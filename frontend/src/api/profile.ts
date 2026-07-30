@@ -1,0 +1,2 @@
+import { http } from './http'
+export const profileApi={summary:()=>http.get('/profile/me'),update:(payload:any)=>http.put('/profile/me',payload),assets:(payload:any)=>http.post('/profile/me/assets',payload),products:()=>http.get('/profile/products'),recommendations:()=>http.get('/profile/me/recommendations'),customers:(q='')=>http.get('/profile/staff/customers',{params:{q}}),customer:(id:string)=>http.get(`/profile/staff/customer/${id}`)}

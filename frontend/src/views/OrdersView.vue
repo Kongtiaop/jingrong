@@ -1,0 +1,11 @@
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'
+import { tradingApi } from '../api/trading'
+const orders=ref<any[]>([]); const trades=ref<any[]>([]); const account=ref<any>(null); const loading=ref(true); const error=ref('')
+const statusText:Record<string,string>={pending_confirmation:'待确认',pending_review:'待审核',executing:'执行中',executed:'已完成',rejected:'已拒绝',cancelled:'已取消'}
+async function load(){try{account.value=(await tradingApi.account()).data.data;orders.value=(await tradingApi.orders()).data.data; trades.value=(await tradingApi.trades()).data.data}catch(e:any){error.value=e.message}finally{loading.value=false}}
+async function confirm(id:string){await tradingApi.confirm(id);await load()}
+async function cancel(id:string){await tradingApi.cancel(id);await load()}
+onMounted(load)
+</script>
+<template><section><div class="section-heading"><div><span class="eyebrow">CUSTOMER ORDERS</span><h2>我的订单</h2><p>从下单、确认到交易完成，查看完整订单状态。</p></div><span class="pill">可用余额 ¥{{account?.available_balance??0}}</span></div><p v-if="error" class="error">{{error}}</p><div v-if="loading" class="empty">正在读取订单…</div><div v-else-if="!orders.length" class="empty">暂无订单，请先前往产品展示。</div><article v-for="order in orders" :key="order.id" class="result"><div class="result-meta"><span>{{order.product_name||order.product_id}}</span><span>{{statusText[order.status]||order.status}}</span></div><h3>¥{{order.amount}}</h3><p>订单号：{{order.order_no}}</p><div class="action-row" v-if="order.status==='pending_confirmation'"><button class="button" @click="confirm(order.id)">确认订单</button><button class="text-button" @click="cancel(order.id)">取消</button></div><div class="action-row" v-else-if="order.status==='pending_review'"><button class="text-button" @click="cancel(order.id)">撤回订单</button></div><p v-if="order.failure_reason" class="error">{{order.failure_reason}}</p><div v-if="order.history?.length" class="history"><small v-for="item in order.history" :key="item.id">{{item.to_status}} · {{item.note}}</small></div></article><div class="section-heading compact"><h3>交易记录</h3><span class="pill">已执行</span></div><article v-for="trade in trades" :key="trade.id" class="result"><div class="result-meta"><span>{{trade.trade_no}}</span><span>{{trade.executed_at}}</span></div><p>成交金额：¥{{trade.amount}} · 数量：{{trade.quantity}}</p></article></section></template>
