@@ -1181,3 +1181,42 @@ docs/BUSINESS_KNOWLEDGE_RISK.md
 - 前端 `npm run build`：PASS，104 modules transformed。
 - 待验证：真实 HTTP 权限修改后重新登录和侧边栏联动。
 - 状态：PARTIAL
+
+
+### TEST-0085：管理员表格、弹窗和分页交互
+
+- 日期：2026-07-31
+- 用户列表：表格化展示，PASS（代码）。
+- 修改角色：居中弹窗，PASS（代码）。
+- 编辑角色权限：居中弹窗，PASS（代码）。
+- 每页条数：10/20/50/100，PASS（代码）。
+- 页码跳转：PASS（代码）。
+- 上一页/下一页：PASS（代码）。
+- 后端分页参数：`limit`/`offset`，已接入。
+- `npm run build`：PASS，104 modules transformed。
+- 待验证：真实 HTTP 分页参数和浏览器交互。
+- 状态：PARTIAL
+
+
+### TEST-0086：用户与权限页面移除重复角色权限区域
+
+- 日期：2026-07-31
+- 用户表格和分页：保留。
+- 修改角色弹窗：保留。
+- 页面底部独立角色权限表格：移除。
+- 独立权限编辑弹窗：移除。
+- `npm run build`：PASS，104 modules transformed。
+- 状态：PASS
+
+
+### TEST-0087：后台业务模块表格化与通用分页
+
+- 日期：2026-07-31
+- 通用分页组件：代码完成。
+- 客户管理表格、搜索、分页、详情弹窗：代码完成。
+- 订单审核表格、分页、通过/拒绝操作：代码完成。
+- 客户订单区域表格复用：代码完成。
+- 后端 Python 编译：PASS。
+- 前端 `npm run build`：PASS，106 modules transformed。
+- 待验证：真实 HTTP total 分页和浏览器操作。
+- 状态：PARTIAL

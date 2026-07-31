@@ -16,7 +16,7 @@ def ensure_admin(user: User) -> User:
     return user
 
 @router.get("/users", response_model=ApiResponse[AdminUserListResponse])
-async def list_users(request: Request, q: str = Query(""), limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0), user: Annotated[User, Depends(require_permission("admin:write"))] = None):
+async def list_users(request: Request, q: str = Query(""), limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0), user: Annotated[User, Depends(require_permission("admin:write"))] = None):
     ensure_admin(user)
     async with request.app.state.database.session_factory() as session:
         query = select(User).options(selectinload(User.roles)).order_by(User.created_at.desc())

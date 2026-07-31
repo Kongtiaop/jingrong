@@ -65,9 +65,9 @@ async def cancel_order(request: Request, order_id: str, user: Annotated[User, De
     except TradingError as exc: err(exc)
 
 @router.get("/orders/pending", response_model=ApiResponse[list[OrderResponse]])
-async def pending_orders(request: Request, user: Annotated[User, Depends(require_permission("order:write"))]):
+async def pending_orders(request: Request, limit: int = 20, offset: int = 0, user: Annotated[User, Depends(require_permission("order:write"))] = None):
     async with request.app.state.database.session_factory() as session:
-        rows = list((await session.execute(select(Order).where(Order.status == "pending_review").order_by(Order.created_at))).scalars().all())
+        rows = list((await session.execute(select(Order).where(Order.status == "pending_review").order_by(Order.created_at).offset(offset).limit(limit))).scalars().all())
         return ApiResponse(data=[await order_response(session, row) for row in rows])
 
 @router.post("/orders/{order_id}/review", response_model=ApiResponse[OrderResponse])
