@@ -9,3 +9,6 @@ class AdminPermissionResponse(BaseModel):
     id:str; code:str; name:str
 class AdminRoleUpdateRequest(BaseModel):
     roles:list[str]=Field(min_length=1)
+
+class AdminRolePermissionsUpdateRequest(BaseModel):
+    permissions: list[str] = Field(default_factory=list)

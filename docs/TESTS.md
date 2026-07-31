@@ -1168,3 +1168,16 @@ docs/BUSINESS_KNOWLEDGE_RISK.md
 - 后端 Python 编译：PASS。
 - 待验证：重启后 HTTP 状态修改、角色修改和权限即时生效。
 - 状态：PARTIAL
+
+
+### TEST-0084：管理员角色权限矩阵第一版
+
+- 日期：2026-07-31
+- 新增接口：`PUT /api/v1/admin/roles/{role_id}/permissions`。
+- 超级管理员角色权限保护：代码完成。
+- 管理员页面角色权限编辑：代码完成。
+- 用户查询/角色修改/账号状态：保留并可用。
+- 后端 Python 编译：PASS。
+- 前端 `npm run build`：PASS，104 modules transformed。
+- 待验证：真实 HTTP 权限修改后重新登录和侧边栏联动。
+- 状态：PARTIAL

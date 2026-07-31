@@ -66,3 +66,21 @@ async def update_user_status(request: Request, user_id: str, status: str = Query
         await session.commit()
         target=(await session.execute(select(User).options(selectinload(User.roles)).where(User.id==user_id))).scalar_one()
         return ApiResponse(data=AdminUserResponse(id=target.id,username=target.username,display_name=target.display_name,status=target.status,is_super_admin=target.is_super_admin,roles=[r.code for r in target.roles]))
+
+
+@router.put("/roles/{role_id}/permissions", response_model=ApiResponse[AdminRoleResponse])
+async def update_role_permissions(request: Request, role_id: str, payload: AdminRolePermissionsUpdateRequest, user: Annotated[User, Depends(require_permission("admin:write"))] = None):
+    ensure_admin(user)
+    async with request.app.state.database.session_factory() as session:
+        role = (await session.execute(select(Role).options(selectinload(Role.permissions)).where(Role.id == role_id))).scalar_one_or_none()
+        if role is None:
+            raise HTTPException(status_code=404, detail="role not found")
+        permissions = list((await session.execute(select(Permission).where(Permission.code.in_(payload.permissions)))).scalars().all())
+        if len(permissions) != len(set(payload.permissions)):
+            raise HTTPException(status_code=400, detail="unknown permission")
+        if role.code == "super_admin":
+            raise HTTPException(status_code=400, detail="super_admin permissions are fixed")
+        role.permissions = permissions
+        await session.commit()
+        role = (await session.execute(select(Role).options(selectinload(Role.permissions)).where(Role.id == role_id))).scalar_one()
+        return ApiResponse(data=AdminRoleResponse(id=role.id, code=role.code, name=role.name, permissions=[p.code for p in role.permissions]))
