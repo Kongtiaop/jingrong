@@ -13,3 +13,8 @@ export const adminApi = {
 }
 
 
+
+export const enterpriseVerificationApi = {
+  list: (status = 'pending') => http.get('/admin/enterprise-verifications', { params: { status } }),
+  review: (id: string, approved: boolean, note = '') => http.post(`/admin/enterprise-verifications/${id}/review`, { approved, note }),
+}

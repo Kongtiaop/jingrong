@@ -5,8 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 
 CUSTOMER_ROLE = "customer"
-from app.models.profile import CustomerHolding, Product
+from app.models.profile import CustomerHolding, CustomerProfile, CustomerRiskAssessment, Product
 from app.models.trading import Account, Order, OrderStatusHistory, Trade
+from app.services.asset_summary_service import AssetSummaryService
 
 class TradingError(ValueError):
     pass
@@ -65,6 +66,18 @@ class TradingService:
         if order.status != "pending_confirmation": raise TradingError("order cannot be confirmed")
         account = (await session.execute(select(Account).where(Account.id == order.account_id).with_for_update())).scalar_one()
         if account.available_balance < order.amount: raise TradingError("insufficient available balance")
+        from app.services.risk_assessment_service import RiskAssessmentService
+        risk = (await session.execute(select(CustomerRiskAssessment).where(CustomerRiskAssessment.user_id == user.id, CustomerRiskAssessment.status.in_(["active", "provisional"])).order_by(CustomerRiskAssessment.assessed_at.desc()).limit(1))).scalars().first()
+        if risk is None:
+            risk = await RiskAssessmentService().ensure_default(session, user.id)
+        product = (await session.execute(select(Product).where(Product.id == order.product_id))).scalar_one()
+        profile = (await session.execute(select(CustomerProfile).where(CustomerProfile.user_id == user.id))).scalar_one_or_none()
+        target_type = getattr(product, "target_customer_type", "individual")
+        if target_type != "all" and (profile is None or profile.customer_type != target_type):
+            raise TradingError(f"product is only available to {target_type} customers")
+        required = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}.get(str(product.risk_level).upper().replace("R", "C"), 1)
+        actual = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}.get(risk.risk_level, 1)
+        if actual < required: raise TradingError(f"risk level {risk.risk_level} is not suitable for product {product.risk_level}; complete a formal risk assessment to unlock higher-risk products")
         account.available_balance -= order.amount; account.frozen_balance += order.amount
         await self.transition(session, order, "pending_review", user.id, "customer confirmed order")
         return order
@@ -99,6 +112,7 @@ class TradingService:
             holding.quantity += order.quantity; holding.cost_amount += order.amount; holding.market_value += order.amount
         session.add(Trade(id=str(uuid4()), trade_no=f"T{uuid4().hex[:16].upper()}", order_id=order.id, user_id=order.user_id, product_id=order.product_id, amount=order.amount, quantity=order.quantity))
         await self.transition(session, order, "executed", operator.id, note or "mock trade executed")
+        await AssetSummaryService().snapshot(session, order.user_id, source_type="trade_derived")
         return order
 
 

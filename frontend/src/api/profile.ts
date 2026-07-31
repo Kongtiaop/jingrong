@@ -1,6 +1,7 @@
 import { http } from './http'
 export const profileApi = {
   summary: () => http.get('/profile/me'),
+  updateProfile: (payload: any) => http.put('/profile/me', payload),
   update: (payload: any) => http.put('/profile/me', payload),
   assets: (payload: any) => http.post('/profile/me/assets', payload),
   products: () => http.get('/profile/products'),
@@ -10,6 +11,10 @@ export const profileApi = {
   deleteProduct: (id: string) => http.delete(`/profile/staff/products/${id}`),
   restoreProduct: (id: string) => http.put(`/profile/staff/products/${id}/restore`),
   recommendations: () => http.get('/profile/me/recommendations'),
-  customers: (q = '', limit = 20, offset = 0) => http.get('/profile/staff/customers', { params: { q, limit, offset } }),
+  customers: (q = '', tier = '', customer_type = '', limit = 20, offset = 0) => http.get('/profile/staff/customers', { params: { q, tier, customer_type, limit, offset } }),
   customer: (id: string) => http.get(`/profile/staff/customer/${id}`),
+  enterpriseVerification: () => http.get('/profile/me/enterprise-verification'),
+  riskAssessment: () => http.get('/profile/me/risk-assessment'),
+  submitRiskAssessment: (payload: any) => http.post('/profile/me/risk-assessment', payload),
+  submitEnterpriseVerification: (payload: any) => http.post('/profile/me/enterprise-verification', payload),
 }

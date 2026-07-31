@@ -12,3 +12,8 @@ class AdminRoleUpdateRequest(BaseModel):
     roles:list[str]=Field(min_length=1)
 class AdminRolePermissionsUpdateRequest(BaseModel):
     permissions: list[str] = Field(default_factory=list)
+
+
+class EnterpriseVerificationReviewRequest(BaseModel):
+    approved: bool
+    note: str = ""

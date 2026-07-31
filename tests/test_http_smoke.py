@@ -119,7 +119,7 @@ class SmokeRunner:
             if products_response is not None:
                 try:
                     products = self.data(products_response)
-                    product = next((item for item in products if item.get("status") == "active"), None)
+                    product = next((item for item in products if item.get("status") == "active" and item.get("target_customer_type", "individual") in {"individual", "all"} and str(item.get("risk_level", "C1")).replace("R", "C") == "C1"), None)
                     if product is None:
                         raise AssertionError("no active product available")
                     amount = Decimal(str(product.get("minimum_amount", "10000")))

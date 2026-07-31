@@ -20,6 +20,8 @@ from app.services.auth_service import AuthService
 from app.services.auth_seed import ensure_auth_seed
 from app.services.profile_seed import ensure_profile_seed
 from app.services.trading_seed import ensure_trading_seed
+from app.services.demo_customer_seed import ensure_demo_customer_profiles
+from app.services.demo_product_seed import ensure_demo_products
 
 
 @asynccontextmanager
@@ -32,6 +34,8 @@ async def lifespan(app: FastAPI):
     await ensure_auth_seed(database, settings)
     await ensure_profile_seed(database)
     await ensure_trading_seed(database)
+    await ensure_demo_products(database)
+    await ensure_demo_customer_profiles(database)
     app.state.settings = settings
     app.state.database = database
     app.state.redis = redis_client

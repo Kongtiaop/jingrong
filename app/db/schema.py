@@ -6,7 +6,7 @@ from app.models.audit import AuditLog  # noqa: F401
 from app.models.auth import Permission, RefreshSession, Role, User  # noqa: F401
 from app.models.knowledge import KnowledgeBase, KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion  # noqa: F401
 from app.models.outbox import OutboxEvent
-from app.models.profile import CustomerAssetSnapshot, CustomerHolding, CustomerProfile, CustomerSubjectiveProfile, Product, ProductSuitabilityRule, RiskRule  # noqa: F401
+from app.models.profile import CustomerAssetSnapshot, CustomerEnterpriseVerification, CustomerHolding, CustomerProfile, CustomerRiskAssessment, CustomerSubjectiveProfile, Product, ProductSuitabilityRule, RiskRule  # noqa: F401
 from app.models.task import AsyncTask
 from app.models.trading import Account, Order, Trade, OrderStatusHistory  # noqa: F401
 
@@ -22,12 +22,19 @@ async def ensure_schema(engine: AsyncEngine) -> None:
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "ALTER TABLE product ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
             "ALTER TABLE product ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "ALTER TABLE product ADD COLUMN IF NOT EXISTS target_customer_type VARCHAR(64) NOT NULL DEFAULT 'individual'",
+            "ALTER TABLE product ADD COLUMN IF NOT EXISTS target_customer_tiers TEXT NOT NULL DEFAULT 'ordinary,gold,platinum,diamond,private_bank'",
             "ALTER TABLE product ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "ALTER TABLE customer_profile ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "ALTER TABLE customer_profile ADD COLUMN IF NOT EXISTS investment_horizon_years INTEGER",
+            "ALTER TABLE customer_profile ADD COLUMN IF NOT EXISTS liquidity_preference VARCHAR(16) NOT NULL DEFAULT 'medium'",
+            "ALTER TABLE customer_risk_assessment ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "ALTER TABLE customer_profile ADD COLUMN IF NOT EXISTS customer_tier VARCHAR(64) NOT NULL DEFAULT 'ordinary'",
             "ALTER TABLE customer_asset_snapshot ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "ALTER TABLE customer_holding ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "ALTER TABLE customer_holding ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "ALTER TABLE product_suitability_rule ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "ALTER TABLE product_suitability_rule ADD COLUMN IF NOT EXISTS minimum_customer_tier VARCHAR(64) NOT NULL DEFAULT 'ordinary'",
             "ALTER TABLE product_suitability_rule ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "ALTER TABLE risk_rule ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "ALTER TABLE risk_rule ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
@@ -45,3 +52,4 @@ async def ensure_schema(engine: AsyncEngine) -> None:
         """))
         await connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_user_idempotency_key ON orders (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"))
         await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_knowledge_chunk_embedding_hnsw ON knowledge_chunk USING hnsw (embedding vector_cosine_ops)"))
+

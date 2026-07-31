@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     redis_stream_prefix: str = "stream:wealth"
     redis_consumer_group: str = "wealth-workers"
     redis_consumer_name: str = "worker-1"
+    database_backend: str = "postgresql"
+    vector_store_backend: str = "pgvector"
+    agent_backend: str = "local"
+    milvus_uri: str = "http://127.0.0.1:19530"
+    milvus_collection: str = "wealth_documents"
+    mysql_url: str = "mysql+aiomysql://wealth:wealth_dev@127.0.0.1:3306/wealth_manager"
 
     dashscope_api_key: str = Field(default="", repr=False)
     qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -26,7 +32,7 @@ class Settings(BaseSettings):
 
     jwt_secret: str = Field(default="change-me-in-development-please-rotate-32", repr=False)
     jwt_algorithm: str = "HS256"
-    jwt_expire_minutes: int = 30
+    jwt_expire_minutes: int = 1440
     refresh_token_expire_days: int = 30
     demo_accounts_enabled: bool = True
     employee_registration_code: str = Field(default="WEALTH-EMPLOYEE-DEV", repr=False)
@@ -58,3 +64,4 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.validate_p0()
     return settings
+

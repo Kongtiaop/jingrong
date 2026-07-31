@@ -1,4 +1,5 @@
 from typing import Annotated
+import json
 from uuid import uuid4
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -6,18 +7,21 @@ from sqlalchemy import select, desc, func, or_
 from app.common.response import ApiResponse
 from app.common.security.auth import current_user, require_permission, require_staff_permission, staff_customer_user
 from app.models.auth import User
-from app.models.profile import CustomerAssetSnapshot, CustomerHolding, CustomerProfile, Product
+from app.models.profile import CustomerAssetSnapshot, CustomerEnterpriseVerification, CustomerHolding, CustomerProfile, CustomerRiskAssessment, Product
 from app.models.audit import AuditLog
 from app.schemas.profile import *
 from app.services.suitability_service import SuitabilityService
+from app.services.customer_tier_service import CustomerTierService
+from app.services.risk_assessment_service import RiskAssessmentService
+from app.services.asset_summary_service import AssetSummaryService
 
 router=APIRouter(prefix="/profile",tags=["profile"])
 @router.get("/me",response_model=ApiResponse[ProfileSummary])
 async def my_summary(request:Request,user:Annotated[User,Depends(current_user)]):
  async with request.app.state.database.session_factory() as s:
   profile=(await s.execute(select(CustomerProfile).where(CustomerProfile.user_id==user.id))).scalar_one_or_none()
-  asset=(await s.execute(select(CustomerAssetSnapshot).where(CustomerAssetSnapshot.user_id==user.id).order_by(desc(CustomerAssetSnapshot.snapshot_time)).limit(1))).scalar_one_or_none()
-  holdings=list((await s.execute(select(CustomerHolding).where(CustomerHolding.user_id==user.id))).scalars().all())
+  asset=await AssetSummaryService().latest_or_derived(s, user.id)
+  holdings=list((await s.execute(select(CustomerHolding).where(CustomerHolding.user_id==user.id, CustomerHolding.status=="active"))).scalars().all())
   return ApiResponse(data=ProfileSummary(profile=ProfileResponse.model_validate(profile,from_attributes=True) if profile else None,latest_asset=AssetSnapshotResponse.model_validate(asset,from_attributes=True) if asset else None,holdings=[HoldingResponse.model_validate(h,from_attributes=True) for h in holdings]))
 @router.put("/me",response_model=ApiResponse[ProfileResponse])
 async def update_profile(request:Request,payload:ProfileRequest,user:Annotated[User,Depends(current_user)]):
@@ -25,6 +29,7 @@ async def update_profile(request:Request,payload:ProfileRequest,user:Annotated[U
   obj=(await s.execute(select(CustomerProfile).where(CustomerProfile.user_id==user.id))).scalar_one_or_none()
   if obj is None: obj=CustomerProfile(id=str(uuid4()),user_id=user.id);s.add(obj)
   for k,v in payload.model_dump().items():setattr(obj,k,v)
+  s.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="update", resource_type="customer_profile", resource_id=obj.id, detail="customer editable profile updated"))
   await s.commit();await s.refresh(obj);return ApiResponse(data=ProfileResponse.model_validate(obj,from_attributes=True))
 @router.post("/me/assets",response_model=ApiResponse[AssetSnapshotResponse],status_code=201)
 async def create_asset(request:Request,payload:AssetSnapshotRequest,user:Annotated[User,Depends(current_user)]):
@@ -104,6 +109,8 @@ async def staff_customers(
     request: Request,
     user: Annotated[User, Depends(staff_customer_user)],
     q: str = "",
+    tier: str = "",
+    customer_type: str = "",
     limit: int = 50,
     offset: int = 0,
 ):
@@ -118,21 +125,76 @@ async def staff_customers(
         items = []
         for customer in users:
             profile = (await s.execute(select(CustomerProfile).where(CustomerProfile.user_id == customer.id))).scalar_one_or_none()
-            asset = (await s.execute(select(CustomerAssetSnapshot).where(CustomerAssetSnapshot.user_id == customer.id).order_by(desc(CustomerAssetSnapshot.snapshot_time)).limit(1))).scalar_one_or_none()
-            holding_count = (await s.execute(select(func.count()).select_from(CustomerHolding).where(CustomerHolding.user_id == customer.id))).scalar_one()
-            items.append(StaffCustomerListItem(id=customer.id, username=customer.username, display_name=customer.display_name, status=customer.status, profile=ProfileResponse.model_validate(profile, from_attributes=True) if profile else None, latest_asset=AssetSnapshotResponse.model_validate(asset, from_attributes=True) if asset else None, holding_count=holding_count))
+            asset = await AssetSummaryService().latest_or_derived(s, customer.id)
+            holding_count = (await s.execute(select(func.count()).select_from(CustomerHolding).where(CustomerHolding.user_id == customer.id, CustomerHolding.status == "active"))).scalar_one()
+            tier_data = await CustomerTierService().calculate(s, customer.id, persist=True)
+            if tier.strip() and tier_data["customer_tier"] != tier.strip():
+                continue
+            if customer_type.strip() and tier_data["customer_type"] != customer_type.strip():
+                continue
+            risk = (await s.execute(select(CustomerRiskAssessment).where(CustomerRiskAssessment.user_id == customer.id, CustomerRiskAssessment.status == "active").order_by(CustomerRiskAssessment.assessed_at.desc()).limit(1))).scalars().first()
+            items.append(StaffCustomerListItem(id=customer.id, username=customer.username, display_name=customer.display_name, status=customer.status, profile=ProfileResponse.model_validate(profile, from_attributes=True) if profile else None, latest_asset=AssetSnapshotResponse.model_validate(asset, from_attributes=True) if asset else None, customer_tier=tier_data["customer_tier"], tier_reasons=tier_data["reasons"], risk_level=risk.risk_level if risk else None, risk_score=risk.score if risk else None, risk_status=risk.status if risk else None, holding_count=holding_count))
         return ApiResponse(data=StaffCustomerListResponse(items=items, total=total))
 
 @router.get("/staff/customer/{user_id}",response_model=ApiResponse[ProfileSummary])
 async def staff_summary(request:Request,user_id:str,user: Annotated[User, Depends(staff_customer_user)]):
  async with request.app.state.database.session_factory() as s:
-  profile=(await s.execute(select(CustomerProfile).where(CustomerProfile.user_id==user_id))).scalar_one_or_none();asset=(await s.execute(select(CustomerAssetSnapshot).where(CustomerAssetSnapshot.user_id==user_id).order_by(desc(CustomerAssetSnapshot.snapshot_time)).limit(1))).scalar_one_or_none();holdings=list((await s.execute(select(CustomerHolding).where(CustomerHolding.user_id==user_id))).scalars().all());return ApiResponse(data=ProfileSummary(profile=ProfileResponse.model_validate(profile,from_attributes=True) if profile else None,latest_asset=AssetSnapshotResponse.model_validate(asset,from_attributes=True) if asset else None,holdings=[HoldingResponse.model_validate(h,from_attributes=True) for h in holdings]))
+  profile=(await s.execute(select(CustomerProfile).where(CustomerProfile.user_id==user_id))).scalar_one_or_none();asset=await AssetSummaryService().latest_or_derived(s, user_id);holdings=list((await s.execute(select(CustomerHolding).where(CustomerHolding.user_id==user_id, CustomerHolding.status=="active"))).scalars().all());return ApiResponse(data=ProfileSummary(profile=ProfileResponse.model_validate(profile,from_attributes=True) if profile else None,latest_asset=AssetSnapshotResponse.model_validate(asset,from_attributes=True) if asset else None,holdings=[HoldingResponse.model_validate(h,from_attributes=True) for h in holdings]))
+
+@router.get("/me/risk-assessment", response_model=ApiResponse[RiskAssessmentResponse | None])
+async def my_risk_assessment(request: Request, user: Annotated[User, Depends(current_user)]):
+    async with request.app.state.database.session_factory() as session:
+        item = (await session.execute(select(CustomerRiskAssessment).where(CustomerRiskAssessment.user_id == user.id, CustomerRiskAssessment.status == "active").order_by(CustomerRiskAssessment.assessed_at.desc()).limit(1))).scalars().first()
+        return ApiResponse(data=RiskAssessmentResponse(id=item.id,user_id=item.user_id,risk_level=item.risk_level,score=item.score,answers=json.loads(item.answers_json or "{}"),status=item.status,source_type=item.source_type,assessed_at=item.assessed_at,expires_at=item.expires_at) if item else None)
+
+@router.post("/me/risk-assessment", response_model=ApiResponse[RiskAssessmentResponse])
+async def submit_risk_assessment(request: Request, payload: RiskAssessmentRequest, user: Annotated[User, Depends(current_user)]):
+    async with request.app.state.database.session_factory() as session:
+        item = await RiskAssessmentService().assess(session, user.id, payload.model_dump())
+        session.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="submit", resource_type="risk_assessment", resource_id=item.id, detail=f"risk_level={item.risk_level};score={item.score}"))
+        await session.commit(); await session.refresh(item)
+        return ApiResponse(data=RiskAssessmentResponse(id=item.id,user_id=item.user_id,risk_level=item.risk_level,score=item.score,answers=payload.model_dump(),status=item.status,source_type=item.source_type,assessed_at=item.assessed_at,expires_at=item.expires_at))
+
+@router.get("/me/enterprise-verification", response_model=ApiResponse[EnterpriseVerificationResponse | None])
+async def my_enterprise_verification(request: Request, user: Annotated[User, Depends(current_user)]):
+    async with request.app.state.database.session_factory() as session:
+        item = (await session.execute(select(CustomerEnterpriseVerification).where(CustomerEnterpriseVerification.user_id == user.id))).scalar_one_or_none()
+        return ApiResponse(data=EnterpriseVerificationResponse.model_validate(item, from_attributes=True) if item else None)
+
+@router.post("/me/enterprise-verification", response_model=ApiResponse[EnterpriseVerificationResponse], status_code=201)
+async def submit_enterprise_verification(request: Request, payload: EnterpriseVerificationRequest, user: Annotated[User, Depends(current_user)]):
+    if not any(role.code == "customer" for role in user.roles):
+        raise HTTPException(status_code=403, detail="customer account required")
+    async with request.app.state.database.session_factory() as session:
+        profile = (await session.execute(select(CustomerProfile).where(CustomerProfile.user_id == user.id))).scalar_one_or_none()
+        if profile is not None and profile.customer_type == "enterprise":
+            raise HTTPException(status_code=409, detail="customer is already an enterprise customer")
+        item = (await session.execute(select(CustomerEnterpriseVerification).where(CustomerEnterpriseVerification.user_id == user.id))).scalar_one_or_none()
+        if item is not None and item.status == "approved":
+            raise HTTPException(status_code=409, detail="enterprise verification already approved")
+        if item is None:
+            item = CustomerEnterpriseVerification(id=str(uuid4()), user_id=user.id, **payload.model_dump())
+            session.add(item)
+        else:
+            for key, value in payload.model_dump().items(): setattr(item, key, value)
+            item.status = "pending"; item.review_note = ""; item.reviewed_by = None; item.reviewed_at = None
+        session.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="submit", resource_type="enterprise_verification", resource_id=item.id, detail=payload.company_name))
+        await session.commit(); await session.refresh(item)
+        return ApiResponse(data=EnterpriseVerificationResponse.model_validate(item, from_attributes=True))
+
+@router.get("/me/tier", response_model=ApiResponse[CustomerTierResponse])
+async def customer_tier(request: Request, user: Annotated[User, Depends(current_user)]):
+    async with request.app.state.database.session_factory() as session:
+        data = await CustomerTierService().calculate(session, str(user.id), persist=True)
+        await session.commit()
+        return ApiResponse(data=CustomerTierResponse(**data))
 
 @router.get("/me/recommendations", response_model=ApiResponse[RecommendationResponse])
 async def recommendations(request: Request, user: Annotated[User, Depends(current_user)]):
     async with request.app.state.database.session_factory() as session:
         data = await SuitabilityService().recommend(session, str(user.id))
         return ApiResponse(data=data)
+
 
 
 

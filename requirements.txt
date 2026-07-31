@@ -17,6 +17,7 @@ argon2-cffi>=25,<26
 # Async PostgreSQL and migrations
 SQLAlchemy>=2.0.51,<3
 asyncpg>=0.31,<1
+aiomysql>=0.2,<1
 psycopg>=3.3,<4
 alembic>=1.18,<2
 pgvector>=0.3,<1

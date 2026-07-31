@@ -9,7 +9,9 @@ from app.common.response import ApiResponse
 from app.common.security.auth import require_permission
 from app.models.audit import AuditLog
 from app.models.auth import Permission, Role, User
+from app.models.profile import CustomerEnterpriseVerification, CustomerProfile
 from app.schemas.admin import *
+from app.schemas.profile import EnterpriseVerificationResponse
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -52,6 +54,37 @@ async def list_users(request: Request, q: str = Query(""), role: str = Query("")
         users = list((await session.execute(query.offset(offset).limit(limit))).scalars().all())
         return ApiResponse(data=AdminUserListResponse(total=total, items=[user_response(item) for item in users]))
 
+
+@router.get("/enterprise-verifications", response_model=ApiResponse[list[dict]])
+async def list_enterprise_verifications(request: Request, status: str = Query("pending"), user: Annotated[User, Depends(require_permission("admin:write"))] = None):
+    ensure_admin(user)
+    async with request.app.state.database.session_factory() as session:
+        query = select(CustomerEnterpriseVerification).order_by(CustomerEnterpriseVerification.created_at.desc())
+        if status in {"pending", "approved", "rejected"}: query = query.where(CustomerEnterpriseVerification.status == status)
+        rows = list((await session.execute(query)).scalars().all())
+        return ApiResponse(data=[{**EnterpriseVerificationResponse.model_validate(row, from_attributes=True).model_dump(mode="json")} for row in rows])
+
+@router.post("/enterprise-verifications/{verification_id}/review", response_model=ApiResponse[dict])
+async def review_enterprise_verification(request: Request, verification_id: str, payload: EnterpriseVerificationReviewRequest, user: Annotated[User, Depends(require_permission("admin:write"))] = None):
+    ensure_admin(user)
+    async with request.app.state.database.session_factory() as session:
+        item = (await session.execute(select(CustomerEnterpriseVerification).where(CustomerEnterpriseVerification.id == verification_id))).scalar_one_or_none()
+        if item is None: raise HTTPException(status_code=404, detail="verification not found")
+        if item.status == "approved" and payload.approved:
+            raise HTTPException(status_code=409, detail="verification already approved")
+        item.status = "approved" if payload.approved else "rejected"; item.review_note = payload.note; item.reviewed_by = user.id; item.reviewed_at = datetime.now(timezone.utc)
+        if payload.approved:
+            profile = (await session.execute(select(CustomerProfile).where(CustomerProfile.user_id == item.user_id))).scalar_one_or_none()
+            if profile is None:
+                profile = CustomerProfile(id=str(uuid4()), user_id=item.user_id)
+                session.add(profile)
+                await session.flush()
+            profile.customer_type = "enterprise"
+            profile.customer_tier = "enterprise_standard"
+            profile.source_type = "enterprise_verified"
+        session.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="approve" if payload.approved else "reject", resource_type="enterprise_verification", resource_id=item.id, detail=payload.note))
+        await session.commit(); await session.refresh(item)
+        return ApiResponse(data=EnterpriseVerificationResponse.model_validate(item, from_attributes=True).model_dump(mode="json"))
 
 @router.get("/roles", response_model=ApiResponse[list[AdminRoleResponse]])
 async def list_roles(request: Request, user: Annotated[User, Depends(require_permission("admin:write"))] = None):

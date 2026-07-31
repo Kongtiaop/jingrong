@@ -4,6 +4,22 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 
 
+class CustomerEnterpriseVerification(Base):
+    __tablename__ = "customer_enterprise_verification"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True)
+    company_name: Mapped[str] = mapped_column(String(255))
+    registration_no: Mapped[str] = mapped_column(String(128), default="")
+    legal_representative: Mapped[str] = mapped_column(String(128), default="")
+    contact_phone: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    review_note: Mapped[str] = mapped_column(Text, default="")
+    reviewed_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class CustomerProfile(Base):
     __tablename__ = "customer_profile"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -12,11 +28,27 @@ class CustomerProfile(Base):
     occupation: Mapped[str] = mapped_column(String(128), default="")
     region: Mapped[str] = mapped_column(String(128), default="")
     customer_type: Mapped[str] = mapped_column(String(64), default="individual")
+    customer_tier: Mapped[str] = mapped_column(String(64), default="ordinary", index=True)
     investment_experience_years: Mapped[int] = mapped_column(Integer, default=0)
     investment_goal: Mapped[str] = mapped_column(String(255), default="")
-    investment_horizon: Mapped[str] = mapped_column(String(64), default="")
-    liquidity_preference: Mapped[str] = mapped_column(String(64), default="")
+    investment_horizon_years: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    liquidity_preference: Mapped[str] = mapped_column(String(16), default="medium")
     source_type: Mapped[str] = mapped_column(String(32), default="synthetic")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class CustomerRiskAssessment(Base):
+    __tablename__ = "customer_risk_assessment"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    risk_level: Mapped[str] = mapped_column(String(8), default="C1", index=True)
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    answers_json: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    source_type: Mapped[str] = mapped_column(String(32), default="questionnaire")
+    assessed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -58,6 +90,7 @@ class Product(Base):
     minimum_amount: Mapped[float] = mapped_column(Numeric(18, 2), default=0)
     liquidity: Mapped[str] = mapped_column(String(64), default="medium")
     description: Mapped[str] = mapped_column(Text, default="")
+    target_customer_type: Mapped[str] = mapped_column(String(64), default="individual")
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
     source_type: Mapped[str] = mapped_column(String(32), default="synthetic")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -105,3 +138,4 @@ class CustomerHolding(Base):
     status: Mapped[str] = mapped_column(String(32), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+

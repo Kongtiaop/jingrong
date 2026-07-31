@@ -1396,3 +1396,218 @@ docs/BUSINESS_KNOWLEDGE_RISK.md
 - Smoke：PASS。
 - 待验证：浏览器侧边栏显示、删除后模块切换、普通工作人员 403、审计记录展示。
 - 状态：PARTIAL
+
+### TEST-0102：时间字段和详情表格最终验证
+
+- 日期：2026-07-31
+- API 健康：PASS。
+- 用户 API 时间字段：PASS。
+- 产品 API 时间字段：PASS。
+- 前端 `npm run build`：PASS，112 modules transformed。
+- Smoke：PASS。
+- Python 编译：PASS。
+- 表格详情/省略号/回收站时间列：代码完成。
+- 状态：PASS
+
+
+## 2026-07-31 资产一致性修复验证
+
+- Python 编译检查：待执行。
+- HTTP Smoke：待执行。
+- 前端构建：待执行。
+- 重点验证：新客户总资产、购买后账户/持仓/资产快照、customer_demo 历史订单。
+
+
+## 2026-07-31 资产一致性修复真实联调
+
+- `/health`：PASS，PostgreSQL/pgvector、Redis、Qwen、Embedding 均正常。
+- `tests/test_http_smoke.py`：PASS。
+- `tests/test_http_faults.py`：PASS，12/12。
+- `tests/test_http_concurrency.py`：PASS，60 请求、0 失败；幂等冲突按预期返回 409。
+- 测试均使用 `conda run -n langchain_env`，并未启用 pytest 缓存。
+
+
+## 2026-07-31 历史资产快照兼容修复
+
+- `app/services/asset_summary_service.py` Python 编译：PASS。
+- 针对 `/profile/staff/customers` 的历史快照空时间字段增加兼容处理。
+- 待 API reload 后重新验证客户列表和客户详情。
+
+
+## 2026-07-31 profile_seed 重复快照兼容修复
+
+- `app/services/profile_seed.py` Python 编译：PASS。
+- 资产快照和持仓查询改为排序后取首条，避免历史重复记录阻塞启动。
+- 待 API reload 后验证启动流程。
+
+
+## 2026-07-31 客户分层接入验证
+
+- 后端 Python 编译：PASS。
+- 前端 `npm run build`：PASS。
+- 待 API reload 后验证客户列表层级展示与筛选。
+
+
+## 2026-07-31 客户管理 UI 宽度优化
+
+- 客户管理前端生产构建：PASS。
+- 重点验收：表格横向滚动、筛选控件换行、操作列可见。
+
+
+## 2026-07-31 高净值与企业客户验证
+
+- 后端 Python 编译：PASS。
+- 前端 `npm run build`：PASS。
+- 待 API reload 后验证 `hNW_demo`、`enterprise_demo` 出现在客户管理列表，并验证客户类型筛选。
+
+
+## 2026-07-31 企业认证实现验证
+
+- 后端 Python 编译：PASS。
+- 前端 `npm run build`：PASS。
+- 待 API reload 后验证申请、审核和审计联动。
+
+
+## 2026-07-31 员工后台企业认证审核验证
+
+- 后端 Python 编译：PASS。
+- 前端 `npm run build`：PASS。
+- 待 API reload 后使用超级管理员提交并审核一条申请。
+
+
+## 2026-07-31 企业认证类型更新修复
+
+- 审核接口 Python 编译：PASS。
+- 修复无客户画像时审核通过不更新客户类型的问题。
+- 待 API reload 后重新提交/审核，或对已通过申请执行一次数据修复验证。
+
+
+## 2026-07-31 企业客户类型数据修复
+
+- `scripts/repair_enterprise_verification.py` 执行：PASS。
+- 已通过申请数量：1。
+- 修复结果：客户画像已写入企业客户类型和企业标准层级。
+- 审核接口编译：PASS。
+
+
+## 2026-07-31 风险画像阶段边界
+
+- 当前只验证基础风险测评、注册预填和确定性适当性规则。
+- 长期行为画像暂不实现，不纳入本阶段测试范围。
+- 长期行为数据来源和调整原则已记录在 `docs/PLAN.md`。
+
+
+## 2026-07-31 最简风险测评与产品 Seed
+
+- 演示产品 Seed 脚本执行：PASS。
+- 已写入 5 类产品及适配规则。
+- 待 API reload 后验证产品展示、风险问卷和不同等级购买拦截。
+
+
+## 2026-07-31 客户个人信息编辑验证
+
+- 后端 Python 编译：PASS。
+- 前端生产构建：PASS。
+- 待浏览器验证个人信息保存、刷新持久化和系统字段只读。
+
+
+## 2026-07-31 高净值客户激进偏好适当性讨论
+
+- 验证现象：高净值客户选择激进目标后获得 C3，购买 C4/C5 被禁止。
+- 结论：当前适当性校验生效。
+- 业务影响：可能影响高净值客户转化，但暂不据此修改规则。
+- 后续候选方案：重新测评、风险升级申请、人工适当性复核。
+
+
+## 2026-07-31 四类客户风险矩阵联调
+
+- API 健康检查：PASS。
+- 三个演示账号登录：PASS。
+- 五类演示产品已写入数据库：PASS。
+- 发现并修复产品 `target_customer_type` 未映射到 ORM，导致接口全部返回 individual 的问题。
+- 当前矩阵脚本已验证产品风险等级和客户类型字段正确返回。
+- 后续仍需补充订单创建/确认的逐项断言。
+
+
+## 2026-07-31 真实订单风险矩阵测试
+
+- `customer_demo` 创建 C2 稳健产品：订单创建 201，但确认因无正式风险测评被拦截。
+- `customer_demo` 创建 C5 私行产品：因当前可用余额不足，创建阶段返回 400。
+- `hNW_demo` 当前风险等级 C3，C4/C5 产品确认均返回 400，原因分别为风险等级不适配。
+- `enterprise_demo` 未完成正式风险测评，企业现金管理和个人稳健产品确认均被要求先完成风险测评。
+- 本轮证明后端风险拦截生效；下一步需要补充演示账号初始风险测评或按规则决定未测评客户是否允许 C1 产品。
+
+
+## 2026-07-31 方案 B 真实订单验证
+
+- `customer_demo` 未测评购买 C1 现金管理保本计划：创建 201，确认 200，进入 `pending_review`，PASS。
+- `customer_demo` 未测评购买 C2 稳健增值计划：确认 400，明确提示 C1 不适配 C2，PASS。
+- `hNW_demo` C3 购买 C4/C5：确认均 400，风险等级不足，PASS。
+- `enterprise_demo` 未测评购买 C2 企业现金管理：确认 400，需正式测评，符合当前规则。
+
+
+## 2026-07-31 抽象层验证
+
+- Agent/VectorStore/Orchestrator Python 编译：PASS。
+- 当前 PostgreSQL 与 pgvector 业务链路不变。
+- MySQL/Milvus 适配器尚未启用，待后续实现后做迁移测试。
+
+
+## 2026-07-31 Repository 抽象验证
+
+- Repository Port/SQLAlchemy 实现 Python 编译：PASS。
+- 风险测评服务、产品适配服务编译：PASS。
+- 待真实 HTTP Smoke 验证产品推荐和风险测评行为不变。
+
+
+## 2026-07-31 交易与资产 Repository 验证
+
+- Python 编译：PASS。
+- HTTP Faults：12/12 PASS。
+- HTTP Smoke：PASS。
+- 交易风险矩阵：C1 产品、企业产品、风险等级拦截和客户类型拦截均符合预期。
+
+
+## 2026-07-31 MySQL/Milvus 连通性
+
+- `milvus-standalone` 容器检查：PASS。
+- PyMilvus 连接 `127.0.0.1:19530`：PASS。
+- Milvus 集合列表：空。
+- 本机 3306 TCP：可连接。
+- MySQL 迁移：未执行，因 `aiomysql` 未安装且尚未确认数据库凭据。
+
+
+## 2026-07-31 MySQL 迁移测试容器
+
+- MySQL 8.0 镜像已存在。
+- 已创建隔离容器 `wealth-mysql-migration`。
+- 3307 端口连通：PASS。
+- `aiomysql`：已安装。
+- 尚未将业务切换到 MySQL，下一步进行 schema/Repository 契约验证。
+
+
+## 2026-07-31 MySQL 最小迁移探针
+
+- MySQL 连接：PASS。
+- 建表：PASS。
+- DECIMAL/JSON/TIMESTAMP 读写：PASS。
+- 重复写入幂等：PASS。
+- 主 PostgreSQL 业务链路未切换。
+
+
+## 2026-07-31 MySQL/Milvus 核心迁移探针
+
+- MySQL 核心 DDL：5/5 PASS。
+- MySQL users/profile 关联读写：PASS。
+- Milvus 集合创建：PASS。
+- Milvus insert/flush/load/search/delete：PASS。
+- 当前主系统仍使用 PostgreSQL + pgvector，迁移探针不改变线上开发链路。
+
+
+## 2026-07-31 正式 Milvus 知识迁移
+
+- PostgreSQL active 知识块迁移：12 条。
+- Milvus 集合创建和索引：PASS。
+- Milvus 查询读取文本和元数据：PASS。
+- 原 PostgreSQL/pgvector 数据未删除。
+- 待补充 embedding 查询向量 Top-K 对比和双读切换测试。
