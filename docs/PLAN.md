@@ -3446,16 +3446,3 @@ API 启动失败原因是 seed 过程懒加载 `User.roles`。已在 profile/tra
 3. 增加角色权限矩阵编辑。
 4. 增加操作审计记录。
 5. 进入员工订单审核后台。
-
-
-## 2026-07-31 Gitee 同步规则确认
-
-后续每轮代码修改完成并通过基本验证后，必须同步提交到 Gitee：
-
-```text
-git@gitee.com:sugar-raincandy-u/wealth.git
-```
-
-流程：更新 docs → `git status` 检查敏感文件 → `git add .` → `git commit` → `git push`。
-
-由于当前环境此前对 Git SSH/HTTPS 有网络限制，已配置 Gitee SSH 443 端口；如果 push 失败，先报告失败，不使用 force push，不关闭 SSL 校验。
