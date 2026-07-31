@@ -1,6 +1,6 @@
 from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 from app.common.response import ApiResponse
 from app.common.security.auth import current_user, require_permission, require_staff_permission, staff_customer_user
 from app.models.auth import User
@@ -64,11 +64,13 @@ async def cancel_order(request: Request, order_id: str, user: Annotated[User, De
             return ApiResponse(data=await order_response(session, order))
     except TradingError as exc: err(exc)
 
-@router.get("/orders/pending", response_model=ApiResponse[list[OrderResponse]])
+@router.get("/orders/pending", response_model=ApiResponse[OrderListResponse])
 async def pending_orders(request: Request, limit: int = 20, offset: int = 0, user: Annotated[User, Depends(require_permission("order:write"))] = None):
     async with request.app.state.database.session_factory() as session:
-        rows = list((await session.execute(select(Order).where(Order.status == "pending_review").order_by(Order.created_at).offset(offset).limit(limit))).scalars().all())
-        return ApiResponse(data=[await order_response(session, row) for row in rows])
+        base_query = select(Order).where(Order.status == "pending_review")
+        total = (await session.execute(select(func.count()).select_from(base_query.subquery()))).scalar_one()
+        rows = list((await session.execute(base_query.order_by(Order.created_at).offset(offset).limit(limit))).scalars().all())
+        return ApiResponse(data=OrderListResponse(items=[await order_response(session, row) for row in rows], total=total))
 
 @router.post("/orders/{order_id}/review", response_model=ApiResponse[OrderResponse])
 async def review_order(request: Request, order_id: str, payload: OrderActionRequest, user: Annotated[User, Depends(require_permission("order:write"))]):

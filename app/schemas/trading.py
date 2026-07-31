@@ -50,3 +50,8 @@ class TradeResponse(BaseModel):
     amount: Decimal
     quantity: Decimal
     executed_at: datetime
+
+
+class OrderListResponse(BaseModel):
+    items: list[OrderResponse]
+    total: int

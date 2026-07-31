@@ -1220,3 +1220,17 @@ docs/BUSINESS_KNOWLEDGE_RISK.md
 - 前端 `npm run build`：PASS，106 modules transformed。
 - 待验证：真实 HTTP total 分页和浏览器操作。
 - 状态：PARTIAL
+
+
+### TEST-0088：订单与客户模块统一表格化第二阶段
+
+- 日期：2026-07-31
+- 待审核订单返回 `items/total`：代码完成。
+- 订单审核分页：代码完成。
+- 客户订单表格：代码完成。
+- 客户交易记录表格：代码完成。
+- 客户详情订单表格：代码完成。
+- 后端 Python 编译：PASS。
+- 前端 `npm run build`：PASS，106 modules transformed。
+- 待验证：API reload 后真实分页 total 和浏览器操作。
+- 状态：PARTIAL

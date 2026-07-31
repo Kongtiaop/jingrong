@@ -3,7 +3,7 @@ import { onMounted, ref, computed } from 'vue'
 import { tradingApi } from '../api/trading'
 import PaginationBar from '../components/PaginationBar.vue'
 const orders=ref<any[]>([]);const error=ref('');const loading=ref(true);const page=ref(1);const pageSize=ref(10);const total=ref(0);const pages=computed(()=>Math.max(1,Math.ceil(total.value/pageSize.value)))
-async function load(){loading.value=true;try{const r=(await tradingApi.pending(pageSize.value,(page.value-1)*pageSize.value)).data;orders.value=r.data;total.value=r.data.length}catch(e:any){error.value=e.response?.data?.detail||e.message}finally{loading.value=false}}
+async function load(){loading.value=true;try{const r=(await tradingApi.pending(pageSize.value,(page.value-1)*pageSize.value)).data;orders.value=r.data.items;total.value=r.data.total}catch(e:any){error.value=e.response?.data?.detail||e.message}finally{loading.value=false}}
 function changeSize(n:number){pageSize.value=n;page.value=1;load()}function go(n:number){page.value=Math.min(Math.max(n,1),pages.value);load()}
 async function approve(id:string){await tradingApi.approve(id,'运营审核通过，Mock 执行');await load()}async function reject(id:string){await tradingApi.reject(id,'工作人员审核拒绝');await load()}
 onMounted(load)
