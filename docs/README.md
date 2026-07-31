@@ -158,3 +158,42 @@ C:\Users\tx360\.conda\envs\langchain_env\python.exe -m scripts.reset_dev_state -
 ```
 
 该脚本仅允许在 `development`、`dev` 或 `local` 环境执行。
+
+
+## Gitee 提交规则
+
+本项目远程仓库：
+
+```text
+git@gitee.com:sugar-raincandy-u/wealth.git
+```
+
+以后每次完成代码修改和验证后，必须按以下顺序提交：
+
+```powershell
+git status
+git add .
+git commit -m "描述本次修改"
+git push
+```
+
+推送前必须确认以下本地文件没有被提交：
+
+```text
+.env
+logs/
+docs/DEMO_ACCOUNTS.txt
+frontend/node_modules/
+frontend/dist/
+```
+
+当前 SSH 已配置为通过 Gitee 443 端口连接，远程地址使用 SSH，不要随意改回 HTTPS。
+
+每次完成一轮开发后，`docs/PLAN.md`、`docs/TESTS.md`、`docs/ISSUES.md` 应先更新，再创建 Git commit 并推送。
+
+提交记录至少包含：
+
+- 本轮功能或修复内容；
+- 测试结果；
+- 未完成事项；
+- 对应文档编号。

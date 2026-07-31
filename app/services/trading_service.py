@@ -1,8 +1,10 @@
 from decimal import Decimal
 from uuid import uuid4
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
+
+CUSTOMER_ROLE = "customer"
 from app.models.profile import CustomerHolding, Product
 from app.models.trading import Account, Order, OrderStatusHistory, Trade
 
@@ -11,6 +13,13 @@ class TradingError(ValueError):
 
 class TradingService:
     async def get_or_create_account(self, session: AsyncSession, user_id: str) -> Account:
+        user = (await session.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+        customer = (await session.execute(select(exists().where(
+            User.id == user_id,
+            User.roles.any(code=CUSTOMER_ROLE),
+        )))).scalar()
+        if user is None or not customer:
+            raise TradingError("only customer accounts can trade")
         account = (await session.execute(select(Account).where(Account.user_id == user_id))).scalar_one_or_none()
         if account is None:
             account = Account(id=str(uuid4()), user_id=user_id, account_no=f"AC{user_id[:10].upper()}", available_balance=Decimal("200000.00"))
@@ -28,6 +37,11 @@ class TradingService:
             if existing is not None:
                 product = (await session.execute(select(Product).where(Product.id == existing.product_id))).scalar_one_or_none()
                 return existing, product.name if product else None
+        customer = (await session.execute(select(exists().where(
+            User.id == user.id, User.roles.any(code=CUSTOMER_ROLE)
+        )))).scalar()
+        if not customer:
+            raise TradingError("only customer accounts can trade")
         product = (await session.execute(select(Product).where(Product.id == product_id, Product.status == "active"))).scalar_one_or_none()
         if product is None: raise TradingError("product unavailable")
         if amount < Decimal(str(product.minimum_amount)): raise TradingError(f"minimum amount is {product.minimum_amount}")

@@ -943,3 +943,128 @@ ProductSuitabilityRule 模型已建立，但还没有完成规则 CRUD、确定�
 - 状态：RESOLVED
 
 工作人员客户列表、客户详情和客户订单接口使用 `_user` 参数但未使用 `Annotated`/明确 Depends 类型，FastAPI 将其识别为必填 query 参数 `user`，返回 422。已改为显式 `user: User = Depends(require_staff_permission(...))`。
+
+
+### ISSUE-0043：客户与员工账户能力混用
+
+- 发现日期：2026-07-30
+- 分类：架构/权限/业务边界
+- 严重程度：P0
+- 状态：IN_PROGRESS
+
+员工和管理员通过通用交易接口拥有账户、资产和订单能力，顶部导航也将客户服务与员工后台混在一起。已增加 customer 角色限制和统一右上角下拉入口；待重启后验证，并清理历史错误 seed 数据。
+
+
+### ISSUE-0044：seed 为员工创建客户资产和交易账户
+
+- 发现日期：2026-07-30
+- 分类：数据初始化/业务边界
+- 严重程度：P0
+- 状态：RESOLVED
+
+已为 `profile_seed` 和 `trading_seed` 增加 customer 角色判断。开发环境 reset 后，只有客户账号会获得构造画像、资产、持仓和交易账户。
+
+
+### ISSUE-0045：异步 seed 访问 User.roles 触发 MissingGreenlet
+
+- 发现日期：2026-07-30
+- 分类：Bug / SQLAlchemy Async ORM
+- 严重程度：P1
+- 状态：RESOLVED
+
+`profile_seed` 和 `trading_seed` 查询用户后直接访问懒加载的 `user.roles`，在异步启动上下文中触发 `sqlalchemy.exc.MissingGreenlet`，导致 API 无法启动。已使用 `selectinload(User.roles)` 预加载角色关系。
+
+- 验证：`python -m scripts.seed_demo_data` PASS。
+
+
+### ISSUE-0046：员工前台/后台耦合与 seed/权限初始化异步问题
+
+- 发现日期：2026-07-30
+- 分类：P0 / 架构 / 权限 / 启动
+- 状态：IN_PROGRESS
+
+已确认三类问题：
+
+1. 员工和管理员曾被允许访问客户交易能力；
+2. 顶部导航把客户前台和工作后台混在一起，个人中心入口不符合要求；
+3. 员工客户列表依赖参数仍被 FastAPI 识别为 query 参数，且交易 Service 访问懒加载 roles 触发 MissingGreenlet。
+
+已完成代码修复：客户交易角色限制、客户/员工下拉入口、seed 角色预加载、交易 Service 使用 SQL 查询判断 customer 角色、工作人员依赖使用 Annotated。待 API 重启后完成最终验证。
+
+
+### ISSUE-0047：staff customer endpoint 仍因默认值被解析为 query 参数
+
+- 发现日期：2026-07-30
+- 分类：Bug / FastAPI 依赖注入
+- 严重程度：P1
+- 状态：RESOLVED
+
+验证发现工作人员客户接口仍返回缺少 query 参数 `user` 的 422。原因是 `Annotated[User, Depends(...)]` 依赖放在带默认值的参数后并设置了默认值，FastAPI 仍产生错误参数签名。已将依赖参数放到普通 query 参数之前并移除默认值。
+
+
+### ISSUE-0048：管理员无法搜索用户和修改角色权限
+
+- 发现日期：2026-07-30
+- 分类：P0 / 管理后台
+- 状态：IN_PROGRESS
+
+当前项目缺少独立管理员用户管理 API 和页面，导致超级管理员无法查找用户、查看角色/权限或修改角色。已新增管理员用户搜索、角色列表、权限列表和用户角色修改能力，待 API reload 后验证。
+
+
+### ISSUE-0049：管理员用户列表访问角色关系触发 MissingGreenlet
+
+- 发现日期：2026-07-30
+- 分类：Bug / Async ORM / 管理后台
+- 严重程度：P1
+- 状态：RESOLVED
+
+管理员用户列表在序列化 `u.roles` 时触发异步懒加载，返回 500。已在查询中使用 `selectinload(User.roles)`；角色列表同步预加载 `Role.permissions`。
+
+### ISSUE-0050：后台需要统一侧边栏而不是多个跳转页面
+
+- 发现日期：2026-07-30
+- 分类：架构 / 前端
+- 严重程度：P0
+- 状态：IN_PROGRESS
+
+后台改为统一 `/backoffice` 页面：左侧根据权限显示模块，右侧显示选中模块内容；公开前台只保留公司、业务、产品和购买相关内容。
+
+
+### ISSUE-0051：前端直连 API 触发 CORS preflight 405
+
+- 发现日期：2026-07-30
+- 分类：Bug / 前后端联调
+- 严重程度：P1
+- 状态：RESOLVED
+
+前端 Axios 被改为直连 `http://127.0.0.1:8010`，浏览器对带 Authorization/X-Trace-Id 的请求发送 OPTIONS 预检，而后端未配置 CORS，导致 `/api/v1/health` 等接口返回 405。已同时配置 FastAPI CORSMiddleware，并恢复前端优先使用 Vite `/api` 代理。
+
+
+### ISSUE-0052：`/orders/me` 被动态订单详情路由抢先匹配
+
+- 发现日期：2026-07-30
+- 分类：Bug / FastAPI 路由顺序
+- 严重程度：P1
+- 状态：RESOLVED
+
+`GET /trading/orders/{order_id}` 注册在 `GET /trading/orders/me` 之前，Starlette 按路由注册顺序匹配时将 `me` 当成 `order_id`，随后订单归属查询返回 `order not found`（404）。已将静态路由 `/orders/me` 移到动态路由 `/orders/{order_id}` 之前。
+
+
+### ISSUE-0053：超级管理员订单审核接口误返回 403
+
+- 发现日期：2026-07-30
+- 分类：Bug / 权限 / FastAPI 依赖注入
+- 严重程度：P1
+- 状态：RESOLVED
+
+`pending_orders` 使用 `_user` 作为依赖参数名，当前 FastAPI 版本可能将其解析为普通 query 参数或导致权限依赖行为不符合预期。已改为明确的 `user: Annotated[User, Depends(require_permission("order:write"))]`。超级管理员因 `require_permission` 的 `is_super_admin` 快速通道应可访问。
+
+
+### ISSUE-0054：动态订单详情路由同时抢占 `/orders/pending`
+
+- 发现日期：2026-07-30
+- 分类：Bug / 路由顺序 / 权限假象
+- 严重程度：P1
+- 状态：RESOLVED
+
+`/orders/{order_id}` 虽已移到 `/orders/me` 后，但仍位于 `/orders/pending` 和 `/orders/customer/{user_id}` 之前。访问 `/orders/pending` 时，`pending` 被当成客户订单 ID，随后客户角色检查返回 `customer account required`，表现为超级管理员 403。已将动态详情路由移动到所有静态 `/orders/*` 路由之后。

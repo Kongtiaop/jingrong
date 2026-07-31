@@ -916,3 +916,255 @@ docs/BUSINESS_KNOWLEDGE_RISK.md
 - 后端编译：PASS。
 - 待验证：重启 API 后重新执行工作人员/客户角色 HTTP 权限测试。
 - 状态：PARTIAL
+
+
+### TEST-0062：客户/员工账户边界和顶部入口修正
+
+- 日期：2026-07-30
+- 实际结果：
+  - 交易 Service 增加 customer 角色限制：代码完成；
+  - 账户、订单、交易查询 API 增加 customer 角色限制：代码完成；
+  - 顶部导航客户/员工分层：代码完成；
+  - 右上角下拉个人中心/工作后台/退出登录：代码完成；
+  - 后端 Python 编译：PASS；
+- 待验证：API 重启后的员工 HTTP 403、历史员工交易数据清理、浏览器下拉菜单交互。
+- 状态：PARTIAL
+
+
+### TEST-0063：客户/员工 seed 数据分层修正
+
+- 日期：2026-07-30
+- 前置：已执行 `python -m scripts.reset_dev_state`。
+- 修复：画像、资产、持仓和交易账户 seed 增加 customer 角色判断。
+- 后端编译：PASS。
+- 待验证：重启 API 后员工账户交易接口 403、员工无账户/客户资产数据、客户账户和交易流程正常。
+- 状态：PARTIAL
+
+
+### TEST-0064：异步 seed MissingGreenlet 修复验证
+
+- 日期：2026-07-30
+- 问题：API 启动时 profile seed 访问懒加载 `user.roles`，抛出 `MissingGreenlet`。
+- 修复：seed 用户查询增加 `selectinload(User.roles)`。
+- `python -m scripts.seed_demo_data`：PASS。
+- 待验证：重启 API 启动和客户/员工 HTTP 边界。
+- 状态：PARTIAL
+
+
+### TEST-0065：客户前台/员工后台分层修复阶段验证
+
+- 日期：2026-07-30
+- 已完成：
+  - profile/trading seed 角色预加载：代码编译 PASS；
+  - 员工交易账户和订单 API 的 customer 角色限制：代码编译 PASS；
+  - 顶部右上角下拉菜单和客户/员工入口分层：前端代码完成；
+  - super_admin seed 角色明确写回：代码完成；
+  - 工作人员 API 依赖改为 Annotated：代码完成。
+- 当前发现：运行 API 在加载旧代码时仍返回客户列表 422，客户账户接口曾触发旧版 MissingGreenlet；需要重启后复验。
+- 状态：PARTIAL
+
+
+### TEST-0066：角色矩阵与员工客户接口 422 修复
+
+- 日期：2026-07-30
+- 已验证：
+  - `customer_demo` 登录角色为 `customer`，账户接口 200；
+  - 员工和管理员账户接口 403；
+  - `super_admin_demo` 角色为 `super_admin`，`is_super_admin=true`；
+  - 员工客户列表接口仍返回 422，已修复参数签名，待 API reload 后复验。
+- 状态：PARTIAL
+
+
+### TEST-0067：客户后台/员工后台独立入口第一版
+
+- 日期：2026-07-30
+- 公开前台路由：`/`、`/products`。
+- 客户后台路由：`/customer-center`、`/customer-center/orders`。
+- 员工后台路由：`/employee-workspace`、`/employee-workspace/orders`、`/employee-workspace/customers`。
+- 顶部主导航：已移除客户后台和员工后台链接。
+- 右上角下拉：已保留后台入口和退出登录。
+- 后端编译：PASS。
+- 待验证：API reload 后 staff customer HTTP 200/403 矩阵和浏览器交互。
+- 状态：PARTIAL
+
+
+### TEST-0068：管理员用户/角色/权限后台第一版
+
+- 日期：2026-07-30
+- 参考：`C:\jiaoyu\backend` 独立管理后台结构。
+- 新增 API：
+  - `GET /api/v1/admin/users`
+  - `GET /api/v1/admin/roles`
+  - `GET /api/v1/admin/permissions`
+  - `PUT /api/v1/admin/users/{user_id}/roles`
+- 新增前端入口：`/admin-workspace`。
+- 超级管理员右上角下拉增加系统管理入口。
+- 后端编译：PASS。
+- 待验证：重启后 HTTP 搜索用户、角色修改、权限边界和浏览器交互。
+- 状态：PARTIAL
+
+
+### TEST-0069：staff 依赖第二轮修复与管理员后台编译验证
+
+- 日期：2026-07-30
+- `staff_customer_user` 独立依赖：代码完成。
+- 管理员用户/角色/权限 API：编译通过。
+- 管理员后台页面和右上角入口：代码完成。
+- 当前 API 连接被拒绝，HTTP 验证待服务重新启动。
+- 状态：PARTIAL
+
+
+### TEST-0070：统一管理后台侧边栏与管理员 ORM 修复
+
+- 日期：2026-07-30
+- 修复管理员用户列表访问 `User.roles` 懒加载导致的 `MissingGreenlet`。
+- 修复管理员角色列表访问 `Role.permissions` 懒加载风险。
+- 新增 `/backoffice` 统一后台壳，左侧菜单、右侧内容区。
+- 公开前台和后台路由内容分离。
+- 后端编译：PASS。
+- 前端浏览器/build：待服务 reload 后验证。
+- 状态：PARTIAL
+
+
+### TEST-0071：统一后台顶部身份提示与退出登录
+
+- 日期：2026-07-30
+- 后台子模块从右上角菜单移除：PASS（代码完成）。
+- 后台顶部显示当前用户、角色和审计提示：PASS（代码完成）。
+- 后台页面退出登录按钮：PASS（代码完成）。
+- 统一侧边栏仍负责模块切换：PASS（代码完成）。
+- 待验证：浏览器实际点击和登录态清理。
+- 状态：PARTIAL
+
+
+### TEST-0072：客户订单接口与前端视觉重构
+
+- 日期：2026-07-30
+- 发现：运行 API 对 `/api/v1/trading/orders/me` 返回 404，需确认进程路由注册和重启状态。
+- 客户后台独立路由：`/customer-center`。
+- 公开前台与客户页视觉：改为明亮蓝紫配色。
+- 管理后台：保留独立工作台和侧边栏。
+- 后端编译：PASS。
+- 状态：PARTIAL
+
+
+### TEST-0073：前端 API CORS 预检修复
+
+- 日期：2026-07-30
+- 发现：OPTIONS `/api/v1/health` 返回 405。
+- 修复：FastAPI 增加 CORSMiddleware；前端 Axios 默认恢复 `/api/v1`，由 Vite 代理到 8010。
+- 后端编译：PASS。
+- 待验证：重启 API/前端后浏览器登录、订单查询和交易请求。
+- 状态：PARTIAL
+
+
+### TEST-0074：客户订单列表路由顺序修复
+
+- 日期：2026-07-30
+- 根因：动态路由 `/orders/{order_id}` 抢先匹配静态路径 `/orders/me`。
+- 修复：调整注册顺序，先注册 `/orders/me`，再注册 `/orders/{order_id}`。
+- Python 编译：PASS。
+- 待验证：API reload 后客户订单列表返回 200。
+- 状态：PARTIAL
+
+
+### TEST-0075：客户后台侧边栏与下拉菜单 UI 修正
+
+- 日期：2026-07-30
+- 客户后台独立侧边栏：代码完成。
+- 客户后台移除首页/产品展示内容：代码完成。
+- 客户后台订单模块复用订单 API 页面：代码完成。
+- 下拉菜单显式显示状态和层级：代码完成。
+- 待验证：浏览器鼠标点击、键盘操作和响应式布局。
+- 状态：PARTIAL
+
+
+### TEST-0076：客户后台侧边栏与超级管理员订单审核权限修复
+
+- 日期：2026-07-30
+- 客户后台固定侧边栏：代码完成。
+- 客户后台不显示公开首页/产品导航：代码完成。
+- 超级管理员订单审核依赖参数修复：代码编译通过。
+- 待验证：API reload 后 super_admin `/trading/orders/pending` 返回 200、客户后台浏览器显示完整侧边栏。
+- 状态：PARTIAL
+
+
+### TEST-0077：客户后台布局与下拉当前项可见性修复
+
+- 日期：2026-07-30
+- 当前路由下拉项增加 `account-dropdown-active`：代码完成。
+- `/customer-center*` 隐藏公开前台顶部栏：代码完成。
+- 客户后台增加侧边栏品牌区、菜单区和退出登录：代码完成。
+- 客户后台布局对齐员工后台：代码完成。
+- 待验证：Vite 浏览器实际显示、个人中心和我的订单当前项可见性。
+- 状态：PARTIAL
+
+
+### TEST-0078：客户后台复用员工后台壳与下拉可见性修正
+
+- 日期：2026-07-30
+- 客户后台复用 backoffice 结构：代码完成。
+- 固定左侧栏布局：代码完成。
+- 客户后台恢复公共顶部账号下拉：代码完成。
+- 当前下拉项 RouterLink 激活态可见：代码完成。
+- `/customer-center/orders` 保持在统一后台壳：代码完成。
+- 待验证：浏览器 Ctrl+F5 后布局和菜单实际显示。
+- 状态：PARTIAL
+
+
+### TEST-0079：超级管理员待审核订单路由修复
+
+- 日期：2026-07-30
+- 根因：动态 `/orders/{order_id}` 抢占 `/orders/pending`。
+- 修复：所有静态订单路由先注册，动态详情路由最后注册。
+- Python 编译：PASS。
+- 客户下拉中的“我的订单”重复入口已移除，仅保留个人中心。
+- 待验证：Uvicorn reload 后超级管理员 `/orders/pending` 返回 200。
+- 状态：PARTIAL
+
+
+### TEST-0080：参考模板后台 UI 重构构建验证
+
+- 日期：2026-07-31
+- 参考：`C:\jiaoyu\backend\templates\base.html`、`dashboard.html`、`users.html` 和 `static/css/style.css`。
+- 客户端/员工端后台统一侧边栏壳：PASS（代码）。
+- 公开前台顶部栏在后台路由隐藏：PASS（代码）。
+- 前端命令：`npm run build`。
+- 实际结果：PASS，104 modules transformed。
+- 构建产物：CSS 18.63 kB，JS 162.75 kB。
+- 备注：存在 auth.ts 同时动态和静态导入的非阻塞警告。
+- 状态：PASS
+
+
+### TEST-0081：前台知识库入口移除与后台视觉间距调整
+
+- 日期：2026-07-31
+- 公开首页知识库按钮：已移除。
+- 产品按钮间距：已增加。
+- 后台侧边栏内边距和顶部留白：已增加。
+- 后台文案强调公开前台与客户后台分工：已完成。
+- 状态：PASS（代码级）
+
+
+### TEST-0082：公司前台文案与后台说明卡清理
+
+- 日期：2026-07-31
+- 首页：替换为公司/业务定位文案，PASS。
+- 产品页：替换为产品中心文案，PASS。
+- 客户后台：移除说明性欢迎卡，PASS。
+- 员工/管理员后台：移除说明性欢迎卡，PASS。
+- `npm run build`：PASS，104 modules transformed。
+- 状态：PASS
+
+
+### TEST-0083：管理员用户查询与账号状态管理第一阶段
+
+- 日期：2026-07-31
+- 超级管理员查询 `/api/v1/admin/users?q=customer`：PASS，返回客户和客服演示账号。
+- 用户角色预加载：PASS。
+- 新增账号状态接口：`PUT /api/v1/admin/users/{user_id}/status`。
+- 管理员页面增加启用/禁用账号操作：代码完成。
+- 禁止管理员禁用自己：代码完成。
+- 后端 Python 编译：PASS。
+- 待验证：重启后 HTTP 状态修改、角色修改和权限即时生效。
+- 状态：PARTIAL

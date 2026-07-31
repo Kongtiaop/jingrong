@@ -73,4 +73,5 @@ async def ensure_auth_seed(database: Database, settings: Settings) -> None:
                 await session.refresh(user, attribute_names=["roles"])
             user.roles.clear()
             user.roles.append(role_map[role_code])
+            user.is_super_admin = is_super_admin
         await session.commit()

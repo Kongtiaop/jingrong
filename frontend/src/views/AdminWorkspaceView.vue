@@ -1,0 +1,10 @@
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'
+import { adminApi } from '../api/admin'
+const users=ref<any[]>([]);const roles=ref<any[]>([]);const q=ref('');const selected=ref<any>(null);const selectedRole=ref('');const error=ref('')
+async function load(){try{users.value=(await adminApi.users(q.value)).data.data.items;roles.value=(await adminApi.roles()).data.data}catch(e:any){error.value=e.response?.data?.detail||e.message}}
+async function toggleStatus(u:any){try{await adminApi.updateStatus(u.id,u.status==='active'?'disabled':'active');await load()}catch(e:any){error.value=e.response?.data?.detail||e.message}}
+async function save(){if(!selected.value)return;try{await adminApi.updateRoles(selected.value.id,[selectedRole.value]);await load();selected.value=null}catch(e:any){error.value=e.response?.data?.detail||e.message}}
+onMounted(load)
+</script>
+<template><section class="workspace-page"><div class="section-heading"><div><span class="eyebrow">ADMINISTRATION</span><h2>系统管理后台</h2><p>管理用户、角色和权限，工作后台与公开前台完全分离。</p></div><span class="pill">超级管理员</span></div><div class="search-box"><input v-model="q" placeholder="搜索用户名或姓名" @keyup.enter="load"/><button class="button" @click="load">搜索用户</button></div><p v-if="error" class="error">{{error}}</p><div class="result" v-for="u in users" :key="u.id"><div class="result-meta"><span>{{u.username}}</span><span>{{u.status}}</span></div><h3>{{u.display_name}}</h3><p>角色：{{u.roles.join(', ')}}</p><div class="action-row"><button class="button" @click="selected=u;selectedRole=u.roles[0]">修改角色</button><button class="text-button" @click="toggleStatus(u)">{{u.status==='active'?'禁用账号':'启用账号'}}</button></div></div><div v-if="selected" class="auth-card"><h3>修改 {{selected.username}} 的角色</h3><select v-model="selectedRole"><option v-for="r in roles" :key="r.code" :value="r.code">{{r.name}}（{{r.code}}）</option></select><div class="action-row"><button class="button" @click="save">保存</button><button class="text-button" @click="selected=null">取消</button></div></div></section></template>

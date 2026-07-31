@@ -1,14 +1,17 @@
 from uuid import uuid4
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from app.db.session import Database
-from app.models.auth import User
+from app.models.auth import User, Role
 from app.models.profile import CustomerAssetSnapshot, CustomerHolding, CustomerProfile, Product, ProductSuitabilityRule, RiskRule
 from app.models.trading import Account
 
 async def ensure_profile_seed(database: Database) -> None:
  async with database.session_factory() as s:
-  user=(await s.execute(select(User).where(User.username=="customer_demo"))).scalar_one_or_none()
+  user=(await s.execute(select(User).options(selectinload(User.roles)).where(User.username=="customer_demo"))).scalar_one_or_none()
   if user is None:return
+  customer_role=(await s.execute(select(Role).where(Role.code=="customer"))).scalar_one_or_none()
+  if customer_role is None or customer_role not in user.roles:return
   product=(await s.execute(select(Product).where(Product.name=="稳健增值计划"))).scalar_one_or_none()
   if product is None:
    product=Product(id=str(uuid4()),name="稳健增值计划",product_type="fund",risk_level="C2",term_days=365,minimum_amount=10000,liquidity="medium",description="构造稳健型产品",status="active",source_type="synthetic");s.add(product);await s.flush()

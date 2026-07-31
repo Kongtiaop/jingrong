@@ -2,7 +2,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, desc
 from app.common.response import ApiResponse
-from app.common.security.auth import current_user, require_permission, require_staff_permission
+from app.common.security.auth import current_user, require_permission, require_staff_permission, staff_customer_user
 from app.models.auth import User
 from app.models.profile import Product
 from app.models.trading import Account, Order, Trade, OrderStatusHistory
@@ -22,6 +22,8 @@ async def order_response(session, order):
 
 @router.get("/account/me", response_model=ApiResponse[AccountResponse])
 async def account_me(request: Request, user: Annotated[User, Depends(current_user)]):
+    if not any(role.code == "customer" for role in user.roles):
+        raise HTTPException(status_code=403, detail="customer account required")
     async with request.app.state.database.session_factory() as session:
         account = await service.get_or_create_account(session, user.id); await session.commit(); await session.refresh(account)
         return ApiResponse(data=AccountResponse.model_validate(account, from_attributes=True))
@@ -34,22 +36,18 @@ async def create_order(request: Request, payload: OrderCreateRequest, user: Anno
             return ApiResponse(data=await order_response(session, order))
     except TradingError as exc: err(exc)
 
-@router.get("/orders/{order_id}", response_model=ApiResponse[OrderResponse])
-async def my_order_detail(request: Request, order_id: str, user: Annotated[User, Depends(current_user)]):
-    async with request.app.state.database.session_factory() as session:
-        order = (await session.execute(select(Order).where(Order.id == order_id, Order.user_id == user.id))).scalar_one_or_none()
-        if order is None:
-            raise HTTPException(status_code=404, detail="order not found")
-        return ApiResponse(data=await order_response(session, order))
-
 @router.get("/orders/me", response_model=ApiResponse[list[OrderResponse]])
 async def my_orders(request: Request, user: Annotated[User, Depends(current_user)]):
+    if not any(role.code == "customer" for role in user.roles):
+        raise HTTPException(status_code=403, detail="customer account required")
     async with request.app.state.database.session_factory() as session:
         rows = list((await session.execute(select(Order).where(Order.user_id == user.id).order_by(desc(Order.created_at)))).scalars().all())
         return ApiResponse(data=[await order_response(session, row) for row in rows])
 
 @router.post("/orders/{order_id}/confirm", response_model=ApiResponse[OrderResponse])
 async def confirm_order(request: Request, order_id: str, user: Annotated[User, Depends(current_user)]):
+    if not any(role.code == "customer" for role in user.roles):
+        raise HTTPException(status_code=403, detail="customer account required")
     try:
         async with request.app.state.database.session_factory() as session:
             order = await service.confirm_order(session, user, order_id); await session.commit(); await session.refresh(order)
@@ -58,20 +56,16 @@ async def confirm_order(request: Request, order_id: str, user: Annotated[User, D
 
 @router.post("/orders/{order_id}/cancel", response_model=ApiResponse[OrderResponse])
 async def cancel_order(request: Request, order_id: str, user: Annotated[User, Depends(current_user)]):
+    if not any(role.code == "customer" for role in user.roles):
+        raise HTTPException(status_code=403, detail="customer account required")
     try:
         async with request.app.state.database.session_factory() as session:
             order = await service.cancel_order(session, user, order_id); await session.commit(); await session.refresh(order)
             return ApiResponse(data=await order_response(session, order))
     except TradingError as exc: err(exc)
 
-@router.get("/orders/customer/{user_id}", response_model=ApiResponse[list[OrderResponse]])
-async def customer_orders(request: Request, user_id: str, user: Annotated[User, Depends(require_staff_permission("customer:read"))]):
-    async with request.app.state.database.session_factory() as session:
-        rows = list((await session.execute(select(Order).where(Order.user_id == user_id).order_by(desc(Order.created_at)))).scalars().all())
-        return ApiResponse(data=[await order_response(session, row) for row in rows])
-
 @router.get("/orders/pending", response_model=ApiResponse[list[OrderResponse]])
-async def pending_orders(request: Request, _user: Annotated[User, Depends(require_permission("order:write"))]):
+async def pending_orders(request: Request, user: Annotated[User, Depends(require_permission("order:write"))]):
     async with request.app.state.database.session_factory() as session:
         rows = list((await session.execute(select(Order).where(Order.status == "pending_review").order_by(Order.created_at))).scalars().all())
         return ApiResponse(data=[await order_response(session, row) for row in rows])
@@ -92,8 +86,26 @@ async def reject_order(request: Request, order_id: str, payload: OrderActionRequ
             return ApiResponse(data=await order_response(session, order))
     except TradingError as exc: err(exc)
 
+@router.get("/orders/customer/{user_id}", response_model=ApiResponse[list[OrderResponse]])
+async def customer_orders(request: Request, user_id: str, user: Annotated[User, Depends(staff_customer_user)]):
+    async with request.app.state.database.session_factory() as session:
+        rows = list((await session.execute(select(Order).where(Order.user_id == user_id).order_by(desc(Order.created_at)))).scalars().all())
+        return ApiResponse(data=[await order_response(session, row) for row in rows])
+
+@router.get("/orders/{order_id}", response_model=ApiResponse[OrderResponse])
+async def my_order_detail(request: Request, order_id: str, user: Annotated[User, Depends(current_user)]):
+    if not any(role.code == "customer" for role in user.roles):
+        raise HTTPException(status_code=403, detail="customer account required")
+    async with request.app.state.database.session_factory() as session:
+        order = (await session.execute(select(Order).where(Order.id == order_id, Order.user_id == user.id))).scalar_one_or_none()
+        if order is None:
+            raise HTTPException(status_code=404, detail="order not found")
+        return ApiResponse(data=await order_response(session, order))
+
 @router.get("/trades/me", response_model=ApiResponse[list[TradeResponse]])
 async def my_trades(request: Request, user: Annotated[User, Depends(current_user)]):
+    if not any(role.code == "customer" for role in user.roles):
+        raise HTTPException(status_code=403, detail="customer account required")
     async with request.app.state.database.session_factory() as session:
         rows = list((await session.execute(select(Trade).where(Trade.user_id == user.id).order_by(desc(Trade.executed_at)))).scalars().all())
         return ApiResponse(data=[TradeResponse.model_validate(row, from_attributes=True) for row in rows])
