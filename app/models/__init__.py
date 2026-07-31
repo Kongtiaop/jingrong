@@ -8,3 +8,4 @@ __all__ = ["AsyncTask", "KnowledgeBase", "KnowledgeChunk", "KnowledgeDocument", 
 from app.models.profile import CustomerAssetSnapshot, CustomerHolding, CustomerProfile, CustomerSubjectiveProfile, Product, ProductSuitabilityRule, RiskRule
 
 from app.models.trading import Account, Order, Trade, OrderStatusHistory
+from app.models.audit import AuditLog

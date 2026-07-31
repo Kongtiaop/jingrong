@@ -3,6 +3,7 @@ from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text, fun
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 
+
 class CustomerProfile(Base):
     __tablename__ = "customer_profile"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -16,7 +17,9 @@ class CustomerProfile(Base):
     investment_horizon: Mapped[str] = mapped_column(String(64), default="")
     liquidity_preference: Mapped[str] = mapped_column(String(64), default="")
     source_type: Mapped[str] = mapped_column(String(32), default="synthetic")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
 
 class CustomerSubjectiveProfile(Base):
     __tablename__ = "customer_subjective_profile"
@@ -30,6 +33,7 @@ class CustomerSubjectiveProfile(Base):
     confidence: Mapped[float] = mapped_column(Numeric(5, 4), default=0)
     collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+
 class CustomerAssetSnapshot(Base):
     __tablename__ = "customer_asset_snapshot"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -41,6 +45,8 @@ class CustomerAssetSnapshot(Base):
     net_asset: Mapped[float] = mapped_column(Numeric(18, 2), default=0)
     snapshot_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     source_type: Mapped[str] = mapped_column(String(32), default="synthetic")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
 
 class Product(Base):
     __tablename__ = "product"
@@ -54,8 +60,11 @@ class Product(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
     source_type: Mapped[str] = mapped_column(String(32), default="synthetic")
-
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ProductSuitabilityRule(Base):
     __tablename__ = "product_suitability_rule"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -64,6 +73,9 @@ class ProductSuitabilityRule(Base):
     investor_type: Mapped[str] = mapped_column(String(64), default="individual")
     minimum_investable_asset: Mapped[float] = mapped_column(Numeric(18, 2), default=0)
     rule_text: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
 
 class RiskRule(Base):
     __tablename__ = "risk_rule"
@@ -76,16 +88,20 @@ class RiskRule(Base):
     enabled: Mapped[bool] = mapped_column(default=True)
     version: Mapped[str] = mapped_column(String(32), default="1.0")
     source_document: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
 
 class CustomerHolding(Base):
     __tablename__ = "customer_holding"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    product_id: Mapped[str] = mapped_column(ForeignKey("product.id"), index=True)
+    product_id: Mapped[str] = mapped_column(ForeignKey("product.id", ondelete="CASCADE"), index=True)
     quantity: Mapped[float] = mapped_column(Numeric(18, 4), default=0)
     cost_amount: Mapped[float] = mapped_column(Numeric(18, 2), default=0)
     market_value: Mapped[float] = mapped_column(Numeric(18, 2), default=0)
     profit_loss: Mapped[float] = mapped_column(Numeric(18, 2), default=0)
     holding_days: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(32), default="active")
-
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

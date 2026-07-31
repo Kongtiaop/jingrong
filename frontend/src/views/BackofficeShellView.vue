@@ -6,11 +6,13 @@ import StaffCustomersView from './StaffCustomersView.vue'
 import StaffOrdersView from './StaffOrdersView.vue'
 import AdminWorkspaceView from './AdminWorkspaceView.vue'
 import StaffProductsView from './StaffProductsView.vue'
+import AuditLogsView from './AuditLogsView.vue'
+import RecycleBinView from './RecycleBinView.vue'
 
 const auth = useAuth()
 const router = useRouter()
 const active = ref('dashboard')
-const isAdmin = computed(() => auth.me.value?.is_super_admin === true)
+const isAdmin = computed(() => auth.me.value?.is_super_admin === true || auth.me.value?.roles?.includes('super_admin') === true)
 const permissions = computed(() => auth.me.value?.permissions || [])
 
 const items = computed(() => {
@@ -20,7 +22,7 @@ const items = computed(() => {
   if (permissions.value.includes('product:write')) out.push({ key: 'products', label: '产品管理', icon: '◇' })
   if (permissions.value.includes('risk:write')) out.push({ key: 'risk', label: '风险管理', icon: '△' })
   if (permissions.value.includes('audit:read')) out.push({ key: 'audit', label: '审计查询', icon: '▤' })
-  if (isAdmin.value) out.push({ key: 'admin', label: '用户与权限', icon: '⚙' })
+  if (isAdmin.value) { out.push({ key: 'admin', label: '用户与权限', icon: '⚙' }); out.push({ key: 'recycle', label: '数据回收站', icon: '♻' }) }
   return out
 })
 const currentTitle = computed(() => items.value.find(item => item.key === active.value)?.label || '数据看板')
@@ -47,11 +49,17 @@ async function logout() { await auth.logout(); await router.push('/login') }
         <StaffCustomersView v-else-if="active === 'customers'" />
         <StaffOrdersView v-else-if="active === 'orders'" />
         <StaffProductsView v-else-if="active === 'products'" />
+        <AuditLogsView v-else-if="active === 'audit'" />
+        <RecycleBinView v-else-if="active === 'recycle'" />
         <AdminWorkspaceView v-else-if="active === 'admin'" />
         <div v-else class="portal-panel"><h2>{{currentTitle}}</h2><p>该模块将在后续业务阶段接入。</p></div>
       </section>
     </main>
   </div>
 </template>
+
+
+
+
 
 

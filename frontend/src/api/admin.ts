@@ -8,4 +8,8 @@ export const adminApi = {
   restoreUser: (id: string) => http.put(`/admin/users/${id}/restore`),
   updateRolePermissions: (id: string, permissions: string[]) => http.put(`/admin/roles/${id}/permissions`, { permissions }),
   permissions: () => http.get('/admin/permissions'),
+  recycleBin: (module = 'user', limit = 50, offset = 0) => http.get('/admin/recycle-bin', { params: { module, limit, offset } }),
+  auditLogs: (action = '', resourceType = '', limit = 50, offset = 0) => http.get('/admin/audit-logs', { params: { action, resource_type: resourceType, limit, offset } }),
 }
+
+

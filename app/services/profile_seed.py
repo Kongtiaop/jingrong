@@ -21,10 +21,11 @@ async def ensure_profile_seed(database: Database) -> None:
   account=(await s.execute(select(Account).where(Account.user_id==user.id))).scalar_one_or_none()
   if account is None:s.add(Account(id=str(uuid4()),user_id=user.id,account_no=f"AC{user.id[:10].upper()}",available_balance=200000,frozen_balance=0,status="active"))
   if asset is None:s.add(CustomerAssetSnapshot(id=str(uuid4()),user_id=user.id,total_asset=800000,cash_balance=200000,investable_asset=600000,liability=50000,net_asset=750000,source_type="synthetic"))
-  holding=(await s.execute(select(CustomerHolding).where(CustomerHolding.user_id==user.id))).scalar_one_or_none()
+  holding=(await s.execute(select(CustomerHolding).where(CustomerHolding.user_id==user.id).order_by(CustomerHolding.id).limit(1))).scalar_one_or_none()
   rule=(await s.execute(select(ProductSuitabilityRule).where(ProductSuitabilityRule.product_id==product.id))).scalar_one_or_none()
   if rule is None:s.add(ProductSuitabilityRule(id=str(uuid4()),product_id=product.id,minimum_risk_level="C2",investor_type="individual",minimum_investable_asset=10000,rule_text="C2及以上客户且可投资资产达到1万元"))
   risk=(await s.execute(select(RiskRule).where(RiskRule.rule_code=="SUITABILITY-RISK-001"))).scalar_one_or_none()
   if risk is None:s.add(RiskRule(id=str(uuid4()),rule_code="SUITABILITY-RISK-001",name="客户与产品风险等级匹配",rule_type="suitability",config_json="{\"customer_level\":\"C1-C5\",\"product_level\":\"R1-R5\"}",risk_level="medium",source_document="BUSINESS_KNOWLEDGE_PRODUCTS.md"))
   if holding is None:s.add(CustomerHolding(id=str(uuid4()),user_id=user.id,product_id=product.id,quantity=100,cost_amount=100000,market_value=105000,profit_loss=5000,holding_days=120,status="active"))
   await s.commit()
+

@@ -1,11 +1,13 @@
 from typing import Annotated
 from uuid import uuid4
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, desc, func, or_
 from app.common.response import ApiResponse
 from app.common.security.auth import current_user, require_permission, require_staff_permission, staff_customer_user
 from app.models.auth import User
 from app.models.profile import CustomerAssetSnapshot, CustomerHolding, CustomerProfile, Product
+from app.models.audit import AuditLog
 from app.schemas.profile import *
 from app.services.suitability_service import SuitabilityService
 
@@ -33,18 +35,20 @@ async def staff_products(
     request: Request,
     user: Annotated[User, Depends(require_permission("product:write"))],
     q: str = "",
-    status: str = "",
+    status: str = "active",
     limit: int = 20,
     offset: int = 0,
 ):
     limit = min(max(limit, 1), 100)
     offset = max(offset, 0)
     async with request.app.state.database.session_factory() as s:
-        query = select(Product).where(Product.deleted_at.is_(None))
+        query = select(Product)
+        if status == "active": query = query.where(Product.deleted_at.is_(None), Product.status != "deleted")
+        elif status == "deleted": query = query.where(Product.deleted_at.is_not(None), Product.status == "deleted")
         if q.strip():
             needle = f"%{q.strip()}%"
             query = query.where(or_(Product.name.ilike(needle), Product.product_type.ilike(needle)))
-        if status.strip():
+        if status not in {"active", "deleted", "all"} and status.strip():
             query = query.where(Product.status == status.strip())
         total = (await s.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
         rows = list((await s.execute(query.order_by(Product.name).offset(offset).limit(limit))).scalars().all())
@@ -77,6 +81,7 @@ async def delete_staff_product(request: Request, product_id: str, user: Annotate
         product = (await s.execute(select(Product).where(Product.id == product_id, Product.deleted_at.is_(None)))).scalar_one_or_none()
         if product is None: raise HTTPException(status_code=404, detail="product not found")
         product.status="deleted"; product.deleted_at=datetime.now(timezone.utc)
+        s.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="soft_delete", resource_type="product", resource_id=product.id, detail=product.name))
         await s.commit(); await s.refresh(product)
         return ApiResponse(data=ProductResponse.model_validate(product, from_attributes=True))
 
@@ -86,6 +91,7 @@ async def restore_staff_product(request: Request, product_id: str, user: Annotat
         product = (await s.execute(select(Product).where(Product.id == product_id))).scalar_one_or_none()
         if product is None: raise HTTPException(status_code=404, detail="product not found")
         product.status="active"; product.deleted_at=None
+        s.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="restore", resource_type="product", resource_id=product.id, detail=product.name))
         await s.commit(); await s.refresh(product)
         return ApiResponse(data=ProductResponse.model_validate(product, from_attributes=True))
 
@@ -127,6 +133,11 @@ async def recommendations(request: Request, user: Annotated[User, Depends(curren
     async with request.app.state.database.session_factory() as session:
         data = await SuitabilityService().recommend(session, str(user.id))
         return ApiResponse(data=data)
+
+
+
+
+
 
 
 
