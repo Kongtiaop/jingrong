@@ -55,6 +55,7 @@ class Product(Base):
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
     source_type: Mapped[str] = mapped_column(String(32), default="synthetic")
 
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 class ProductSuitabilityRule(Base):
     __tablename__ = "product_suitability_rule"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -87,3 +88,4 @@ class CustomerHolding(Base):
     profit_loss: Mapped[float] = mapped_column(Numeric(18, 2), default=0)
     holding_days: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(32), default="active")
+

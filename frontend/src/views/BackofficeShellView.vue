@@ -5,6 +5,7 @@ import { useAuth } from '../stores/auth'
 import StaffCustomersView from './StaffCustomersView.vue'
 import StaffOrdersView from './StaffOrdersView.vue'
 import AdminWorkspaceView from './AdminWorkspaceView.vue'
+import StaffProductsView from './StaffProductsView.vue'
 
 const auth = useAuth()
 const router = useRouter()
@@ -45,9 +46,12 @@ async function logout() { await auth.logout(); await router.push('/login') }
         <div v-else-if="active === 'profile'" class="portal-panel"><h2>个人信息</h2><dl class="portal-profile"><dt>用户名</dt><dd>{{auth.me.value?.username}}</dd><dt>姓名</dt><dd>{{auth.me.value?.display_name}}</dd><dt>角色</dt><dd>{{auth.me.value?.roles?.join('、')}}</dd></dl></div>
         <StaffCustomersView v-else-if="active === 'customers'" />
         <StaffOrdersView v-else-if="active === 'orders'" />
+        <StaffProductsView v-else-if="active === 'products'" />
         <AdminWorkspaceView v-else-if="active === 'admin'" />
         <div v-else class="portal-panel"><h2>{{currentTitle}}</h2><p>该模块将在后续业务阶段接入。</p></div>
       </section>
     </main>
   </div>
 </template>
+
+

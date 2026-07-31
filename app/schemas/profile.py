@@ -12,6 +12,7 @@ class AssetSnapshotResponse(AssetSnapshotRequest):
 class ProductRequest(BaseModel):
     name:str; product_type:str="fund"; risk_level:str="C1"; term_days:int=0; minimum_amount:float=0; liquidity:str="medium"; description:str=""; status:str="active"
 class ProductResponse(ProductRequest): id:str; source_type:str
+class ProductListResponse(BaseModel): items:list[ProductResponse]; total:int
 class HoldingResponse(BaseModel):
     id:str; user_id:str; product_id:str; quantity:float; cost_amount:float; market_value:float; profit_loss:float; holding_days:int; status:str
 class ProfileSummary(BaseModel):
@@ -45,3 +46,5 @@ class StaffCustomerListResponse(BaseModel):
 
 class StaffCustomerDetail(ProfileSummary):
     user: StaffCustomerListItem
+
+

@@ -1234,3 +1234,116 @@ docs/BUSINESS_KNOWLEDGE_RISK.md
 - 前端 `npm run build`：PASS，106 modules transformed。
 - 待验证：API reload 后真实分页 total 和浏览器操作。
 - 状态：PARTIAL
+
+### TEST-0089：重启后真实 HTTP 主流程与异常边界验收
+
+- 日期：2026-07-31
+- 环境：重启后的 FastAPI `127.0.0.1:8010`、Vite 前端 `localhost:5173`、PostgreSQL/pgvector、Redis。
+- `/api/v1/health`：PASS，PostgreSQL、pgvector、Redis、Embedding 均正常。
+- 演示账号登录与 `/auth/me`：PASS，超级管理员、客户、运营、审计账号均可登录。
+- 超级管理员用户分页：PASS，`total=7`，`limit/offset` 生效。
+- 超级管理员角色列表：PASS。
+- 超级管理员待审核订单：PASS，返回 `items/total`。
+- 客户账户、订单、交易、个人资料接口：PASS。
+- 未登录访问管理员接口：PASS，返回 401。
+- 客户访问管理员和待审核订单：PASS，返回 403。
+- 禁用客户账号后登录：PASS，返回 401；恢复账号：PASS。
+- 客户创建订单、重复幂等请求、确认、管理员审核：PASS；重复请求返回同一订单，最终状态为 `executed`。
+- 客户访问不存在订单：PASS，返回 404。
+- 发现并修复：待审核订单分页参数原先缺少约束，`limit=0`/负 `offset` 会导致异常或 500；已增加 `Query(ge=1, le=100)` 和 `Query(ge=0)`，修复后返回 422。
+- Python 编译：PASS。
+- 前端探活：PASS，`localhost:5173` 返回 200。
+- 前端 `npm run build`：本轮沙箱执行因 Vite `spawn EPERM` 未完成，需在本机终端复跑确认。
+- 状态：PARTIAL
+- 未覆盖：浏览器逐项点击、压力/并发、数据库/Redis故障注入、长时间稳定性。
+
+### TEST-0090：HTTP Smoke 回归脚本
+
+- 日期：2026-07-31
+- 新增脚本：`tests/test_http_smoke.py`。
+- 默认目标：`http://127.0.0.1:8010/api/v1`。
+- 覆盖：健康检查、演示账号登录、`/auth/me`、管理员分页/角色、客户账户/订单/交易/资料、权限 401/403、非法分页 422、订单幂等创建、确认、审核执行、不存在订单 404。
+- 执行命令：`C:\Users\tx360\.conda\envs\langchain_env\python.exe tests/test_http_smoke.py`
+- 实际结果：PASS，`failures=[]`。
+- 可选本地凭据：增加 `--accounts docs/DEMO_ACCOUNTS.txt`。
+- 状态：PASS
+
+### TEST-0091：受控 HTTP 并发测试
+
+- 日期：2026-07-31
+- 新增脚本：`tests/test_http_concurrency.py`。
+- 默认场景：客户订单/资料只读、管理员用户分页、同一幂等键并发下单。
+- 执行命令：`C:\Users\tx360\.conda\envs\langchain_env\python.exe tests/test_http_concurrency.py --concurrency 5 --requests 10`。
+- 实际结果：PASS，30 个请求，失败 0，median 约 31.95ms，P95 约 117.99ms，最大约 124.93ms。
+- 并发幂等结果：同一幂等键只产生一个订单；成功请求返回 201，竞争请求返回 409，不再出现重复订单或 500。
+- 发现并修复：并发幂等下单原先存在竞态，可能出现重复订单、`MultipleResultsFound`、500；已增加数据库唯一部分索引、启动时重复数据清理、查询兼容处理和 409 冲突响应。
+- 状态：PASS
+
+### TEST-0092：并发测试脚本命令修复与复测
+
+- 日期：2026-07-31
+- 用户首次执行时误输入了 `python tests/`，PowerShell 随后将下一行当作独立命令；正确命令必须包含脚本文件名。
+- 脚本曾因生成文件时残留字面量 `\n` 导致 SyntaxError，已修复。
+- 正确命令：`python tests/test_http_concurrency.py --concurrency 5 --requests 10`。
+- 当前环境复测：PASS，30 个请求、失败 0，median 42.34ms，P95 146.19ms，最大 150.02ms。
+- 幂等并发状态：201/409，符合当前唯一约束策略。
+- 状态：PASS
+
+### TEST-0093：开发环境 HTTP 异常注入与恢复测试
+
+- 日期：2026-07-31
+- 新增脚本：`tests/test_http_faults.py`。
+- 本脚本为非破坏性异常测试，不自动停止 PostgreSQL/Redis；覆盖非法分页、错误登录、未知产品、非法金额、未知订单操作、非法 Token、权限边界和异常后的恢复检查。
+- 首次执行发现非法金额请求返回 500，原因是统一验证错误处理器直接序列化 Pydantic `Decimal`，触发 `TypeError`。
+- 修复：验证错误和应用错误响应统一使用 FastAPI `jsonable_encoder`。
+- 修复后执行结果：12 个检查，失败 0，状态 PASS。
+- 恢复检查：健康、客户订单、管理员用户接口均恢复 200。
+- 状态：PASS
+- 未覆盖：实际停止/重启 PostgreSQL、Redis 和长时间 soak；这些测试必须在确认开发环境且具备恢复权限时单独运行。
+
+### TEST-0094：三套稳定性测试最终验收与产品管理第一阶段
+
+- 日期：2026-07-31
+- 用户环境：`langchain_env`。
+- Smoke：PASS。
+- 并发：PASS，30 请求失败 0，median 26.49ms，P95 106.48ms，最大 110.78ms。
+- 异常注入：PASS，12 项失败 0。
+- 结论：基础 API、权限、交易幂等、并发和异常恢复无阻塞项，可以进入产品管理后台。
+- 产品管理 API：代码完成，产品经理访问 `GET /profile/staff/products` 返回 200。
+- 产品管理前端：代码完成，待本机浏览器和本机 `npm run build` 验证。
+- 状态：PARTIAL
+
+### TEST-0095：用户角色筛选与产品管理 UI 修正
+
+- 日期：2026-07-31
+- 管理员按角色筛选接口：PASS，`role=customer` 返回 200。
+- 产品经理产品列表接口：PASS，返回 200。
+- Smoke 回归：PASS。
+- 用户角色筛选前端：代码完成。
+- 产品新增/编辑弹窗显式显示状态：代码完成。
+- 产品编辑表单双列布局和描述整行布局：代码完成。
+- 待验证：浏览器实际点击、新增保存、编辑保存和本机前端构建。
+- 状态：PARTIAL
+
+### TEST-0096：用户角色筛选修复
+
+- 日期：2026-07-31
+- 根因：后端声明了 `role` 参数，但没有应用到查询条件。
+- 修复：增加 `User.roles.any(code=role.strip())` 条件。
+- `role=customer`：PASS，仅返回客户角色用户。
+- `role=product_manager`：PASS，仅返回产品经理用户。
+- Smoke：PASS。
+- Python 编译：PASS。
+- 状态：PASS
+
+### TEST-0097：用户软删除与恢复接口
+
+- 日期：2026-07-31
+- 用户软删除：PASS，返回 200。
+- 删除后默认用户列表隐藏：代码已接入状态筛选。
+- 用户恢复：PASS，返回 200。
+- Smoke：PASS。
+- Python 编译：PASS。
+- 产品软删除/恢复接口：代码完成，待 API reload 后执行真实 HTTP 验证。
+- 前端删除/恢复按钮：待完成。
+- 状态：PARTIAL

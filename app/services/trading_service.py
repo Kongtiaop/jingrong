@@ -33,7 +33,7 @@ class TradingService:
 
     async def create_order(self, session: AsyncSession, user: User, product_id: str, amount: Decimal, idempotency_key: str | None = None):
         if idempotency_key:
-            existing = (await session.execute(select(Order).where(Order.user_id == user.id, Order.idempotency_key == idempotency_key))).scalar_one_or_none()
+            existing = (await session.execute(select(Order).where(Order.user_id == user.id, Order.idempotency_key == idempotency_key).order_by(Order.created_at.desc()).limit(1))).scalars().first()
             if existing is not None:
                 product = (await session.execute(select(Product).where(Product.id == existing.product_id))).scalar_one_or_none()
                 return existing, product.name if product else None
@@ -100,3 +100,8 @@ class TradingService:
         session.add(Trade(id=str(uuid4()), trade_no=f"T{uuid4().hex[:16].upper()}", order_id=order.id, user_id=order.user_id, product_id=order.product_id, amount=order.amount, quantity=order.quantity))
         await self.transition(session, order, "executed", operator.id, note or "mock trade executed")
         return order
+
+
+
+
+

@@ -1,6 +1,7 @@
 from typing import Annotated
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from sqlalchemy import select, desc, func
+from sqlalchemy.exc import IntegrityError
 from app.common.response import ApiResponse
 from app.common.security.auth import current_user, require_permission, require_staff_permission, staff_customer_user
 from app.models.auth import User
@@ -35,6 +36,8 @@ async def create_order(request: Request, payload: OrderCreateRequest, user: Anno
             order, _ = await service.create_order(session, user, payload.product_id, payload.amount, payload.idempotency_key); await session.commit(); await session.refresh(order)
             return ApiResponse(data=await order_response(session, order))
     except TradingError as exc: err(exc)
+    except IntegrityError:
+        raise HTTPException(status_code=409, detail="idempotency key already used")
 
 @router.get("/orders/me", response_model=ApiResponse[list[OrderResponse]])
 async def my_orders(request: Request, user: Annotated[User, Depends(current_user)]):
@@ -65,7 +68,7 @@ async def cancel_order(request: Request, order_id: str, user: Annotated[User, De
     except TradingError as exc: err(exc)
 
 @router.get("/orders/pending", response_model=ApiResponse[OrderListResponse])
-async def pending_orders(request: Request, limit: int = 20, offset: int = 0, user: Annotated[User, Depends(require_permission("order:write"))] = None):
+async def pending_orders(request: Request, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0), user: Annotated[User, Depends(require_permission("order:write"))] = None):
     async with request.app.state.database.session_factory() as session:
         base_query = select(Order).where(Order.status == "pending_review")
         total = (await session.execute(select(func.count()).select_from(base_query.subquery()))).scalar_one()

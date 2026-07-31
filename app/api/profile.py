@@ -28,10 +28,71 @@ async def update_profile(request:Request,payload:ProfileRequest,user:Annotated[U
 async def create_asset(request:Request,payload:AssetSnapshotRequest,user:Annotated[User,Depends(current_user)]):
  async with request.app.state.database.session_factory() as s:
   obj=CustomerAssetSnapshot(id=str(uuid4()),user_id=user.id,**payload.model_dump());s.add(obj);await s.commit();await s.refresh(obj);return ApiResponse(data=AssetSnapshotResponse.model_validate(obj,from_attributes=True))
+@router.get("/staff/products", response_model=ApiResponse[ProductListResponse])
+async def staff_products(
+    request: Request,
+    user: Annotated[User, Depends(require_permission("product:write"))],
+    q: str = "",
+    status: str = "",
+    limit: int = 20,
+    offset: int = 0,
+):
+    limit = min(max(limit, 1), 100)
+    offset = max(offset, 0)
+    async with request.app.state.database.session_factory() as s:
+        query = select(Product).where(Product.deleted_at.is_(None))
+        if q.strip():
+            needle = f"%{q.strip()}%"
+            query = query.where(or_(Product.name.ilike(needle), Product.product_type.ilike(needle)))
+        if status.strip():
+            query = query.where(Product.status == status.strip())
+        total = (await s.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
+        rows = list((await s.execute(query.order_by(Product.name).offset(offset).limit(limit))).scalars().all())
+        return ApiResponse(data=ProductListResponse(items=[ProductResponse.model_validate(row, from_attributes=True) for row in rows], total=total))
+
+@router.post("/staff/products", response_model=ApiResponse[ProductResponse], status_code=201)
+async def create_staff_product(request: Request, payload: ProductRequest, user: Annotated[User, Depends(require_permission("product:write"))]):
+    async with request.app.state.database.session_factory() as s:
+        product = Product(id=str(uuid4()), **payload.model_dump())
+        s.add(product)
+        await s.commit()
+        await s.refresh(product)
+        return ApiResponse(data=ProductResponse.model_validate(product, from_attributes=True))
+
+@router.put("/staff/products/{product_id}", response_model=ApiResponse[ProductResponse])
+async def update_staff_product(request: Request, product_id: str, payload: ProductRequest, user: Annotated[User, Depends(require_permission("product:write"))]):
+    async with request.app.state.database.session_factory() as s:
+        product = (await s.execute(select(Product).where(Product.id == product_id, Product.deleted_at.is_(None)))).scalar_one_or_none()
+        if product is None:
+            raise HTTPException(status_code=404, detail="product not found")
+        for key, value in payload.model_dump().items():
+            setattr(product, key, value)
+        await s.commit()
+        await s.refresh(product)
+        return ApiResponse(data=ProductResponse.model_validate(product, from_attributes=True))
+
+@router.delete("/staff/products/{product_id}", response_model=ApiResponse[ProductResponse])
+async def delete_staff_product(request: Request, product_id: str, user: Annotated[User, Depends(require_permission("product:write"))]):
+    async with request.app.state.database.session_factory() as s:
+        product = (await s.execute(select(Product).where(Product.id == product_id, Product.deleted_at.is_(None)))).scalar_one_or_none()
+        if product is None: raise HTTPException(status_code=404, detail="product not found")
+        product.status="deleted"; product.deleted_at=datetime.now(timezone.utc)
+        await s.commit(); await s.refresh(product)
+        return ApiResponse(data=ProductResponse.model_validate(product, from_attributes=True))
+
+@router.put("/staff/products/{product_id}/restore", response_model=ApiResponse[ProductResponse])
+async def restore_staff_product(request: Request, product_id: str, user: Annotated[User, Depends(require_permission("product:write"))]):
+    async with request.app.state.database.session_factory() as s:
+        product = (await s.execute(select(Product).where(Product.id == product_id))).scalar_one_or_none()
+        if product is None: raise HTTPException(status_code=404, detail="product not found")
+        product.status="active"; product.deleted_at=None
+        await s.commit(); await s.refresh(product)
+        return ApiResponse(data=ProductResponse.model_validate(product, from_attributes=True))
+
 @router.get("/products",response_model=ApiResponse[list[ProductResponse]])
 async def products(request:Request):
  async with request.app.state.database.session_factory() as s:
-  rows=list((await s.execute(select(Product).where(Product.status=="active").order_by(Product.name))).scalars().all());return ApiResponse(data=[ProductResponse.model_validate(x,from_attributes=True) for x in rows])
+  rows=list((await s.execute(select(Product).where(Product.status=="active", Product.deleted_at.is_(None)).order_by(Product.name))).scalars().all());return ApiResponse(data=[ProductResponse.model_validate(x,from_attributes=True) for x in rows])
 @router.get("/staff/customers", response_model=ApiResponse[StaffCustomerListResponse])
 async def staff_customers(
     request: Request,
@@ -66,3 +127,6 @@ async def recommendations(request: Request, user: Annotated[User, Depends(curren
     async with request.app.state.database.session_factory() as session:
         data = await SuitabilityService().recommend(session, str(user.id))
         return ApiResponse(data=data)
+
+
+
