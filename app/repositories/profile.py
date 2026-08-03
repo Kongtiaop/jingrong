@@ -1,21 +1,32 @@
+class SqlAlchemyUserRepository:
+    async def get(self, session, user_id):
+        from app.models.auth import User
+        return (await session.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+
+    async def is_customer(self, session, user_id):
+        from sqlalchemy import exists
+        from app.models.auth import User
+        return bool((await session.execute(select(exists().where(User.id == user_id, User.roles.any(code="customer"))))).scalar())
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 from app.models.profile import CustomerProfile, CustomerRiskAssessment, Product
 
 class SqlAlchemyCustomerRepository:
-    async def get_user(self, session, user_id): return (await session.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-    async def get_profile(self, session, user_id): return (await session.execute(select(CustomerProfile).where(CustomerProfile.user_id == user_id))).scalar_one_or_none()
-    async def save_profile(self, session, profile): session.add(profile); await session.flush(); return profile
+    """Compatibility facade; canonical implementation lives in trading.py."""
+    def __new__(cls):
+        from app.repositories.trading import SqlAlchemyProfileRepository
+        return SqlAlchemyProfileRepository()
 
 class SqlAlchemyProductRepository:
-    async def get_active(self, session, product_id): return (await session.execute(select(Product).where(Product.id == product_id, Product.status == "active", Product.deleted_at.is_(None)))).scalar_one_or_none()
-    async def list_active(self, session): return list((await session.execute(select(Product).where(Product.status == "active", Product.deleted_at.is_(None)).order_by(Product.name))).scalars().all())
+    """Compatibility facade; canonical implementation lives in trading.py."""
+    def __new__(cls):
+        from app.repositories.trading import SqlAlchemyProductReadRepository
+        return SqlAlchemyProductReadRepository()
 
 class SqlAlchemyRiskAssessmentRepository:
-    async def get_active(self, session, user_id): return (await session.execute(select(CustomerRiskAssessment).where(CustomerRiskAssessment.user_id == user_id, CustomerRiskAssessment.status.in_(["active", "provisional"])).order_by(CustomerRiskAssessment.assessed_at.desc()).limit(1))).scalars().first()
-    async def supersede_active(self, session, user_id):
-        rows=list((await session.execute(select(CustomerRiskAssessment).where(CustomerRiskAssessment.user_id == user_id, CustomerRiskAssessment.status == "active"))).scalars().all())
-        for row in rows: row.status="superseded"
-        await session.flush()
-    async def save(self, session, assessment): session.add(assessment); await session.flush(); return assessment
+    """Compatibility facade; canonical implementation lives in trading.py."""
+    def __new__(cls):
+        from app.repositories.trading import SqlAlchemyRiskRepository
+        return SqlAlchemyRiskRepository()

@@ -3,6 +3,10 @@ import json
 from uuid import uuid4
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
+from app.common.exceptions import ConflictError, ResourceNotFoundError
+from app.schemas.profile import StaffRecommendationRequest, StaffRecommendationResponse, AdvisorDraftRequest, AdvisorDraftResponse, AdvisorAuthorizationRequest, AdvisorAuthorizationResponse
+from app.models.auth import CustomerAdvisorAuthorization
+from app.models.trading import AdvisorOperationDraft, Order
 from sqlalchemy import select, desc, func, or_
 from app.common.response import ApiResponse
 from app.common.security.auth import current_user, require_permission, require_staff_permission, staff_customer_user
@@ -11,30 +15,83 @@ from app.models.profile import CustomerAssetSnapshot, CustomerEnterpriseVerifica
 from app.models.audit import AuditLog
 from app.schemas.profile import *
 from app.services.suitability_service import SuitabilityService
-from app.services.customer_tier_service import CustomerTierService
+from app.services.customer_tier_service import CustomerTierService, calculate_customer_tier
 from app.services.risk_assessment_service import RiskAssessmentService
 from app.services.asset_summary_service import AssetSummaryService
+from app.services.holding_valuation_service import HoldingValuationService
+from app.services.trading_service import TradingError
 
 router=APIRouter(prefix="/profile",tags=["profile"])
+
+def resolve_profile_uow(request: Request):
+    trading_service = getattr(request.app.state, "trading_service", None)
+    if trading_service is not None:
+        return trading_service.unit_of_work
+    from app.repositories.unit_of_work import create_postgres_unit_of_work
+    return create_postgres_unit_of_work()
+
 @router.get("/me",response_model=ApiResponse[ProfileSummary])
 async def my_summary(request:Request,user:Annotated[User,Depends(current_user)]):
+ trading_service = getattr(request.app.state, "trading_service", None)
+ if trading_service is None:
+  from app.repositories.unit_of_work import create_postgres_unit_of_work
+  uow = create_postgres_unit_of_work()
+ else:
+  uow = trading_service.unit_of_work
+ asset_service = AssetSummaryService(
+  account_repository=uow.accounts,
+  holding_repository=uow.holdings,
+  asset_repository=uow.assets,
+ )
  async with request.app.state.database.session_factory() as s:
-  profile=(await s.execute(select(CustomerProfile).where(CustomerProfile.user_id==user.id))).scalar_one_or_none()
-  asset=await AssetSummaryService().latest_or_derived(s, user.id)
-  holdings=list((await s.execute(select(CustomerHolding).where(CustomerHolding.user_id==user.id, CustomerHolding.status=="active"))).scalars().all())
-  return ApiResponse(data=ProfileSummary(profile=ProfileResponse.model_validate(profile,from_attributes=True) if profile else None,latest_asset=AssetSnapshotResponse.model_validate(asset,from_attributes=True) if asset else None,holdings=[HoldingResponse.model_validate(h,from_attributes=True) for h in holdings]))
+  profile = await uow.profiles.get(s, user.id)
+  asset = await asset_service.latest_or_derived(s, user.id)
+  holdings = await uow.holdings.list_active(s, user.id)
+  details = await HoldingValuationService().details_for(s, holdings)
+  holding_items = [HoldingResponse.model_validate(h,from_attributes=True).model_copy(update=details.get(h.id, {})) for h in holdings]
+  return ApiResponse(data=ProfileSummary(profile=ProfileResponse.model_validate(profile,from_attributes=True) if profile else None,latest_asset=AssetSnapshotResponse.model_validate(asset,from_attributes=True) if asset else None,holdings=holding_items))
+@router.get("/me/assets/history",response_model=ApiResponse[AssetSnapshotHistoryResponse])
+async def asset_history(request: Request, limit: int = 60, user: Annotated[User, Depends(current_user)] = None):
+ if limit < 1 or limit > 180:
+  raise HTTPException(status_code=422, detail={"code":"INVALID_LIMIT","message":"limit must be between 1 and 180"})
+ async with request.app.state.database.session_factory() as s:
+  rows = list((await s.execute(select(CustomerAssetSnapshot).where(CustomerAssetSnapshot.user_id==user.id).order_by(CustomerAssetSnapshot.snapshot_time.desc(), CustomerAssetSnapshot.id.desc()).limit(limit))).scalars().all())
+  rows.reverse()
+  return ApiResponse(data=AssetSnapshotHistoryResponse(items=[AssetSnapshotResponse.model_validate(row, from_attributes=True) for row in rows], total=len(rows)))
+
 @router.put("/me",response_model=ApiResponse[ProfileResponse])
 async def update_profile(request:Request,payload:ProfileRequest,user:Annotated[User,Depends(current_user)]):
+ trading_service = getattr(request.app.state, "trading_service", None)
+ if trading_service is None:
+  from app.repositories.unit_of_work import create_postgres_unit_of_work
+  uow = create_postgres_unit_of_work()
+ else:
+  uow = trading_service.unit_of_work
  async with request.app.state.database.session_factory() as s:
-  obj=(await s.execute(select(CustomerProfile).where(CustomerProfile.user_id==user.id))).scalar_one_or_none()
-  if obj is None: obj=CustomerProfile(id=str(uuid4()),user_id=user.id);s.add(obj)
-  for k,v in payload.model_dump().items():setattr(obj,k,v)
-  s.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="update", resource_type="customer_profile", resource_id=obj.id, detail="customer editable profile updated"))
-  await s.commit();await s.refresh(obj);return ApiResponse(data=ProfileResponse.model_validate(obj,from_attributes=True))
+  obj = await uow.profiles.get(s, user.id)
+  if obj is None:
+   obj = CustomerProfile(id=str(uuid4()), user_id=user.id, **payload.model_dump())
+   obj = await uow.profiles.save(s, obj)
+  else:
+   for k, v in payload.model_dump().items():
+    setattr(obj, k, v)
+   obj = await uow.profiles.update_values(s, obj)
+  await uow.audit_logs.save(s, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="update", resource_type="customer_profile", resource_id=obj.id, detail="customer editable profile updated"))
+  await s.commit(); await s.refresh(obj)
+  return ApiResponse(data=ProfileResponse.model_validate(obj,from_attributes=True))
 @router.post("/me/assets",response_model=ApiResponse[AssetSnapshotResponse],status_code=201)
 async def create_asset(request:Request,payload:AssetSnapshotRequest,user:Annotated[User,Depends(current_user)]):
+ trading_service = getattr(request.app.state, "trading_service", None)
+ if trading_service is None:
+  from app.repositories.unit_of_work import create_postgres_unit_of_work
+  uow = create_postgres_unit_of_work()
+ else:
+  uow = trading_service.unit_of_work
  async with request.app.state.database.session_factory() as s:
-  obj=CustomerAssetSnapshot(id=str(uuid4()),user_id=user.id,**payload.model_dump());s.add(obj);await s.commit();await s.refresh(obj);return ApiResponse(data=AssetSnapshotResponse.model_validate(obj,from_attributes=True))
+  obj = CustomerAssetSnapshot(id=str(uuid4()), user_id=user.id, **payload.model_dump())
+  obj = await uow.assets.save(s, obj)
+  await s.commit(); await s.refresh(obj)
+  return ApiResponse(data=AssetSnapshotResponse.model_validate(obj,from_attributes=True))
 @router.get("/staff/products", response_model=ApiResponse[ProductListResponse])
 async def staff_products(
     request: Request,
@@ -61,131 +118,399 @@ async def staff_products(
 
 @router.post("/staff/products", response_model=ApiResponse[ProductResponse], status_code=201)
 async def create_staff_product(request: Request, payload: ProductRequest, user: Annotated[User, Depends(require_permission("product:write"))]):
+    uow = resolve_profile_uow(request)
     async with request.app.state.database.session_factory() as s:
-        product = Product(id=str(uuid4()), **payload.model_dump())
-        s.add(product)
-        await s.commit()
-        await s.refresh(product)
+        product = await uow.products.save(s, Product(id=str(uuid4()), **payload.model_dump()))
+        await s.commit(); await s.refresh(product)
         return ApiResponse(data=ProductResponse.model_validate(product, from_attributes=True))
 
 @router.put("/staff/products/{product_id}", response_model=ApiResponse[ProductResponse])
 async def update_staff_product(request: Request, product_id: str, payload: ProductRequest, user: Annotated[User, Depends(require_permission("product:write"))]):
+    uow = resolve_profile_uow(request)
     async with request.app.state.database.session_factory() as s:
-        product = (await s.execute(select(Product).where(Product.id == product_id, Product.deleted_at.is_(None)))).scalar_one_or_none()
-        if product is None:
-            raise HTTPException(status_code=404, detail="product not found")
-        for key, value in payload.model_dump().items():
-            setattr(product, key, value)
-        await s.commit()
-        await s.refresh(product)
+        product = await uow.products.get_active(s, product_id)
+        if product is None: raise HTTPException(status_code=404, detail={"code":"PRODUCT_NOT_FOUND","message":"product not found"})
+        for key, value in payload.model_dump().items(): setattr(product, key, value)
+        product = await uow.products.update_values(s, product)
+        await s.commit(); await s.refresh(product)
         return ApiResponse(data=ProductResponse.model_validate(product, from_attributes=True))
 
 @router.delete("/staff/products/{product_id}", response_model=ApiResponse[ProductResponse])
 async def delete_staff_product(request: Request, product_id: str, user: Annotated[User, Depends(require_permission("product:write"))]):
+    uow = resolve_profile_uow(request)
     async with request.app.state.database.session_factory() as s:
-        product = (await s.execute(select(Product).where(Product.id == product_id, Product.deleted_at.is_(None)))).scalar_one_or_none()
-        if product is None: raise HTTPException(status_code=404, detail="product not found")
+        product = await uow.products.get_active(s, product_id)
+        if product is None: raise HTTPException(status_code=404, detail={"code":"PRODUCT_NOT_FOUND","message":"product not found"})
         product.status="deleted"; product.deleted_at=datetime.now(timezone.utc)
-        s.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="soft_delete", resource_type="product", resource_id=product.id, detail=product.name))
+        product = await uow.products.update_values(s, product)
+        await uow.audit_logs.save(s, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="soft_delete", resource_type="product", resource_id=product.id, detail=product.name))
         await s.commit(); await s.refresh(product)
         return ApiResponse(data=ProductResponse.model_validate(product, from_attributes=True))
 
 @router.put("/staff/products/{product_id}/restore", response_model=ApiResponse[ProductResponse])
 async def restore_staff_product(request: Request, product_id: str, user: Annotated[User, Depends(require_permission("product:write"))]):
+    uow = resolve_profile_uow(request)
     async with request.app.state.database.session_factory() as s:
-        product = (await s.execute(select(Product).where(Product.id == product_id))).scalar_one_or_none()
-        if product is None: raise HTTPException(status_code=404, detail="product not found")
+        product = await uow.products.get_by_id(s, product_id)
+        if product is None: raise HTTPException(status_code=404, detail={"code":"PRODUCT_NOT_FOUND","message":"product not found"})
         product.status="active"; product.deleted_at=None
-        s.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="restore", resource_type="product", resource_id=product.id, detail=product.name))
+        product = await uow.products.update_values(s, product)
+        await uow.audit_logs.save(s, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="restore", resource_type="product", resource_id=product.id, detail=product.name))
         await s.commit(); await s.refresh(product)
         return ApiResponse(data=ProductResponse.model_validate(product, from_attributes=True))
 
 @router.get("/products",response_model=ApiResponse[list[ProductResponse]])
 async def products(request:Request):
+ uow = resolve_profile_uow(request)
  async with request.app.state.database.session_factory() as s:
-  rows=list((await s.execute(select(Product).where(Product.status=="active", Product.deleted_at.is_(None)).order_by(Product.name))).scalars().all());return ApiResponse(data=[ProductResponse.model_validate(x,from_attributes=True) for x in rows])
-@router.get("/staff/customers", response_model=ApiResponse[StaffCustomerListResponse])
-async def staff_customers(
-    request: Request,
-    user: Annotated[User, Depends(staff_customer_user)],
-    q: str = "",
-    tier: str = "",
-    customer_type: str = "",
-    limit: int = 50,
-    offset: int = 0,
-):
-    limit = min(max(limit, 1), 100)
-    async with request.app.state.database.session_factory() as s:
-        query = select(User).where(User.status == "active", User.roles.any(code="customer"))
-        if q.strip():
-            needle = f"%{q.strip()}%"
-            query = query.where(or_(User.username.ilike(needle), User.display_name.ilike(needle)))
-        total = (await s.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
-        users = list((await s.execute(query.order_by(User.created_at).offset(offset).limit(limit))).scalars().all())
-        items = []
-        for customer in users:
-            profile = (await s.execute(select(CustomerProfile).where(CustomerProfile.user_id == customer.id))).scalar_one_or_none()
-            asset = await AssetSummaryService().latest_or_derived(s, customer.id)
-            holding_count = (await s.execute(select(func.count()).select_from(CustomerHolding).where(CustomerHolding.user_id == customer.id, CustomerHolding.status == "active"))).scalar_one()
-            tier_data = await CustomerTierService().calculate(s, customer.id, persist=True)
-            if tier.strip() and tier_data["customer_tier"] != tier.strip():
-                continue
-            if customer_type.strip() and tier_data["customer_type"] != customer_type.strip():
-                continue
-            risk = (await s.execute(select(CustomerRiskAssessment).where(CustomerRiskAssessment.user_id == customer.id, CustomerRiskAssessment.status == "active").order_by(CustomerRiskAssessment.assessed_at.desc()).limit(1))).scalars().first()
-            items.append(StaffCustomerListItem(id=customer.id, username=customer.username, display_name=customer.display_name, status=customer.status, profile=ProfileResponse.model_validate(profile, from_attributes=True) if profile else None, latest_asset=AssetSnapshotResponse.model_validate(asset, from_attributes=True) if asset else None, customer_tier=tier_data["customer_tier"], tier_reasons=tier_data["reasons"], risk_level=risk.risk_level if risk else None, risk_score=risk.score if risk else None, risk_status=risk.status if risk else None, holding_count=holding_count))
-        return ApiResponse(data=StaffCustomerListResponse(items=items, total=total))
+  rows = await uow.products.list_active(s)
+  return ApiResponse(data=[ProductResponse.model_validate(x,from_attributes=True) for x in rows])
+async def _active_advisor_authorization(session, customer_id: str, advisor_id: str, now: datetime | None = None):
+    now = now or datetime.now(timezone.utc)
+    return (await session.execute(select(CustomerAdvisorAuthorization).where(
+        CustomerAdvisorAuthorization.customer_id == customer_id,
+        CustomerAdvisorAuthorization.advisor_id == advisor_id,
+        CustomerAdvisorAuthorization.status == "active",
+        CustomerAdvisorAuthorization.effective_from <= now,
+        or_(CustomerAdvisorAuthorization.effective_to.is_(None), CustomerAdvisorAuthorization.effective_to >= now),
+    ).order_by(CustomerAdvisorAuthorization.created_at.desc()))).scalars().first()
 
-@router.get("/staff/customer/{user_id}",response_model=ApiResponse[ProfileSummary])
-async def staff_summary(request:Request,user_id:str,user: Annotated[User, Depends(staff_customer_user)]):
- async with request.app.state.database.session_factory() as s:
-  profile=(await s.execute(select(CustomerProfile).where(CustomerProfile.user_id==user_id))).scalar_one_or_none();asset=await AssetSummaryService().latest_or_derived(s, user_id);holdings=list((await s.execute(select(CustomerHolding).where(CustomerHolding.user_id==user_id, CustomerHolding.status=="active"))).scalars().all());return ApiResponse(data=ProfileSummary(profile=ProfileResponse.model_validate(profile,from_attributes=True) if profile else None,latest_asset=AssetSnapshotResponse.model_validate(asset,from_attributes=True) if asset else None,holdings=[HoldingResponse.model_validate(h,from_attributes=True) for h in holdings]))
+
+def _customer_summary_item(row, customer_tier_value: str, tier_reasons: list[str]) -> StaffCustomerListItem:
+    customer = row.user
+    profile = row.profile
+    asset = row.asset
+    risk = row.risk
+    return StaffCustomerListItem(
+        id=customer.id, username=customer.username, display_name=customer.display_name, status=customer.status,
+        profile=ProfileResponse.model_validate(profile, from_attributes=True) if profile else None,
+        latest_asset=AssetSnapshotResponse.model_validate(asset, from_attributes=True) if asset else None,
+        customer_tier=customer_tier_value, tier_reasons=tier_reasons,
+        risk_level=risk.risk_level if risk else None, risk_score=risk.score if risk else None,
+        risk_status=risk.status if risk else None, holding_count=row.holding_count,
+    )
+
+
+async def _list_customer_summaries(request: Request, q: str, tier: str, customer_type: str, limit: int, offset: int, allowed_customer_ids: set[str] | None = None) -> StaffCustomerListResponse:
+    limit = min(max(limit, 1), 100)
+    uow = resolve_profile_uow(request)
+    async with request.app.state.database.session_factory() as s:
+        rows = await uow.customer_queries.list_staff_customer_views(s, q=q, limit=10000, offset=0)
+        filtered = []
+        for row in rows:
+            if allowed_customer_ids is not None and row.user.id not in allowed_customer_ids:
+                continue
+            profile = row.profile
+            asset = row.asset
+            customer_type_value = profile.customer_type if profile else "individual"
+            investable_asset = asset.investable_asset if asset else 0
+            customer_tier_value, tier_reasons = calculate_customer_tier(customer_type_value, investable_asset)
+            if tier.strip() and customer_tier_value != tier.strip():
+                continue
+            if customer_type.strip() and customer_type_value != customer_type.strip():
+                continue
+            filtered.append((row, customer_tier_value, tier_reasons))
+        page = filtered[max(offset, 0):max(offset, 0) + limit]
+        return StaffCustomerListResponse(
+            items=[_customer_summary_item(row, customer_tier_value, tier_reasons) for row, customer_tier_value, tier_reasons in page],
+            total=len(filtered),
+        )
+
+
+@router.get("/staff/customers", response_model=ApiResponse[StaffCustomerListResponse])
+async def staff_customers(request: Request, user: Annotated[User, Depends(require_permission("customer:read"))], q: str = "", tier: str = "", customer_type: str = "", limit: int = 50, offset: int = 0):
+    """Operational customer-management list: all active customers within customer:read scope."""
+    return ApiResponse(data=await _list_customer_summaries(request, q, tier, customer_type, limit, offset))
+
+
+@router.get("/staff/advisor-customers", response_model=ApiResponse[StaffCustomerListResponse])
+async def staff_advisor_customers(request: Request, user: Annotated[User, Depends(staff_customer_user)], q: str = "", tier: str = "", customer_type: str = "", limit: int = 50, offset: int = 0):
+    """Advisor workbench list: only customers with an active, effective authorization for the current advisor."""
+    now = datetime.now(timezone.utc)
+    async with request.app.state.database.session_factory() as s:
+        authorized_customer_ids = set((await s.execute(select(CustomerAdvisorAuthorization.customer_id).where(
+            CustomerAdvisorAuthorization.advisor_id == user.id,
+            CustomerAdvisorAuthorization.status == "active",
+            CustomerAdvisorAuthorization.effective_from <= now,
+            or_(CustomerAdvisorAuthorization.effective_to.is_(None), CustomerAdvisorAuthorization.effective_to >= now),
+        ))).scalars().all())
+    if not authorized_customer_ids:
+        return ApiResponse(data=StaffCustomerListResponse(items=[], total=0))
+    return ApiResponse(data=await _list_customer_summaries(request, q, tier, customer_type, limit, offset, authorized_customer_ids))
+
+
+
+@router.get("/staff/customer/{user_id}", response_model=ApiResponse[ProfileSummary])
+async def staff_summary(request: Request, user_id: str, user: Annotated[User, Depends(staff_customer_user)]):
+    uow = resolve_profile_uow(request)
+    asset_service = AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets)
+    async with request.app.state.database.session_factory() as s:
+        if await _active_advisor_authorization(s, user_id, str(user.id)) is None:
+            raise HTTPException(status_code=403, detail={"code": "ADVISOR_AUTHORIZATION_REQUIRED", "message": "active advisor authorization required"})
+        profile = await uow.profiles.get(s, user_id)
+        if profile is None:
+            raise HTTPException(status_code=404, detail={"code": "CUSTOMER_NOT_FOUND", "message": "customer not found"})
+        asset = await asset_service.latest_or_derived(s, user_id)
+        holdings = await uow.holdings.list_active(s, user_id)
+        details = await HoldingValuationService().details_for(s, holdings)
+        holding_items = [HoldingResponse.model_validate(h, from_attributes=True).model_copy(update=details.get(h.id, {})) for h in holdings]
+        return ApiResponse(data=ProfileSummary(
+            profile=ProfileResponse.model_validate(profile, from_attributes=True),
+            latest_asset=AssetSnapshotResponse.model_validate(asset, from_attributes=True) if asset else None,
+            holdings=holding_items,
+        ))
+
+
+@router.post("/me/advisor-authorizations", response_model=ApiResponse[AdvisorAuthorizationResponse], status_code=201)
+async def create_advisor_authorization(request: Request, payload: AdvisorAuthorizationRequest, user: Annotated[User, Depends(current_user)]):
+    uow = resolve_profile_uow(request)
+    async with request.app.state.database.session_factory() as session:
+        advisor = await uow.users.get(session, payload.advisor_id)
+        if advisor is None:
+            raise HTTPException(status_code=404, detail={"code": "ADVISOR_NOT_FOUND", "message": "advisor not found"})
+        existing = (await session.execute(select(CustomerAdvisorAuthorization).where(
+            CustomerAdvisorAuthorization.customer_id == user.id,
+            CustomerAdvisorAuthorization.advisor_id == payload.advisor_id,
+            CustomerAdvisorAuthorization.status == "active",
+        ).with_for_update())).scalars().first()
+        if existing is not None:
+            for key, value in payload.model_dump().items():
+                setattr(existing, key, value)
+            existing.effective_to = None
+            existing.revoked_at = None
+            existing.status = "active"
+            authorization = existing
+        else:
+            authorization = CustomerAdvisorAuthorization(customer_id=user.id, **payload.model_dump(), id=str(uuid4()))
+            session.add(authorization)
+        await session.flush()
+        await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="grant", resource_type="advisor_authorization", resource_id=authorization.id, detail=payload.model_dump_json()))
+        await session.commit(); await session.refresh(authorization)
+        return ApiResponse(data=AdvisorAuthorizationResponse.model_validate(authorization, from_attributes=True))
+
+@router.get("/me/advisor-authorizations", response_model=ApiResponse[dict])
+async def list_advisor_authorizations(request: Request, limit: int = 20, offset: int = 0, user: Annotated[User, Depends(current_user)] = None):
+    async with request.app.state.database.session_factory() as session:
+        query=select(CustomerAdvisorAuthorization).where(CustomerAdvisorAuthorization.customer_id == user.id, CustomerAdvisorAuthorization.status == "active").order_by(CustomerAdvisorAuthorization.created_at.desc())
+        total=int((await session.execute(select(func.count()).select_from(query.subquery()))).scalar_one())
+        rows=list((await session.execute(query.offset(max(offset,0)).limit(min(max(limit,1),100)))).scalars().all())
+        advisor_ids={row.advisor_id for row in rows}
+        advisors={item.id:item for item in (await session.execute(select(User).where(User.id.in_(advisor_ids)))).scalars().all()} if advisor_ids else {}
+        items=[]
+        for row in rows:
+            payload={**row.__dict__, "advisor_name": advisors.get(row.advisor_id).display_name if advisors.get(row.advisor_id) else ""}
+            items.append(AdvisorAuthorizationResponse.model_validate(payload))
+        return ApiResponse(data={"items":items,"total":total})
+
+@router.delete("/me/advisor-authorizations/{authorization_id}", response_model=ApiResponse[dict])
+async def revoke_advisor_authorization(request: Request, authorization_id: str, user: Annotated[User, Depends(current_user)]):
+    uow = resolve_profile_uow(request)
+    async with request.app.state.database.session_factory() as session:
+        row = (await session.execute(select(CustomerAdvisorAuthorization).where(CustomerAdvisorAuthorization.id == authorization_id, CustomerAdvisorAuthorization.customer_id == user.id, CustomerAdvisorAuthorization.status == "active"))).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail={"code": "AUTHORIZATION_NOT_FOUND", "message": "advisor authorization not found"})
+        row.status = "revoked"; row.revoked_at = datetime.now(timezone.utc)
+        await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="revoke", resource_type="advisor_authorization", resource_id=row.id, detail="customer revoked authorization")); await session.commit()
+        return ApiResponse(data={"id": row.id, "status": row.status})
+
+@router.get("/staff/advisors", response_model=ApiResponse[dict])
+async def staff_advisors(request: Request, limit: int = 20, offset: int = 0, user: Annotated[User, Depends(current_user)] = None):
+    async with request.app.state.database.session_factory() as session:
+        query=select(User).where(User.status == "active", User.is_super_admin.is_(True) | User.roles.any(code="product_manager"))
+        total=int((await session.execute(select(func.count()).select_from(query.subquery()))).scalar_one())
+        rows=list((await session.execute(query.offset(max(offset,0)).limit(min(max(limit,1),100)))).scalars().all())
+        return ApiResponse(data={"items":[{"id": row.id, "username": row.username, "display_name": row.display_name} for row in rows],"total":total})
+
+@router.post("/staff/recommendations", response_model=ApiResponse[StaffRecommendationResponse])
+async def staff_recommendations(request: Request, payload: StaffRecommendationRequest, user: Annotated[User, Depends(staff_customer_user)]):
+    uow = resolve_profile_uow(request)
+    async with request.app.state.database.session_factory() as session:
+        if await _active_advisor_authorization(session, payload.customer_id, str(user.id)) is None:
+            raise HTTPException(status_code=403, detail={"code": "ADVISOR_AUTHORIZATION_REQUIRED", "message": "active advisor authorization required"})
+        profile = await uow.profiles.get(session, payload.customer_id)
+        if profile is None:
+            raise HTTPException(status_code=404, detail={"code": "CUSTOMER_NOT_FOUND", "message": "customer not found"})
+        service = SuitabilityService(risk_repository=uow.risks, product_repository=uow.products, profile_repository=uow.profiles, asset_service=AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets))
+        recommendation = await service.recommend(session, payload.customer_id)
+        data = StaffRecommendationResponse(user_id=recommendation.user_id, matches=recommendation.matches, excluded=recommendation.excluded, generated_for=payload.customer_id)
+        return ApiResponse(data=data)
+
+@router.post("/staff/operation-drafts", response_model=ApiResponse[AdvisorDraftResponse], status_code=201)
+async def create_staff_operation_draft(request: Request, payload: AdvisorDraftRequest, user: Annotated[User, Depends(current_user)]):
+    uow = resolve_profile_uow(request)
+    async with request.app.state.database.session_factory() as session:
+        profile = await uow.profiles.get(session, payload.customer_id)
+        if profile is None:
+            raise HTTPException(status_code=404, detail={"code": "CUSTOMER_NOT_FOUND", "message": "customer not found"})
+        product = await uow.products.get_active(session, payload.product_id)
+        if product is None:
+            raise HTTPException(status_code=404, detail={"code": "PRODUCT_NOT_FOUND", "message": "product not found"})
+        now = datetime.now(timezone.utc)
+        advisor_id = str(user.id)
+        authorization = await _active_advisor_authorization(session, payload.customer_id, advisor_id, now)
+        if authorization is None:
+            raise HTTPException(status_code=403, detail={"code": "ADVISOR_AUTHORIZATION_REQUIRED", "message": "active advisor authorization required"})
+        allowed_actions = {item.strip() for item in authorization.allowed_actions.split(",") if item.strip()}
+        if "buy" not in allowed_actions:
+            raise HTTPException(status_code=403, detail={"code": "AUTHORIZATION_ACTION_NOT_ALLOWED", "message": "buy action is not authorized"})
+        if authorization.product_scope != "*" and payload.product_id not in {item.strip() for item in authorization.product_scope.split(",") if item.strip()}:
+            raise HTTPException(status_code=403, detail={"code": "AUTHORIZATION_PRODUCT_NOT_ALLOWED", "message": "product is outside authorization scope"})
+        if payload.amount > authorization.max_single_amount:
+            raise HTTPException(status_code=409, detail={"code": "AUTHORIZATION_SINGLE_LIMIT_EXCEEDED", "message": "single operation amount exceeds authorization limit"})
+        daily_total = (await session.execute(select(func.coalesce(func.sum(AdvisorOperationDraft.amount), 0)).where(
+            AdvisorOperationDraft.customer_id == payload.customer_id,
+            AdvisorOperationDraft.advisor_id == advisor_id,
+            AdvisorOperationDraft.status.in_(["pending_customer_confirmation", "customer_confirmed"]),
+            AdvisorOperationDraft.created_at >= func.date_trunc("day", now),
+        ))).scalar_one()
+        if float(daily_total) + payload.amount > authorization.max_daily_amount:
+            raise HTTPException(status_code=409, detail={"code": "AUTHORIZATION_DAILY_LIMIT_EXCEEDED", "message": "daily operation amount exceeds authorization limit"})
+        risk_order = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}
+        if risk_order.get(product.risk_level, 99) > risk_order.get(authorization.risk_level_ceiling, 0):
+            raise HTTPException(status_code=403, detail={"code": "AUTHORIZATION_RISK_LIMIT_EXCEEDED", "message": "product risk exceeds authorization ceiling"})
+        draft = AdvisorOperationDraft(id=str(uuid4()), customer_id=payload.customer_id, advisor_id=user.id, product_id=payload.product_id, side="buy", amount=payload.amount, note=payload.note, status="pending_customer_confirmation")
+        session.add(draft); await session.commit(); await session.refresh(draft)
+        return ApiResponse(data=AdvisorDraftResponse.model_validate(draft, from_attributes=True))
+
+@router.get("/me/operation-drafts", response_model=ApiResponse[dict])
+async def list_my_operation_drafts(request: Request, limit: int = 20, offset: int = 0, user: Annotated[User, Depends(current_user)] = None):
+    async with request.app.state.database.session_factory() as session:
+        query=select(AdvisorOperationDraft).where(AdvisorOperationDraft.customer_id == user.id).order_by(AdvisorOperationDraft.created_at.desc())
+        total=int((await session.execute(select(func.count()).select_from(query.subquery()))).scalar_one())
+        rows=list((await session.execute(query.offset(max(offset,0)).limit(min(max(limit,1),100)))).scalars().all())
+        product_ids={row.product_id for row in rows}; advisor_ids={row.advisor_id for row in rows}; products={x.id:x for x in (await session.execute(select(Product).where(Product.id.in_(product_ids)))).scalars().all()} if product_ids else {}; advisors={x.id:x for x in (await session.execute(select(User).where(User.id.in_(advisor_ids)))).scalars().all()} if advisor_ids else {}
+        return ApiResponse(data={"items":[AdvisorDraftResponse.model_validate({**row.__dict__, "product_name": products.get(row.product_id).name if products.get(row.product_id) else "", "advisor_name": advisors.get(row.advisor_id).display_name if advisors.get(row.advisor_id) else ""}) for row in rows],"total":total})
+
+@router.post("/me/operation-drafts/{draft_id}/reject", response_model=ApiResponse[AdvisorDraftResponse])
+async def reject_my_operation_draft(request: Request, draft_id: str, user: Annotated[User, Depends(current_user)]):
+    async with request.app.state.database.session_factory() as session:
+        draft = (await session.execute(select(AdvisorOperationDraft).where(AdvisorOperationDraft.id == draft_id, AdvisorOperationDraft.customer_id == user.id).with_for_update())).scalar_one_or_none()
+        if draft is None:
+            raise HTTPException(status_code=404, detail={"code": "DRAFT_NOT_FOUND", "message": "operation draft not found"})
+        if draft.status != "pending_customer_confirmation":
+            raise HTTPException(status_code=409, detail={"code": "DRAFT_STATE_CONFLICT", "message": "draft is not awaiting customer confirmation"})
+        draft.status = "rejected"
+        draft.customer_confirmed_at = datetime.now(timezone.utc)
+        await session.commit(); await session.refresh(draft)
+        return ApiResponse(data=AdvisorDraftResponse.model_validate(draft, from_attributes=True))
+
+@router.post("/me/operation-drafts/{draft_id}/confirm", response_model=ApiResponse[AdvisorDraftResponse])
+async def confirm_my_operation_draft(request: Request, draft_id: str, user: Annotated[User, Depends(current_user)]):
+    async with request.app.state.database.session_factory() as session:
+        draft = (await session.execute(select(AdvisorOperationDraft).where(AdvisorOperationDraft.id == draft_id, AdvisorOperationDraft.customer_id == user.id).with_for_update())).scalar_one_or_none()
+        if draft is None:
+            raise HTTPException(status_code=404, detail={"code": "DRAFT_NOT_FOUND", "message": "operation draft not found"})
+        if draft.status != "pending_customer_confirmation":
+            raise HTTPException(status_code=409, detail={"code": "DRAFT_STATE_CONFLICT", "message": "draft is not awaiting customer confirmation"})
+        draft.status = "customer_confirmed"
+        draft.customer_confirmed_at = datetime.now(timezone.utc)
+        await session.commit(); await session.refresh(draft)
+        return ApiResponse(data=AdvisorDraftResponse.model_validate(draft, from_attributes=True))
+@router.post("/me/operation-drafts/{draft_id}/submit-order", response_model=ApiResponse[dict])
+async def submit_operation_draft_order(request: Request, draft_id: str, user: Annotated[User, Depends(current_user)]):
+    trading_service = getattr(request.app.state, "trading_service", None)
+    if trading_service is None:
+        from app.services.trading_service import TradingService
+        trading_service = TradingService()
+    uow = trading_service.unit_of_work
+    async with request.app.state.database.session_factory() as session:
+        draft = (await session.execute(select(AdvisorOperationDraft).where(AdvisorOperationDraft.id == draft_id, AdvisorOperationDraft.customer_id == user.id).with_for_update())).scalar_one_or_none()
+        if draft is None:
+            raise HTTPException(status_code=404, detail={"code": "DRAFT_NOT_FOUND", "message": "operation draft not found"})
+        if draft.status != "customer_confirmed":
+            raise HTTPException(status_code=409, detail={"code": "DRAFT_STATE_CONFLICT", "message": "draft must be customer confirmed before order submission"})
+        now = datetime.now(timezone.utc)
+        authorization = (await session.execute(select(CustomerAdvisorAuthorization).where(
+            CustomerAdvisorAuthorization.customer_id == draft.customer_id,
+            CustomerAdvisorAuthorization.advisor_id == draft.advisor_id,
+            CustomerAdvisorAuthorization.status == "active",
+            CustomerAdvisorAuthorization.effective_from <= now,
+            or_(CustomerAdvisorAuthorization.effective_to.is_(None), CustomerAdvisorAuthorization.effective_to >= now),
+        ))).scalars().first()
+        if authorization is None:
+            raise HTTPException(status_code=403, detail={"code": "ADVISOR_AUTHORIZATION_REQUIRED", "message": "active advisor authorization required"})
+        try:
+            order, _ = await trading_service.create_order(session, user, draft.product_id, draft.amount, f"advisor-draft:{draft.id}", order_source="advisor_assisted", advisor_id=draft.advisor_id, confirmation_mode="advisor_customer_confirmation")
+            await trading_service.transition(session, order, "pending_review", user.id, "customer confirmed in advisor flow")
+        except TradingError as exc:
+            raise HTTPException(status_code=409, detail={"code": "DRAFT_ORDER_SUBMISSION_FAILED", "message": str(exc)}) from exc
+        draft.status = "submitted"
+        draft.customer_confirmed_at = draft.customer_confirmed_at or now
+        await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="submit", resource_type="advisor_operation_draft", resource_id=draft.id, detail=f"order_id={order.id}"))
+        await session.commit(); await session.refresh(draft)
+        return ApiResponse(data={"draft_id": draft.id, "status": draft.status, "order_id": order.id, "order_status": order.status})
 
 @router.get("/me/risk-assessment", response_model=ApiResponse[RiskAssessmentResponse | None])
 async def my_risk_assessment(request: Request, user: Annotated[User, Depends(current_user)]):
+    uow = getattr(request.app.state, "trading_service", None)
+    uow = uow.unit_of_work if uow is not None else None
+    if uow is None:
+        from app.repositories.unit_of_work import create_postgres_unit_of_work
+        uow = create_postgres_unit_of_work()
     async with request.app.state.database.session_factory() as session:
-        item = (await session.execute(select(CustomerRiskAssessment).where(CustomerRiskAssessment.user_id == user.id, CustomerRiskAssessment.status == "active").order_by(CustomerRiskAssessment.assessed_at.desc()).limit(1))).scalars().first()
+        item = await uow.risks.get_latest_active(session, user.id)
         return ApiResponse(data=RiskAssessmentResponse(id=item.id,user_id=item.user_id,risk_level=item.risk_level,score=item.score,answers=json.loads(item.answers_json or "{}"),status=item.status,source_type=item.source_type,assessed_at=item.assessed_at,expires_at=item.expires_at) if item else None)
 
 @router.post("/me/risk-assessment", response_model=ApiResponse[RiskAssessmentResponse])
 async def submit_risk_assessment(request: Request, payload: RiskAssessmentRequest, user: Annotated[User, Depends(current_user)]):
+    trading_service = getattr(request.app.state, "trading_service", None)
+    uow = trading_service.unit_of_work if trading_service is not None else None
+    if uow is None:
+        from app.repositories.unit_of_work import create_postgres_unit_of_work
+        uow = create_postgres_unit_of_work()
     async with request.app.state.database.session_factory() as session:
-        item = await RiskAssessmentService().assess(session, user.id, payload.model_dump())
-        session.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="submit", resource_type="risk_assessment", resource_id=item.id, detail=f"risk_level={item.risk_level};score={item.score}"))
+        item = await RiskAssessmentService(repository=uow.risks).assess(session, user.id, payload.model_dump())
+        await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="submit", resource_type="risk_assessment", resource_id=item.id, detail=f"risk_level={item.risk_level};score={item.score}"))
         await session.commit(); await session.refresh(item)
         return ApiResponse(data=RiskAssessmentResponse(id=item.id,user_id=item.user_id,risk_level=item.risk_level,score=item.score,answers=payload.model_dump(),status=item.status,source_type=item.source_type,assessed_at=item.assessed_at,expires_at=item.expires_at))
 
 @router.get("/me/enterprise-verification", response_model=ApiResponse[EnterpriseVerificationResponse | None])
 async def my_enterprise_verification(request: Request, user: Annotated[User, Depends(current_user)]):
+    trading_service = getattr(request.app.state, "trading_service", None)
+    if trading_service is None:
+        from app.repositories.unit_of_work import create_postgres_unit_of_work
+        uow = create_postgres_unit_of_work()
+    else:
+        uow = trading_service.unit_of_work
     async with request.app.state.database.session_factory() as session:
-        item = (await session.execute(select(CustomerEnterpriseVerification).where(CustomerEnterpriseVerification.user_id == user.id))).scalar_one_or_none()
+        item = await uow.enterprise_verifications.get(session, user.id)
         return ApiResponse(data=EnterpriseVerificationResponse.model_validate(item, from_attributes=True) if item else None)
 
 @router.post("/me/enterprise-verification", response_model=ApiResponse[EnterpriseVerificationResponse], status_code=201)
 async def submit_enterprise_verification(request: Request, payload: EnterpriseVerificationRequest, user: Annotated[User, Depends(current_user)]):
     if not any(role.code == "customer" for role in user.roles):
-        raise HTTPException(status_code=403, detail="customer account required")
+        raise HTTPException(status_code=403, detail={"code":"CUSTOMER_ACCOUNT_REQUIRED","message":"customer account required"})
+    trading_service = getattr(request.app.state, "trading_service", None)
+    if trading_service is None:
+        from app.repositories.unit_of_work import create_postgres_unit_of_work
+        uow = create_postgres_unit_of_work()
+    else:
+        uow = trading_service.unit_of_work
     async with request.app.state.database.session_factory() as session:
-        profile = (await session.execute(select(CustomerProfile).where(CustomerProfile.user_id == user.id))).scalar_one_or_none()
+        profile = await uow.profiles.get(session, user.id)
         if profile is not None and profile.customer_type == "enterprise":
-            raise HTTPException(status_code=409, detail="customer is already an enterprise customer")
-        item = (await session.execute(select(CustomerEnterpriseVerification).where(CustomerEnterpriseVerification.user_id == user.id))).scalar_one_or_none()
+            raise HTTPException(status_code=409, detail={"code":"ALREADY_ENTERPRISE_CUSTOMER","message":"customer is already an enterprise customer"})
+        item = await uow.enterprise_verifications.get(session, user.id)
         if item is not None and item.status == "approved":
-            raise HTTPException(status_code=409, detail="enterprise verification already approved")
+            raise HTTPException(status_code=409, detail={"code":"ENTERPRISE_VERIFICATION_APPROVED","message":"enterprise verification already approved"})
         if item is None:
             item = CustomerEnterpriseVerification(id=str(uuid4()), user_id=user.id, **payload.model_dump())
-            session.add(item)
+            item = await uow.enterprise_verifications.save(session, item)
         else:
             for key, value in payload.model_dump().items(): setattr(item, key, value)
             item.status = "pending"; item.review_note = ""; item.reviewed_by = None; item.reviewed_at = None
-        session.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="submit", resource_type="enterprise_verification", resource_id=item.id, detail=payload.company_name))
+            item = await uow.enterprise_verifications.update_values(session, item)
+        await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="submit", resource_type="enterprise_verification", resource_id=item.id, detail=payload.company_name))
         await session.commit(); await session.refresh(item)
         return ApiResponse(data=EnterpriseVerificationResponse.model_validate(item, from_attributes=True))
 
 @router.get("/me/tier", response_model=ApiResponse[CustomerTierResponse])
 async def customer_tier(request: Request, user: Annotated[User, Depends(current_user)]):
+    uow = resolve_profile_uow(request)
+    asset_service = AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets)
+    service = CustomerTierService(profile_repository=uow.profiles, asset_service=asset_service)
     async with request.app.state.database.session_factory() as session:
-        data = await CustomerTierService().calculate(session, str(user.id), persist=True)
+        data = await service.calculate(session, str(user.id), persist=True)
         await session.commit()
         return ApiResponse(data=CustomerTierResponse(**data))
 
@@ -194,6 +519,24 @@ async def recommendations(request: Request, user: Annotated[User, Depends(curren
     async with request.app.state.database.session_factory() as session:
         data = await SuitabilityService().recommend(session, str(user.id))
         return ApiResponse(data=data)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

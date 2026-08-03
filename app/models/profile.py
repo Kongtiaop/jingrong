@@ -26,11 +26,14 @@ class CustomerProfile(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True)
     age: Mapped[int | None] = mapped_column(Integer, nullable=True)
     occupation: Mapped[str] = mapped_column(String(128), default="")
+    annual_income: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
     region: Mapped[str] = mapped_column(String(128), default="")
     customer_type: Mapped[str] = mapped_column(String(64), default="individual")
     customer_tier: Mapped[str] = mapped_column(String(64), default="ordinary", index=True)
     investment_experience_years: Mapped[int] = mapped_column(Integer, default=0)
     investment_goal: Mapped[str] = mapped_column(String(255), default="")
+    # Legacy PostgreSQL deployments keep this non-null text column; retain it during the P0/P-C transition.
+    investment_horizon: Mapped[str] = mapped_column(String(64), default="3-5年")
     investment_horizon_years: Mapped[int | None] = mapped_column(Integer, nullable=True)
     liquidity_preference: Mapped[str] = mapped_column(String(16), default="medium")
     source_type: Mapped[str] = mapped_column(String(32), default="synthetic")
@@ -88,6 +91,7 @@ class Product(Base):
     risk_level: Mapped[str] = mapped_column(String(16), default="C1", index=True)
     term_days: Mapped[int] = mapped_column(Integer, default=0)
     minimum_amount: Mapped[float] = mapped_column(Numeric(18, 2), default=0)
+    daily_yield_rate: Mapped[float] = mapped_column(Numeric(12, 8), default=0)
     liquidity: Mapped[str] = mapped_column(String(64), default="medium")
     description: Mapped[str] = mapped_column(Text, default="")
     target_customer_type: Mapped[str] = mapped_column(String(64), default="individual")
@@ -138,4 +142,6 @@ class CustomerHolding(Base):
     status: Mapped[str] = mapped_column(String(32), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 

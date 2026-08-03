@@ -18,10 +18,14 @@ class Settings(BaseSettings):
     redis_consumer_name: str = "worker-1"
     database_backend: str = "postgresql"
     vector_store_backend: str = "pgvector"
+    database_read_backend: str = "postgresql"
+    database_write_backend: str = "postgresql"
+    migration_shadow_read: bool = False
     agent_backend: str = "local"
     milvus_uri: str = "http://127.0.0.1:19530"
     milvus_collection: str = "wealth_documents"
-    mysql_url: str = "mysql+aiomysql://wealth:wealth_dev@127.0.0.1:3306/wealth_manager"
+    mysql_url: str = "mysql+aiomysql://wealth:wealth_dev@127.0.0.1:3307/wealth_manager"
+    mysql_validation_writes: bool = False
 
     dashscope_api_key: str = Field(default="", repr=False)
     qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -49,6 +53,14 @@ class Settings(BaseSettings):
     )
 
     def validate_p0(self) -> None:
+        if self.database_backend.lower() not in {"postgresql", "mysql"}:
+            raise ValueError("DATABASE_BACKEND must be postgresql or mysql")
+        if self.vector_store_backend.lower() not in {"pgvector", "milvus"}:
+            raise ValueError("VECTOR_STORE_BACKEND must be pgvector or milvus")
+        if self.database_write_backend.lower() != "postgresql" and not self.mysql_validation_writes:
+            raise ValueError("database writes remain PostgreSQL until migration gate is explicitly completed")
+        if self.mysql_validation_writes and self.app_env in {"production", "prod"}:
+            raise ValueError("MYSQL_VALIDATION_WRITES cannot be enabled in production")
         if self.app_env in {"production", "prod"} and self.demo_accounts_enabled:
             raise ValueError("DEMO_ACCOUNTS_ENABLED must be false in production")
         if self.embedding_dimension != 1024:

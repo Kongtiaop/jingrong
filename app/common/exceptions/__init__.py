@@ -2,3 +2,5 @@ from app.common.exceptions.base import AppException, ConflictError, RateLimitErr
 from app.common.exceptions.handlers import app_exception_handler, validation_exception_handler
 
 __all__ = ["AppException", "ConflictError", "RateLimitError", "ResourceNotFoundError", "app_exception_handler", "validation_exception_handler"]
+
+from app.common.exceptions.base import DatabaseConflictError, map_database_error

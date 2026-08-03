@@ -21,14 +21,25 @@ def calculate_customer_tier(customer_type: str, investable_asset: Decimal | floa
     return "ordinary", ["可投资资产未达到高净值客户层级门槛"]
 
 class CustomerTierService:
+    def __init__(self, profile_repository=None, asset_service=None):
+        self.profile_repository = profile_repository
+        self.asset_service = asset_service
+
     async def calculate(self, session: AsyncSession, user_id: str, persist: bool = True) -> dict:
-        profile = (await session.execute(select(CustomerProfile).where(CustomerProfile.user_id == user_id))).scalar_one_or_none()
+        if self.profile_repository is None:
+            profile = (await session.execute(select(CustomerProfile).where(CustomerProfile.user_id == user_id))).scalar_one_or_none()
+        else:
+            profile = await self.profile_repository.get(session, user_id)
         if profile is None:
             return {"user_id": user_id, "customer_type": "individual", "customer_tier": "ordinary", "investable_asset": 0, "reasons": ["客户画像不存在，按普通个人客户保守处理"]}
-        asset = await AssetSummaryService().latest_or_derived(session, user_id)
+        asset_service = self.asset_service or AssetSummaryService()
+        asset = await asset_service.latest_or_derived(session, user_id)
         investable_asset = asset.investable_asset if asset else Decimal("0")
         tier, reasons = calculate_customer_tier(profile.customer_type, investable_asset)
         if persist and profile.customer_tier != tier:
             profile.customer_tier = tier
-            await session.flush()
+            if self.profile_repository is not None and hasattr(self.profile_repository, "update_values"):
+                await self.profile_repository.update_values(session, profile)
+            else:
+                await session.flush()
         return {"user_id": user_id, "customer_type": profile.customer_type, "customer_tier": tier, "investable_asset": investable_asset, "reasons": reasons}

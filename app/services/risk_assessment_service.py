@@ -2,13 +2,12 @@ import json
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.profile import CustomerRiskAssessment
-from app.repositories.profile import SqlAlchemyRiskAssessmentRepository
+from app.repositories.trading import SqlAlchemyRiskRepository
 
 class RiskAssessmentService:
-    def __init__(self, repository=None): self.repository = repository or SqlAlchemyRiskAssessmentRepository()
-    async def ensure_default(self, session: AsyncSession, user_id: str) -> CustomerRiskAssessment:
+    def __init__(self, repository=None): self.repository = repository or SqlAlchemyRiskRepository()
+    async def ensure_default(self, session, user_id: str) -> CustomerRiskAssessment:
         existing = await self.repository.get_active(session, user_id)
         if existing is not None:
             return existing
@@ -25,7 +24,7 @@ class RiskAssessmentService:
         reasons = [f"问卷得分 {score}，对应风险等级 {level}"]
         return score, level, reasons
 
-    async def assess(self, session: AsyncSession, user_id: str, answers: dict) -> CustomerRiskAssessment:
+    async def assess(self, session, user_id: str, answers: dict) -> CustomerRiskAssessment:
         score, level, _ = self.score(answers)
         await self.repository.supersede_active(session, user_id)
         item = CustomerRiskAssessment(id=str(uuid4()), user_id=user_id, risk_level=level, score=score, answers_json=json.dumps(answers, ensure_ascii=False), status="active", source_type="questionnaire", assessed_at=datetime.now(timezone.utc), expires_at=datetime.now(timezone.utc) + timedelta(days=365))

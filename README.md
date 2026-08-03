@@ -1,196 +1,183 @@
-# 智能财富管家
+# 文档目录说明
 
-基于 **FastAPI + Vue 3/Vite + PostgreSQL/pgvector + Redis Streams + Qwen** 的智能财富管理演示系统。项目当前已覆盖客户画像、企业认证、风险测评、产品适配、模拟交易、资产汇总、审计和基础 Agent/存储抽象。
+> 当前有效方案以 `docs/P0-P5_IMPLEMENTATION_PLAN.md v2.0` 和 `docs/DECISIONS.md` 为准。
 
-> 当前定位：可运行、可演示、可扩展的 Mock/MVP 系统。所有交易均为模拟业务，不连接真实金融交易系统。
-
-## 当前能力
-
-- 用户注册、登录、JWT/刷新令牌和角色权限。
-- 客户画像：个人资料编辑、客户类型、客户层级、资产和持仓。
-- 企业客户认证：客户提交、超级管理员审核、审计记录。
-- 客户风险测评：C1-C5、C1 provisional 默认等级、测评有效期。
-- 产品适配：风险等级、客户类型、最低资产/金额的确定性校验。
-- 模拟交易：订单创建、确认、审核、执行、交易记录和持仓更新。
-- 资产汇总：账户现金 + 有效持仓市值，交易后生成派生资产快照。
-- 后台管理：客户、产品、订单、企业认证、审计、回收站。
-- 存储抽象：Repository Port、VectorStore Port、Agent Contract。
-- MySQL 8 和 Milvus 已完成隔离环境探针及首批知识向量迁移验证；主链路仍使用 PostgreSQL/pgvector。
-
-## 技术结构
+## 当前文档
 
 ```text
-frontend (Vue 3 + Vite)
-        │ HTTP / JSON
-        ▼
-FastAPI /api/v1
-        ├── API 路由
-        ├── Service 业务规则
-        ├── Repository Port
-        │     └── SQLAlchemy PostgreSQL Adapter
-        ├── Agent Contract / Orchestrator
-        └── VectorStore Port
-              ├── pgvector
-              └── Milvus Adapter（迁移验证中）
+PLAN.md
+    项目总体计划、阶段进度和决策变更记录
+
+P0-P5_IMPLEMENTATION_PLAN.md
+    当前有效的 P0-P5 分级实施方案
+
+ARCHITECTURE_DATABASE_DRAFT.md
+    当前架构、数据库和边界设计草案；冲突时以 P0-P5 v2 为准
+
+DECISIONS.md
+    当前技术决策、弃用方案和文档维护规则
+
+TESTS.md
+    测试策略、测试命令、测试结果和未覆盖范围
+
+ISSUES.md
+    问题、Bug、讨论过程、解决方案、验证结果和延期事项
+
+P0_IMPLEMENTATION.md
+    P0 实施说明
+
+P0_INFRASTRUCTURE.md
+    P0 Docker/基础设施说明
 ```
 
-主要目录：
+## 文档优先级
 
 ```text
-app/api/             API 路由
-app/services/        业务服务与确定性规则
-app/models/          SQLAlchemy 模型
-app/schemas/         Pydantic 请求/响应模型
-app/ports/           Agent、Repository、VectorStore 接口
-app/repositories/    当前数据库适配实现
-app/infrastructure/  Qwen、Redis、向量存储适配器
-frontend/src/        Vue 前端
-scripts/             Seed、迁移和联调脚本
-docs/                计划、测试、问题和架构文档
+P0-P5_IMPLEMENTATION_PLAN.md
+    ↓
+DECISIONS.md
+    ↓
+ARCHITECTURE_DATABASE_DRAFT.md
+    ↓
+PLAN.md 的历史追加记录
 ```
 
-## 启动
+## 每次实现完成后的记录规则
 
-### 1. 准备环境
-
-推荐使用 Conda 环境：
-
-```powershell
-conda activate langchain_env
-```
-
-基础设施：
-
-```powershell
-docker compose up -d
-```
-
-### 2. 配置环境变量
-
-复制并修改：
-
-```powershell
-Copy-Item .env.example .env
-```
-
-开发环境常用配置：
-
-```env
-DATABASE_URL=postgresql+asyncpg://wealth:wealth_dev@127.0.0.1:5433/wealth_manager
-REDIS_URL=redis://127.0.0.1:6380/0
-VECTOR_STORE_BACKEND=pgvector
-MILVUS_URI=http://127.0.0.1:19530
-```
-
-### 3. 启动后端
-
-```powershell
-uvicorn app.main:app --host 127.0.0.1 --port 8010 --reload
-```
-
-健康检查：
+### 必须更新
 
 ```text
-http://127.0.0.1:8010/api/v1/health
+docs/PLAN.md
 ```
 
-FastAPI 在线文档：
+至少记录：
+
+- 本次完成内容
+- 当前阶段状态
+- 下一步计划
+- 新增或修改的关键文件
+
+### 有测试或验证时必须更新
 
 ```text
-http://127.0.0.1:8010/docs
+docs/TESTS.md
 ```
 
-### 4. 启动前端
+记录：
 
-```powershell
-cd frontend
-npm install
-npm run dev
-```
+- 测试编号
+- 测试环境
+- 命令或步骤
+- 预期结果
+- 实际结果
+- PASS/FAIL
+- 未覆盖范围
 
-生产构建：
-
-```powershell
-npm run build
-```
-
-### 5. 启动 Worker（如需）
-
-```powershell
-python -m workers.runner
-```
-
-## 测试
-
-项目的 HTTP 回归脚本使用独立脚本模式，不依赖 pytest 收集：
-
-```powershell
-conda run -n langchain_env python tests/test_http_smoke.py --base-url http://127.0.0.1:8010/api/v1
-conda run -n langchain_env python tests/test_http_faults.py --base-url http://127.0.0.1:8010/api/v1
-conda run -n langchain_env python tests/test_http_concurrency.py --base-url http://127.0.0.1:8010/api/v1
-```
-
-当前已验证的主要结果：
-
-- HTTP Smoke：PASS。
-- Faults：12/12 PASS。
-- 并发与订单幂等：通过。
-- C1-C5 风险适配和企业客户类型适配：通过。
-- MySQL 核心 Schema 探针：通过。
-- Milvus 向量写入/检索/删除和知识块迁移：通过。
-
-## 演示账号
-
-账号清单见：
+### 发现问题、讨论方案或修复 Bug 时必须更新
 
 ```text
-DEMO_ACCOUNTS.txt
+docs/ISSUES.md
 ```
 
-该文件只用于本地开发、联调和答辩演示，生产环境禁止保存明文密码。
+记录：
 
-## 数据库与向量存储迁移边界
+- 问题描述
+- 讨论过程
+- 最终结论
+- 处理方式
+- 验证结果
+- 当前状态
 
-当前主链路：
+如果问题形成新的架构决策，还要同步更新：
 
 ```text
-PostgreSQL + pgvector
+docs/DECISIONS.md
+```
+## 跨窗口上下文维护规则
+
+除非用户明确说明“本次讨论不录入”，否则每次项目讨论都必须同步写入文档，以便切换新窗口后恢复上下文。
+
+新窗口开始时优先阅读：
+
+```text
+docs/README.md
+docs/DECISIONS.md
+docs/PLAN.md
+docs/ISSUES.md
+docs/TESTS.md
 ```
 
-已经完成抽象和验证，但切换到 MySQL/Milvus 仍需完成完整 Adapter、全量数据迁移、双读对比和回滚方案。不能仅修改配置后直接用于生产。详细说明见：
+具体记录规则和文档分工见 `docs/DECISIONS.md` 中的 `DECISION-20260729-001`。
+## 业务知识总结文档
 
-- `docs/ARCHITECTURE.md`
-- `docs/PLAN.md`
-- `docs/TESTS.md`
-- `docs/API.md`
+以下文档是对项目根目录业务资料的结构化总结，供后续模型、规则、API 和 Agent 使用：
 
-## 重要边界
+```text
+BUSINESS_KNOWLEDGE_COMPANY.md
+    公司基本信息、牌照资质、组织、个人/企业服务、FAQ 字段
 
-- LLM/Agent 负责理解、解释和建议；金额、权限、客户类型、风险等级、适当性和交易状态由后端确定性逻辑决定。
-- 所有交易均为 Mock，不产生真实资金变化。
-- 客户类型、客户层级和正式风险等级不能由客户直接伪造修改。
-- Milvus/MySQL 迁移环境与当前 PostgreSQL 主系统隔离。
+BUSINESS_KNOWLEDGE_PRODUCTS.md
+    个人理财、高净值服务、企业金融、产品字段和产品匹配原则
+
+BUSINESS_KNOWLEDGE_POLICIES.md
+    KYC、AML、适当性、销售、双录、冷静期、复评、投诉和档案
+
+BUSINESS_KNOWLEDGE_RISK.md
+    用户画像维度、主客观分层、C1-C5/R1-R5、AML 规则和风险预警流程
+```
+
+总结文档是实现参考，不替代原始制度文件。涉及政策、牌照、金额、期限和保存要求时，必须回到当前有效原文和版本。
 
 
-## 一键启动
 
-基础服务：
+## 开发环境重置与演示数据
+
+推荐使用以下命令恢复干净的应用状态并重新导入虚拟用户数据：
 
 ```powershell
-docker compose up -d
+C:\Users\tx360\.conda\envs\langchain_env\python.exe -m scripts.reset_dev_state
 ```
 
-默认启动：
+该命令会：
 
-- PostgreSQL/pgvector：5433
-- Redis：6380
-- Milvus gRPC：19530
-- Milvus HTTP：9091
+- 清空应用业务表和认证表；
+- 清空 Redis 当前数据库；
+- 保留知识库文档和向量；
+- 重新导入演示账号、产品、客户画像、资产、持仓和交易账户。
 
-同时启动隔离 MySQL 迁移库：
+如果连知识库文档和向量也要清除：
 
 ```powershell
-docker compose --profile migration up -d
+C:\Users\tx360\.conda\envs\langchain_env\python.exe -m scripts.reset_dev_state --include-knowledge
 ```
 
-注意：Docker Compose 负责启动基础设施；FastAPI、Vue 前端和 Worker 仍需分别启动，避免开发热重载进程被容器接管。
+如果只清 PostgreSQL，不清 Redis：
+
+```powershell
+C:\Users\tx360\.conda\envs\langchain_env\python.exe -m scripts.reset_dev_state --no-redis
+```
+
+该脚本仅允许在 `development`、`dev` 或 `local` 环境执行。
+
+
+## MySQL 迁移隔离库开发测试
+
+MySQL 只作为迁移验证和隔离测试库，PostgreSQL 仍是主业务库。每次需要重新开始 MySQL 迁移测试时，执行：
+
+```powershell
+conda run -n langchain_env python -m scripts.reset_mysql_dev_state --yes
+conda run -n langchain_env python -m scripts.migrate_core_to_mysql
+```
+
+严格对比订单、成交和状态历史：
+
+```powershell
+conda run -n langchain_env python -m scripts.compare_trade_rows
+```
+
+`reset_mysql_dev_state.py` 只操作本地 MySQL 迁移库，不会清理 PostgreSQL、Redis 或 Milvus。未传入 `--yes` 时脚本拒绝执行删除。
+
+
+## 标准开发门禁
+
+当前没有 CI 流水线；Gitee push/pull 仅负责代码同步。涉及数据库、Repository/UoW 或 MySQL 双读的改动，提交前按 `docs/DEVELOPMENT_WORKFLOW.md` 执行本地标准门禁。

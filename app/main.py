@@ -22,6 +22,7 @@ from app.services.profile_seed import ensure_profile_seed
 from app.services.trading_seed import ensure_trading_seed
 from app.services.demo_customer_seed import ensure_demo_customer_profiles
 from app.services.demo_product_seed import ensure_demo_products
+from app.services.trading_service import TradingService
 
 
 @asynccontextmanager
@@ -42,6 +43,12 @@ async def lifespan(app: FastAPI):
     app.state.health_service = HealthService(DatabaseHealth(database), redis_client, QwenProvider(settings), settings)
     app.state.task_service = TaskService(database, settings)
     app.state.auth_service = AuthService(database, settings)
+    if settings.database_backend.lower() == "mysql":
+        raise RuntimeError(
+            "DATABASE_BACKEND=mysql is validation-only and cannot serve HTTP trading routes yet; "
+            "keep DATABASE_BACKEND=postgresql and run MySQL validation scripts separately"
+        )
+    app.state.trading_service = TradingService(settings=settings)
     try:
         yield
     finally:

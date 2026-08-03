@@ -2,20 +2,21 @@ from decimal import Decimal
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.profile import CustomerAssetSnapshot, CustomerHolding
-from app.models.trading import Account
+from app.models.profile import CustomerAssetSnapshot
 from app.repositories.trading import SqlAlchemyAccountRepository, SqlAlchemyHoldingRepository, SqlAlchemyAssetRepository
+from app.services.holding_valuation_service import HoldingValuationService
 
 
 class AssetSummaryService:
     """Build one consistent, mock-safe wealth view from account + active holdings."""
     def __init__(self, account_repository=None, holding_repository=None, asset_repository=None):
-        self.accounts=account_repository or SqlAlchemyAccountRepository(); self.holdings=holding_repository or SqlAlchemyHoldingRepository(); self.assets=asset_repository or SqlAlchemyAssetRepository()
+        self.accounts=account_repository or SqlAlchemyAccountRepository(); self.holdings=holding_repository or SqlAlchemyHoldingRepository(); self.assets=asset_repository or SqlAlchemyAssetRepository(); self.valuations=HoldingValuationService()
 
-    async def calculate(self, session: AsyncSession, user_id: str) -> dict:
+    async def calculate(self, session: AsyncSession, user_id: str, *, revalue: bool = True) -> dict:
+        if revalue:
+            await self.valuations.revalue_user(session, user_id)
         account = await self.accounts.get_by_user(session, user_id)
         holdings_value = await self.holdings.sum_market_value(session, user_id)
         holdings_value = Decimal(str(holdings_value or 0))
@@ -36,32 +37,39 @@ class AssetSummaryService:
         }
 
     async def snapshot(self, session: AsyncSession, user_id: str, source_type: str = "derived") -> CustomerAssetSnapshot:
-        values = await self.calculate(session, user_id)
+        values = await self.calculate(session, user_id, revalue=True)
         snapshot = CustomerAssetSnapshot(id=str(uuid4()), user_id=user_id, source_type=source_type, **values)
         return await self.assets.save(session, snapshot)
 
     async def latest_or_derived(self, session: AsyncSession, user_id: str) -> CustomerAssetSnapshot:
-        values = await self.calculate(session, user_id)
-        latest = await self.assets.latest(session, user_id)
+        now = datetime.now(timezone.utc)
+        values = await self.calculate(session, user_id, revalue=True)
+        day_start = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+        day_end = datetime.combine(now.date(), datetime.max.time(), tzinfo=timezone.utc)
+        # Historical event/daily snapshots are immutable. Only a same-day derived snapshot may be refreshed on read.
+        latest = (await session.execute(
+            __import__('sqlalchemy').select(CustomerAssetSnapshot).where(
+                CustomerAssetSnapshot.user_id == user_id,
+                CustomerAssetSnapshot.source_type == 'derived',
+                CustomerAssetSnapshot.snapshot_time >= day_start,
+                CustomerAssetSnapshot.snapshot_time < day_end,
+            ).order_by(CustomerAssetSnapshot.snapshot_time.desc(), CustomerAssetSnapshot.id.desc()).limit(1)
+        )).scalars().first()
         if latest is None:
             latest = CustomerAssetSnapshot(
                 id=str(uuid4()),
                 user_id=user_id,
-                source_type="derived",
-                snapshot_time=datetime.now(timezone.utc),
-                created_at=datetime.now(timezone.utc),
+                source_type='derived',
+                snapshot_time=now,
+                created_at=now,
                 **values,
             )
-            session.add(latest)
+            await self.assets.save(session, latest)
         else:
             for key, value in values.items():
                 setattr(latest, key, value)
-            latest.source_type = "derived"
-            # Legacy rows may have been created before server defaults were
-            # applied. Ensure response serialization remains valid.
-            if latest.snapshot_time is None:
-                latest.snapshot_time = datetime.now(timezone.utc)
+            latest.snapshot_time = now
             if latest.created_at is None:
-                latest.created_at = datetime.now(timezone.utc)
-        await session.flush()
+                latest.created_at = now
+            await self.assets.update_values(session, latest)
         return latest

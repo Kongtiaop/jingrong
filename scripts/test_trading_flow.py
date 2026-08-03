@@ -17,7 +17,7 @@ async def main():
         async with db.session_factory() as s:
             customer=(await s.execute(select(User).where(User.username=="customer_demo"))).scalar_one()
             operations=(await s.execute(select(User).where(User.username=="operations_demo"))).scalar_one()
-            product=(await s.execute(select(Product).where(Product.status=="active").order_by(Product.name))).scalars().first()
+            product=(await s.execute(select(Product).where(Product.status=="active", Product.target_customer_type=="all").order_by(Product.name))).scalars().first()
             account=(await s.execute(select(Account).where(Account.user_id==customer.id))).scalar_one()
             before=Decimal(str(account.available_balance))
             order,_=await service.create_order(s, customer, product.id, Decimal(str(max(float(product.minimum_amount), 10000))))

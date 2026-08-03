@@ -17,3 +17,8 @@ class AdminRolePermissionsUpdateRequest(BaseModel):
 class EnterpriseVerificationReviewRequest(BaseModel):
     approved: bool
     note: str = ""
+
+
+class EnterpriseVerificationListResponse(BaseModel):
+    items: list[dict]
+    total: int

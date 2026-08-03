@@ -10,11 +10,13 @@ export const adminApi = {
   permissions: () => http.get('/admin/permissions'),
   recycleBin: (module = 'user', limit = 50, offset = 0) => http.get('/admin/recycle-bin', { params: { module, limit, offset } }),
   auditLogs: (action = '', resourceType = '', limit = 50, offset = 0) => http.get('/admin/audit-logs', { params: { action, resource_type: resourceType, limit, offset } }),
+  riskWorkbench: () => http.get('/admin/dashboard/risk-workbench'),
 }
 
 
 
 export const enterpriseVerificationApi = {
-  list: (status = 'pending') => http.get('/admin/enterprise-verifications', { params: { status } }),
+  list: (status = 'pending', limit=20, offset=0) => http.get('/admin/enterprise-verifications', { params: { status, limit, offset } }),
   review: (id: string, approved: boolean, note = '') => http.post(`/admin/enterprise-verifications/${id}/review`, { approved, note }),
 }
+

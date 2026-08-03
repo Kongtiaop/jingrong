@@ -35,6 +35,9 @@ class OrderResponse(BaseModel):
     side: str
     review_note: str
     failure_reason: str
+    order_source: str = "customer_direct"
+    advisor_id: str | None = None
+    confirmation_mode: str = "customer_order"
     created_at: datetime
     updated_at: datetime
     history: list[OrderStatusHistoryResponse] = []

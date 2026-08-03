@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuth } from '../stores/auth'
+import { adminApi } from '../api/admin'
 import StaffCustomersView from './StaffCustomersView.vue'
 import StaffOrdersView from './StaffOrdersView.vue'
 import AdminWorkspaceView from './AdminWorkspaceView.vue'
@@ -9,59 +10,17 @@ import StaffProductsView from './StaffProductsView.vue'
 import AuditLogsView from './AuditLogsView.vue'
 import RecycleBinView from './RecycleBinView.vue'
 import EnterpriseVerificationReviewView from './EnterpriseVerificationReviewView.vue'
+import RiskAlertsView from './RiskAlertsView.vue'
+import AdvisorStaffWorkspaceView from './AdvisorStaffWorkspaceView.vue'
+import BusinessOperationsView from './BusinessOperationsView.vue'
 
-const auth = useAuth()
-const router = useRouter()
-const active = ref('dashboard')
-const isAdmin = computed(() => auth.me.value?.is_super_admin === true || auth.me.value?.roles?.includes('super_admin') === true)
-const permissions = computed(() => auth.me.value?.permissions || [])
-
-const items = computed(() => {
-  const out = [{ key: 'dashboard', label: '数据看板', icon: '▦' }, { key: 'profile', label: '个人信息', icon: '◉' }]
-  if (permissions.value.includes('customer:read')) out.push({ key: 'customers', label: '客户管理', icon: '♙' })
-  if (permissions.value.includes('order:write')) out.push({ key: 'orders', label: '订单审核', icon: '✓' })
-  if (permissions.value.includes('product:write')) out.push({ key: 'products', label: '产品管理', icon: '◇' })
-  if (permissions.value.includes('risk:write')) out.push({ key: 'risk', label: '风险管理', icon: '△' })
-  if (permissions.value.includes('audit:read')) out.push({ key: 'audit', label: '审计查询', icon: '▤' })
-  if (isAdmin.value) { out.push({ key: 'enterprise-review', label: '企业认证审核', icon: '▣' }); out.push({ key: 'admin', label: '用户与权限', icon: '⚙' }); out.push({ key: 'recycle', label: '数据回收站', icon: '♻' }) }
-  return out
-})
-const currentTitle = computed(() => items.value.find(item => item.key === active.value)?.label || '数据看板')
-async function logout() { await auth.logout(); await router.push('/login') }
+const auth=useAuth(),router=useRouter(),active=ref('dashboard'),sidebarOpen=ref(false),dashboard=ref<any>(null),dashboardLoading=ref(false),dashboardError=ref('')
+const isAdmin=computed(()=>auth.me.value?.is_super_admin===true||auth.me.value?.roles?.includes('super_admin')===true)
+const permissions=computed(()=>auth.me.value?.permissions||[])
+type NavItem={key:string;label:string;icon:string;hint:string};type NavGroup={label:string;items:NavItem[]}
+const groups=computed<NavGroup[]>(()=>{const overview:NavItem[]=[{key:'dashboard',label:'工作概览',icon:'⌁',hint:'风险与待办优先'},{key:'profile',label:'个人信息',icon:'◎',hint:'账号与角色信息'}];const business:NavItem[]=[];const governance:NavItem[]=[];const system:NavItem[]=[];if(permissions.value.includes('customer:read'))business.push({key:'customers',label:'客户管理',icon:'人',hint:'客户档案与资产概览'},{key:'advisor-work',label:'投顾工作台',icon:'策',hint:'授权客户与投顾草稿'});if(permissions.value.includes('order:write'))business.push({key:'orders',label:'订单审核',icon:'单',hint:'交易订单审核执行'},{key:'operations',label:'业务操作',icon:'流',hint:'赎回转账与审计轨迹'});if(permissions.value.includes('product:write'))business.push({key:'products',label:'产品管理',icon:'品',hint:'产品资料与上下架'});if(permissions.value.includes('risk:write'))governance.push({key:'risk',label:'风险管理',icon:'险',hint:'风险预警与处置'});if(permissions.value.includes('audit:read'))governance.push({key:'audit',label:'系统审计',icon:'审',hint:'全局系统审计日志'});if(isAdmin.value){governance.push({key:'enterprise-review',label:'企业认证',icon:'企',hint:'企业客户认证审核'});system.push({key:'admin',label:'用户与权限',icon:'权',hint:'用户角色与权限配置'},{key:'recycle',label:'数据回收站',icon:'收',hint:'恢复已删除数据'});}return[{label:'概览',items:overview},{label:'业务中心',items:business},{label:'风险与合规',items:governance},{label:'系统管理',items:system}].filter(g=>g.items.length)})
+const allItems=computed(()=>groups.value.flatMap(g=>g.items));const current=computed(()=>allItems.value.find(i=>i.key===active.value)||allItems.value[0]);const maxRisk=computed(()=>Math.max(1,...(dashboard.value?.risk_distribution||[]).map((item:any)=>Number(item.count||0))));const flowRows=computed(()=>[{label:'订单',color:'blue',items:dashboard.value?.flows?.orders||{}},{label:'赎回',color:'cyan',items:dashboard.value?.flows?.redeems||{}},{label:'转账',color:'gold',items:dashboard.value?.flows?.transfers||{}}]);const alertRows=computed(()=>Object.entries(dashboard.value?.alert_status||{}).map(([status,count])=>({status,count:Number(count)})));const suitabilityRows=computed(()=>[{key:'suitable',label:'风险适配',desc:'客户风险 ≥ 产品风险',count:Number(dashboard.value?.suitability?.suitable||0),tone:'good'},{key:'mismatch',label:'风险不匹配',desc:'客户风险 < 产品风险',count:Number(dashboard.value?.suitability?.mismatch||0),tone:'danger'},{key:'restricted',label:'受限账户订单',desc:'账户处于风险限制',count:Number(dashboard.value?.suitability?.restricted||0),tone:'warning'},{key:'missing_risk',label:'缺失风测',desc:'客户无有效风测',count:Number(dashboard.value?.suitability?.missing_risk||0),tone:'muted'}]);const statusLabel=(status:string)=>({pending_confirmation:'待客户确认',pending_review:'待审核',executed:'已成交',settled:'已结算',rejected:'已拒绝',cancelled:'已取消',open:'待处理',acknowledged:'已确认',investigating:'调查中',report_pending:'待上报',resolved:'已解决',dismissed:'已忽略'} as Record<string,string>)[status]||status
+async function loadDashboard(){if(!auth.loggedIn.value)return;dashboardLoading.value=true;dashboardError.value='';try{dashboard.value=(await adminApi.riskWorkbench()).data.data}catch(e:any){dashboardError.value=e.message||'看板数据加载失败'}finally{dashboardLoading.value=false}}
+function select(key:string){active.value=key;sidebarOpen.value=false;if(key==='dashboard')loadDashboard()}async function logout(){await auth.logout();await router.push('/login')}onMounted(loadDashboard)
 </script>
-
-<template>
-  <div class="portal-shell">
-    <aside class="portal-sidebar">
-      <div class="portal-brand"><div class="portal-logo">W</div><div><strong>财富管理平台</strong><small>业务管理端</small></div></div>
-      <div class="portal-user"><div class="portal-avatar">{{(auth.me.value?.display_name || '员').slice(0,1)}}</div><div><strong>{{auth.me.value?.display_name}}</strong><small>{{auth.me.value?.roles?.join('、')}}</small></div></div>
-      <nav class="portal-nav">
-        <button class="portal-return" @click="router.push('/')"><span>⌂</span> 返回前台</button>
-        <div class="portal-divider"></div>
-        <button v-for="item in items" :key="item.key" :class="{ active: active === item.key }" @click="active = item.key"><span class="portal-icon">{{item.icon}}</span>{{item.label}}</button>
-      </nav>
-      <button class="portal-logout" @click="logout"><span>↪</span> 退出登录</button>
-    </aside>
-    <main class="portal-main">
-      <header class="portal-content-header"><div><p>当前位置 / {{currentTitle}}</p><h1>{{currentTitle}}</h1></div><div class="portal-header-badge">{{isAdmin ? '超级管理员' : '工作人员'}}</div></header>
-      <section class="portal-content-body">
-        <div v-if="active === 'dashboard'" class="portal-dashboard"><div class="portal-stat-grid"><article><span>当前角色</span><strong>{{auth.me.value?.roles?.[0]}}</strong></article><article><span>授权模块</span><strong>{{items.length - 2}}</strong></article><article><span>账号状态</span><strong>正常</strong></article></div></div>
-        <div v-else-if="active === 'profile'" class="portal-panel"><h2>个人信息</h2><dl class="portal-profile"><dt>用户名</dt><dd>{{auth.me.value?.username}}</dd><dt>姓名</dt><dd>{{auth.me.value?.display_name}}</dd><dt>角色</dt><dd>{{auth.me.value?.roles?.join('、')}}</dd></dl></div>
-        <StaffCustomersView v-else-if="active === 'customers'" />
-        <StaffOrdersView v-else-if="active === 'orders'" />
-        <StaffProductsView v-else-if="active === 'products'" />
-        <AuditLogsView v-else-if="active === 'audit'" />
-        <RecycleBinView v-else-if="active === 'recycle'" />
-        <EnterpriseVerificationReviewView v-else-if="active === 'enterprise-review'" />
-        <AdminWorkspaceView v-else-if="active === 'admin'" />
-        <div v-else class="portal-panel"><h2>{{currentTitle}}</h2><p>该模块将在后续业务阶段接入。</p></div>
-      </section>
-    </main>
-  </div>
-</template>
-
-
-
-
-
-
+<template><div class="portal-shell" :class="{'sidebar-open':sidebarOpen}"><button class="portal-mobile-mask" aria-label="关闭导航" @click="sidebarOpen=false"></button><aside class="portal-sidebar"><div class="portal-brand"><div class="portal-logo">W</div><div><strong>财富管理平台</strong><small>WEALTH OPERATIONS</small></div><button class="sidebar-close" @click="sidebarOpen=false">×</button></div><div class="portal-user"><div class="portal-avatar">{{(auth.me.value?.display_name||'员').slice(0,1)}}</div><div><strong>{{auth.me.value?.display_name}}</strong><small>{{isAdmin?'超级管理员':auth.me.value?.roles?.join('、')}}</small></div><span class="online-dot"></span></div><nav class="portal-nav" aria-label="后台主导航"><section v-for="group in groups" :key="group.label" class="nav-group"><p>{{group.label}}</p><button v-for="item in group.items" :key="item.key" :class="{active:active===item.key}" :title="item.hint" @click="select(item.key)"><span class="portal-icon">{{item.icon}}</span><span class="nav-copy"><strong>{{item.label}}</strong><small>{{item.hint}}</small></span></button></section></nav><div class="portal-sidebar-footer"><button class="portal-return" @click="router.push('/')"><span>⌂</span>返回前台</button><button class="portal-logout" @click="logout"><span>↪</span>退出登录</button></div></aside><main class="portal-main"><header class="portal-content-header"><button class="sidebar-toggle" @click="sidebarOpen=true">☰</button><div class="header-title"><p>工作后台 <span>/</span> {{current?.label}}</p><h1>{{current?.label}}</h1><small>{{current?.hint}}</small></div><div class="portal-header-actions"><span class="environment-chip">DEV</span><div class="portal-header-badge">{{isAdmin?'超级管理员':'工作人员'}}</div></div></header><section class="portal-content-body"><div v-if="active==='dashboard'" class="portal-dashboard risk-workbench"><div class="dashboard-intro risk-intro"><div><p>RISK & OPERATIONS CENTER</p><h2>先处理风险，再推进业务</h2><span>待审核交易、账户限制与风险预警集中在同一工作视图。</span></div><button @click="select(allItems.find(i=>i.key==='operations')?'operations':'orders')">进入待办业务 →</button></div><p v-if="dashboardError" class="error">{{dashboardError}}</p><div v-if="dashboardLoading&&!dashboard" class="dashboard-loading">正在同步风险与待办数据…</div><template v-else-if="dashboard"><div class="todo-grid"><article class="todo-card order"><span>待审核订单</span><strong>{{dashboard.todo.pending_orders}}</strong><button @click="select('orders')">处理订单 →</button></article><article class="todo-card redeem"><span>待审核赎回</span><strong>{{dashboard.todo.pending_redeems}}</strong><button @click="select('operations')">查看操作 →</button></article><article class="todo-card transfer"><span>待审核转账</span><strong>{{dashboard.todo.pending_transfers}}</strong><button @click="select('operations')">查看操作 →</button></article><article class="todo-card alert"><span>待处理风险预警</span><strong>{{dashboard.todo.open_alerts}}</strong><button @click="select('risk')">进入风控 →</button></article><article class="todo-card restricted"><span>风险受限账户</span><strong>{{dashboard.todo.restricted_accounts}}</strong><button @click="select('customers')">查看客户 →</button></article></div><div class="risk-chart-grid"><section class="risk-chart-card suitability-card"><div class="chart-card-head"><div><span>SUITABILITY CHECK</span><h3>待审核交易适当性检查</h3></div><small>订单优先</small></div><div class="suitability-list"><div v-for="item in suitabilityRows" :key="item.key" :class="'suitability-row '+item.tone"><span class="suitability-count">{{item.count}}</span><div><strong>{{item.label}}</strong><small>{{item.desc}}</small></div></div></div><div class="operation-restriction-note"><span>受限赎回 <b>{{dashboard.operation_restrictions?.redeems||0}}</b></span><span>受限转账 <b>{{dashboard.operation_restrictions?.transfers||0}}</b></span></div></section><section class="risk-chart-card"><div class="chart-card-head"><div><span>RISK ALERTS</span><h3>风险预警处置</h3></div><small>{{dashboard.todo.open_alerts}} 项待办</small></div><div class="alert-status-list"><div v-for="item in alertRows" :key="item.status"><span :class="'alert-dot '+item.status"></span><strong>{{statusLabel(item.status)}}</strong><b>{{item.count}}</b></div><div v-if="!alertRows.length" class="chart-empty">暂无风险预警。</div></div></section></div><section class="flow-panel"><div class="chart-card-head"><div><span>BUSINESS FLOW</span><h3>业务状态流转</h3></div><small>订单、赎回、转账</small></div><div class="flow-grid"><article v-for="flow in flowRows" :key="flow.label" :class="'flow-card '+flow.color"><h4>{{flow.label}}</h4><div v-for="(count,status) in flow.items" :key="String(status)"><span>{{statusLabel(String(status))}}</span><b>{{count}}</b></div><p v-if="!Object.keys(flow.items).length">暂无记录</p></article></div></section><div class="risk-distribution-support"><span>客户风险分布（辅助）</span><i v-for="item in dashboard.risk_distribution" :key="item.level">{{item.level}} <b>{{item.count}}</b></i></div><div class="dashboard-supporting"><span>客户总数 <strong>{{dashboard.supporting.customer_total}}</strong></span><span>累计成交金额 <strong>¥{{Number(dashboard.supporting.executed_trade_amount||0).toLocaleString('zh-CN',{minimumFractionDigits:2})}}</strong></span><button @click="loadDashboard">刷新数据</button></div></template></div><div v-else-if="active==='profile'" class="portal-panel profile-panel"><h2>个人信息</h2><dl class="portal-profile"><dt>用户名</dt><dd>{{auth.me.value?.username}}</dd><dt>姓名</dt><dd>{{auth.me.value?.display_name}}</dd><dt>角色</dt><dd>{{auth.me.value?.roles?.join('、')}}</dd><dt>权限数量</dt><dd>{{permissions.length}}</dd></dl></div><StaffCustomersView v-else-if="active==='customers'"/><AdvisorStaffWorkspaceView v-else-if="active==='advisor-work'"/><StaffOrdersView v-else-if="active==='orders'"/><BusinessOperationsView v-else-if="active==='operations'"/><StaffProductsView v-else-if="active==='products'"/><AuditLogsView v-else-if="active==='audit'"/><RiskAlertsView v-else-if="active==='risk'"/><RecycleBinView v-else-if="active==='recycle'"/><EnterpriseVerificationReviewView v-else-if="active==='enterprise-review'"/><AdminWorkspaceView v-else-if="active==='admin'"/></section></main></div></template>

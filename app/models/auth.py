@@ -52,3 +52,21 @@ class RefreshSession(Base):
 
 
 
+
+
+class CustomerAdvisorAuthorization(Base):
+    __tablename__ = "customer_advisor_authorization"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    customer_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    advisor_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    allowed_actions: Mapped[str] = mapped_column(String(255), default="buy")
+    product_scope: Mapped[str] = mapped_column(String(255), default="*")
+    max_single_amount: Mapped[float] = mapped_column(default=0)
+    max_daily_amount: Mapped[float] = mapped_column(default=0)
+    risk_level_ceiling: Mapped[str] = mapped_column(String(8), default="C2")
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    effective_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    requires_customer_confirmation: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

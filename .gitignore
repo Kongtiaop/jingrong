@@ -6,11 +6,24 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .streamlit/
-docs/DEMO_ACCOUNTS.txt
-**/DEMO_ACCOUNTS.txt
 logs/
 # Local/build artifacts
 frontend/node_modules/
 frontend/dist/
 *.log
 *.zip
+
+# Local-only restored documentation
+docs/ARCHITECTURE.md
+docs/ARCHITECTURE_DATABASE_DRAFT.md
+docs/DECISIONS.md
+docs/DEMO_ACCOUNTS.example.txt
+docs/ISSUES.md
+docs/P0-P5_IMPLEMENTATION_PLAN.md
+docs/P0_IMPLEMENTATION.md
+docs/P0_INFRASTRUCTURE.md
+docs/PLAN.md
+docs/TESTS.md
+
+# Local-only credentials
+DEMO_ACCOUNTS.txt

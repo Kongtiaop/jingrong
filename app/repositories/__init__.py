@@ -1,7 +1,21 @@
 from app.repositories.knowledge import KnowledgeRepository
+from app.repositories.trading import (
+    SqlAlchemyAccountRepository,
+    SqlAlchemyAssetRepository,
+    SqlAlchemyHoldingRepository,
+    SqlAlchemyOrderRepository,
+    SqlAlchemyProductReadRepository,
+    SqlAlchemyProfileRepository,
+    SqlAlchemyRiskRepository,
+)
 
-__all__ = ["KnowledgeRepository"]
-
-from app.repositories.profile import SqlAlchemyCustomerRepository, SqlAlchemyProductRepository, SqlAlchemyRiskAssessmentRepository
-
-from app.repositories.trading import SqlAlchemyAccountRepository, SqlAlchemyOrderRepository, SqlAlchemyHoldingRepository, SqlAlchemyAssetRepository
+__all__ = [
+    "KnowledgeRepository",
+    "SqlAlchemyAccountRepository",
+    "SqlAlchemyAssetRepository",
+    "SqlAlchemyHoldingRepository",
+    "SqlAlchemyOrderRepository",
+    "SqlAlchemyProductReadRepository",
+    "SqlAlchemyProfileRepository",
+    "SqlAlchemyRiskRepository",
+]
