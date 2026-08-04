@@ -15,6 +15,7 @@ export const profileApi = {
   customers: (q = '', tier = '', customer_type = '', limit = 20, offset = 0) => http.get('/profile/staff/customers', { params: { q, tier, customer_type, limit, offset } }),
   advisorCustomers: (q = '', tier = '', customer_type = '', limit = 20, offset = 0) => http.get('/profile/staff/advisor-customers', { params: { q, tier, customer_type, limit, offset } }),
   customer: (id: string) => http.get(`/profile/staff/customer/${id}`),
+  managedCustomer: (id: string) => http.get(`/profile/staff/customers/${id}`),
   enterpriseVerification: () => http.get('/profile/me/enterprise-verification'),
   riskAssessment: () => http.get('/profile/me/risk-assessment'),
   submitRiskAssessment: (payload: any) => http.post('/profile/me/risk-assessment', payload),
@@ -30,6 +31,9 @@ export const profileApi = {
   staffRecommendations: (customer_id: string) => http.post('/profile/staff/recommendations', { customer_id }),
   createStaffOperationDraft: (payload: any) => http.post('/profile/staff/operation-drafts', payload),
 }
+
+
+
 
 
 

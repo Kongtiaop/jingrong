@@ -29,8 +29,11 @@ def require_permission(code: str):
     return dependency
 
 def require_staff_permission(code: str):
-    async def dependency(user: Annotated[User, Depends(require_permission(code))]) -> User:
-        if any(role.code == "customer" for role in user.roles):
+    async def dependency(user: Annotated[User, Depends(current_user)]) -> User:
+        if user.is_super_admin:
+            return user
+        permissions = {p.code for role in user.roles for p in role.permissions}
+        if code not in permissions or any(role.code == "customer" for role in user.roles):
             raise HTTPException(status_code=403, detail="staff permission required")
         return user
     return dependency
@@ -43,3 +46,4 @@ async def staff_customer_user(user: Annotated[User, Depends(current_user)]) -> U
     if "customer:read" not in permissions or any(role.code == "customer" for role in user.roles):
         raise HTTPException(status_code=403, detail="staff permission required")
     return user
+

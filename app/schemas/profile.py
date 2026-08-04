@@ -35,8 +35,23 @@ class HoldingResponse(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+class RiskOperationStatusResponse(BaseModel):
+    status: str = "normal"
+    restriction_status: str = "none"
+    restriction_reason: str = ""
+    restricted_until: datetime | None = None
+    latest_alert_id: str | None = None
+    latest_rule_code: str | None = None
+    latest_alert_level: str | None = None
+    latest_alert_status: str | None = None
+    latest_action_code: str | None = None
+    latest_action_status: str | None = None
+
 class ProfileSummary(BaseModel):
-    profile:ProfileResponse|None; latest_asset:AssetSnapshotResponse|None; holdings:list[HoldingResponse]
+    profile: ProfileResponse | None
+    latest_asset: AssetSnapshotResponse | None
+    holdings: list[HoldingResponse]
+    risk_operation: RiskOperationStatusResponse = Field(default_factory=RiskOperationStatusResponse)
 
 class SuitabilityResult(BaseModel):
     product_id: str
@@ -90,6 +105,11 @@ class StaffCustomerListItem(BaseModel):
     risk_score: int | None = None
     risk_status: str | None = None
     holding_count: int = 0
+    risk_operation_status: str = "normal"
+    risk_restriction_status: str = "none"
+    risk_restriction_reason: str = ""
+    latest_risk_rule_code: str | None = None
+    latest_risk_alert_level: str | None = None
 class StaffCustomerListResponse(BaseModel):
     items: list[StaffCustomerListItem]
     total: int

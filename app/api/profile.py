@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.common.exceptions import ConflictError, ResourceNotFoundError
 from app.schemas.profile import StaffRecommendationRequest, StaffRecommendationResponse, AdvisorDraftRequest, AdvisorDraftResponse, AdvisorAuthorizationRequest, AdvisorAuthorizationResponse
 from app.models.auth import CustomerAdvisorAuthorization
-from app.models.trading import AdvisorOperationDraft, Order
+from app.models.trading import Account, AdvisorOperationDraft, Order, RiskAlert
 from sqlalchemy import select, desc, func, or_
 from app.common.response import ApiResponse
 from app.common.security.auth import current_user, require_permission, require_staff_permission, staff_customer_user
@@ -30,6 +30,36 @@ def resolve_profile_uow(request: Request):
     from app.repositories.unit_of_work import create_postgres_unit_of_work
     return create_postgres_unit_of_work()
 
+
+def _risk_operation_response(account, alert):
+    if account is not None and account.risk_restriction_status == "restricted":
+        status = "restricted"
+    elif alert is not None:
+        status = "monitoring"
+    else:
+        status = "normal"
+    return RiskOperationStatusResponse(
+        status=status,
+        restriction_status=account.risk_restriction_status if account else "none",
+        restriction_reason=account.risk_restriction_reason if account else "",
+        restricted_until=account.risk_restricted_until if account else None,
+        latest_alert_id=alert.id if alert else None,
+        latest_rule_code=alert.rule_code if alert else None,
+        latest_alert_level=alert.alert_level if alert else None,
+        latest_alert_status=alert.status if alert else None,
+        latest_action_code=alert.action_code if alert else None,
+        latest_action_status=alert.action_status if alert else None,
+    )
+
+
+async def _risk_operation_for_user(session, user_id: str):
+    account = (await session.execute(select(Account).where(Account.user_id == user_id))).scalar_one_or_none()
+    alert = (await session.execute(select(RiskAlert).where(
+        RiskAlert.customer_id == user_id,
+        RiskAlert.status.in_(["open", "acknowledged", "investigating", "report_pending"]),
+    ).order_by(RiskAlert.created_at.desc()).limit(1))).scalars().first()
+    return _risk_operation_response(account, alert)
+
 @router.get("/me",response_model=ApiResponse[ProfileSummary])
 async def my_summary(request:Request,user:Annotated[User,Depends(current_user)]):
  trading_service = getattr(request.app.state, "trading_service", None)
@@ -49,7 +79,7 @@ async def my_summary(request:Request,user:Annotated[User,Depends(current_user)])
   holdings = await uow.holdings.list_active(s, user.id)
   details = await HoldingValuationService().details_for(s, holdings)
   holding_items = [HoldingResponse.model_validate(h,from_attributes=True).model_copy(update=details.get(h.id, {})) for h in holdings]
-  return ApiResponse(data=ProfileSummary(profile=ProfileResponse.model_validate(profile,from_attributes=True) if profile else None,latest_asset=AssetSnapshotResponse.model_validate(asset,from_attributes=True) if asset else None,holdings=holding_items))
+  return ApiResponse(data=ProfileSummary(profile=ProfileResponse.model_validate(profile,from_attributes=True) if profile else None, latest_asset=AssetSnapshotResponse.model_validate(asset,from_attributes=True) if asset else None, holdings=holding_items, risk_operation=await _risk_operation_for_user(s, user.id)))
 @router.get("/me/assets/history",response_model=ApiResponse[AssetSnapshotHistoryResponse])
 async def asset_history(request: Request, limit: int = 60, user: Annotated[User, Depends(current_user)] = None):
  if limit < 1 or limit > 180:
@@ -176,7 +206,7 @@ async def _active_advisor_authorization(session, customer_id: str, advisor_id: s
     ).order_by(CustomerAdvisorAuthorization.created_at.desc()))).scalars().first()
 
 
-def _customer_summary_item(row, customer_tier_value: str, tier_reasons: list[str]) -> StaffCustomerListItem:
+def _customer_summary_item(row, customer_tier_value: str, tier_reasons: list[str], risk_operation: RiskOperationStatusResponse | None = None) -> StaffCustomerListItem:
     customer = row.user
     profile = row.profile
     asset = row.asset
@@ -188,6 +218,11 @@ def _customer_summary_item(row, customer_tier_value: str, tier_reasons: list[str
         customer_tier=customer_tier_value, tier_reasons=tier_reasons,
         risk_level=risk.risk_level if risk else None, risk_score=risk.score if risk else None,
         risk_status=risk.status if risk else None, holding_count=row.holding_count,
+        risk_operation_status=risk_operation.status if risk_operation else "normal",
+        risk_restriction_status=risk_operation.restriction_status if risk_operation else "none",
+        risk_restriction_reason=risk_operation.restriction_reason if risk_operation else "",
+        latest_risk_rule_code=risk_operation.latest_rule_code if risk_operation else None,
+        latest_risk_alert_level=risk_operation.latest_alert_level if risk_operation else None,
     )
 
 
@@ -211,8 +246,17 @@ async def _list_customer_summaries(request: Request, q: str, tier: str, customer
                 continue
             filtered.append((row, customer_tier_value, tier_reasons))
         page = filtered[max(offset, 0):max(offset, 0) + limit]
+        page_user_ids = [row.user.id for row, _, _ in page]
+        accounts = {account.user_id: account for account in (await s.execute(select(Account).where(Account.user_id.in_(page_user_ids)))).scalars().all()} if page_user_ids else {}
+        alerts = {}
+        if page_user_ids:
+            for alert in (await s.execute(select(RiskAlert).where(
+                RiskAlert.customer_id.in_(page_user_ids),
+                RiskAlert.status.in_(["open", "acknowledged", "investigating", "report_pending"]),
+            ).order_by(RiskAlert.created_at.desc()))).scalars().all():
+                alerts.setdefault(alert.customer_id, alert)
         return StaffCustomerListResponse(
-            items=[_customer_summary_item(row, customer_tier_value, tier_reasons) for row, customer_tier_value, tier_reasons in page],
+            items=[_customer_summary_item(row, customer_tier_value, tier_reasons, _risk_operation_response(accounts.get(row.user.id), alerts.get(row.user.id))) for row, customer_tier_value, tier_reasons in page],
             total=len(filtered),
         )
 
@@ -240,6 +284,27 @@ async def staff_advisor_customers(request: Request, user: Annotated[User, Depend
 
 
 
+@router.get("/staff/customers/{user_id}", response_model=ApiResponse[ProfileSummary])
+async def managed_customer_summary(request: Request, user_id: str, user: Annotated[User, Depends(require_staff_permission("customer:read"))]):
+    uow = resolve_profile_uow(request)
+    asset_service = AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets)
+    async with request.app.state.database.session_factory() as s:
+        customer = await uow.users.get(s, user_id)
+        if customer is None or not await uow.users.is_customer(s, user_id):
+            raise HTTPException(status_code=404, detail={"code": "CUSTOMER_NOT_FOUND", "message": "customer not found"})
+        profile = await uow.profiles.get(s, user_id)
+        asset = await asset_service.latest_or_derived(s, user_id)
+        holdings = await uow.holdings.list_active(s, user_id)
+        details = await HoldingValuationService().details_for(s, holdings)
+        holding_items = [HoldingResponse.model_validate(h, from_attributes=True).model_copy(update=details.get(h.id, {})) for h in holdings]
+        return ApiResponse(data=ProfileSummary(
+            profile=ProfileResponse.model_validate(profile, from_attributes=True) if profile else None,
+            latest_asset=AssetSnapshotResponse.model_validate(asset, from_attributes=True) if asset else None,
+            holdings=holding_items,
+            risk_operation=await _risk_operation_for_user(s, user_id),
+        ))
+
+
 @router.get("/staff/customer/{user_id}", response_model=ApiResponse[ProfileSummary])
 async def staff_summary(request: Request, user_id: str, user: Annotated[User, Depends(staff_customer_user)]):
     uow = resolve_profile_uow(request)
@@ -258,6 +323,7 @@ async def staff_summary(request: Request, user_id: str, user: Annotated[User, De
             profile=ProfileResponse.model_validate(profile, from_attributes=True),
             latest_asset=AssetSnapshotResponse.model_validate(asset, from_attributes=True) if asset else None,
             holdings=holding_items,
+            risk_operation=await _risk_operation_for_user(s, user_id),
         ))
 
 
@@ -519,6 +585,7 @@ async def recommendations(request: Request, user: Annotated[User, Depends(curren
     async with request.app.state.database.session_factory() as session:
         data = await SuitabilityService().recommend(session, str(user.id))
         return ApiResponse(data=data)
+
 
 
 

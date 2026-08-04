@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from uuid import uuid4
 from sqlalchemy import func, select, text
-from app.models.trading import Account, MoneyFlow, Order, RiskAlert, RiskInvestigation, RiskReportDraft
+from app.models.trading import Account, MoneyFlow, Order, OrderStatusHistory, RiskAlert, RiskInvestigation, RiskReportDraft
 
 RULES = {
     "RW-001": {"name": "大额现金交易", "risk_level": "medium", "recommendation": "生成大额交易报告草稿，核实交易目的和资金来源。", "response_deadline": "1_business_day"},
@@ -107,47 +107,80 @@ class RiskAlertService:
         now = datetime.now(timezone.utc)
         order = await self.uow.orders.get_for_update(session, alert.order_id) if alert.order_id else None
         account = await self.uow.accounts.get_by_id(session, order.account_id, for_update=True) if order else None
+        # Customer-window AML alerts may not be associated with a single order.
+        # Restriction actions still operate on the customer's trading account.
+        if account is None and action_code in {"RESTRICT_TRADING", "RELEASE_RESTRICTION"}:
+            account = await self.uow.accounts.get_by_user(session, alert.customer_id, for_update=True)
         if action_code in {"HOLD_ORDER", "REJECT_ORDER"} and order is None:
             raise ValueError("risk action requires an order")
         if action_code == "HOLD_ORDER":
-            if order.status == "pending_review":
-                order.status = "risk_hold"; order.review_note = note or "risk alert hold"
-            elif order.status in {"pending_confirmation", "executing"}:
-                order.status = "risk_hold"; order.review_note = note or "risk alert hold"
-                if account and account.status == "active": account.status = "risk_hold"
-            else:
+            if order.status not in {"pending_review", "pending_confirmation", "executing"}:
                 raise ValueError("order cannot be held in current state")
+            previous_status = order.status
+            order.status = "risk_hold"
+            order.review_note = note or "risk alert hold"
+            await self.uow.status_history.save(session, OrderStatusHistory(
+                id=str(uuid4()), order_id=order.id, from_status=previous_status, to_status="risk_hold",
+                operator_user_id=actor.id, note=note or "risk alert hold",
+            ))
+            if previous_status in {"pending_confirmation", "executing"} and account and account.status == "active":
+                account.status = "risk_hold"
         elif action_code == "REJECT_ORDER":
             if order.status not in {"pending_review", "risk_hold"}:
                 raise ValueError("order cannot be rejected in current state")
+            previous_status = order.status
             # Customer-direct orders reserve funds at confirmation. A risk hold changes
             # only the order status, so rejection must return the same frozen amount.
             if account and order.order_source == "customer_direct":
                 if account.frozen_balance < order.amount:
                     raise ValueError("order frozen balance is inconsistent")
-                account.available_balance += order.amount; account.frozen_balance -= order.amount
-            order.status = "rejected"; order.failure_reason = note or "rejected by risk control"
+                account.available_balance += order.amount
+                account.frozen_balance -= order.amount
+            order.status = "rejected"
+            order.failure_reason = note or "rejected by risk control"
+            await self.uow.status_history.save(session, OrderStatusHistory(
+                id=str(uuid4()), order_id=order.id, from_status=previous_status, to_status="rejected",
+                operator_user_id=actor.id, note=note or "rejected by risk control",
+            ))
         elif action_code == "RESTRICT_TRADING":
             if account is None:
                 raise ValueError("risk action requires an account")
-            account.status = "risk_restricted"; account.risk_restriction_status = "restricted"; account.risk_restriction_reason = note or alert.rule_code; account.risk_restricted_until = None
+            account.status = "risk_restricted"
+            account.risk_restriction_status = "restricted"
+            account.risk_restriction_reason = note or alert.rule_code
+            account.risk_restricted_until = None
             alert.restriction_status = "restricted"
         elif action_code == "RELEASE_RESTRICTION":
             if account is None:
                 raise ValueError("risk action requires an account")
-            account.status = "active"; account.risk_restriction_status = "none"; account.risk_restriction_reason = ""; account.risk_restricted_until = None; alert.restriction_status = "none"
+            account.status = "active"
+            account.risk_restriction_status = "none"
+            account.risk_restriction_reason = ""
+            account.risk_restricted_until = None
+            alert.restriction_status = "none"
         elif action_code == "CREATE_INVESTIGATION":
             investigation = RiskInvestigation(id=str(uuid4()), alert_id=alert.id, customer_id=alert.customer_id, assigned_to=actor.id, status="open")
-            session.add(investigation); await session.flush(); alert.investigation_id = investigation.id
+            session.add(investigation)
+            await session.flush()
+            alert.investigation_id = investigation.id
         elif action_code == "CREATE_REPORT_DRAFT":
             report = RiskReportDraft(id=str(uuid4()), alert_id=alert.id, customer_id=alert.customer_id, report_type="large_transaction" if alert.rule_code == "RW-001" else "suspicious_transaction", payload_json=alert.evidence_json, created_by=actor.id)
-            session.add(report); await session.flush(); alert.report_draft_id = report.id
+            session.add(report)
+            await session.flush()
+            alert.report_draft_id = report.id
         elif action_code in {"REQUEST_MATERIALS", "ESCALATE"}:
             pass
         else:
             raise ValueError("unsupported risk action")
-        alert.action_code = action_code; alert.action_status = "completed"; alert.action_note = note; alert.handled_by = actor.id; alert.handled_note = note; alert.handled_at = now
+        alert.action_code = action_code
+        alert.action_status = "completed"
+        alert.action_note = note
+        alert.handled_by = actor.id
+        alert.handled_note = note
+        alert.handled_at = now
         return alert
+
+
 
 
 
