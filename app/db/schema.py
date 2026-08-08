@@ -5,10 +5,15 @@ from app.db.base import Base
 from app.models.audit import AuditLog  # noqa: F401
 from app.models.auth import CustomerAdvisorAuthorization, Permission, RefreshSession, Role, User  # noqa: F401
 from app.models.knowledge import KnowledgeBase, KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion  # noqa: F401
+from app.models.data_catalog import DataCatalogColumn, DataCatalogDomain, DataCatalogExampleQuery, DataCatalogRelation, DataCatalogRevision, DataCatalogTable  # noqa: F401
 from app.models.outbox import OutboxEvent
 from app.models.profile import CustomerAssetSnapshot, CustomerEnterpriseVerification, CustomerHolding, CustomerProfile, CustomerRiskAssessment, CustomerSubjectiveProfile, Product, ProductSuitabilityRule, RiskRule  # noqa: F401
 from app.models.task import AsyncTask
-from app.models.trading import Account, Order, Trade, OrderStatusHistory, AdvisorOperationDraft, MoneyFlow, RiskAlert, RiskInvestigation, RiskReportDraft  # noqa: F401
+from app.models.workorder import WorkOrder  # noqa: F401
+from app.models.workorder_update import WorkOrderUpdate  # noqa: F401
+from app.models.workorder_attachment import WorkOrderAttachment  # noqa: F401
+from app.models.notification import Notification  # noqa: F401
+from app.models.trading import Account, Order, Trade, OrderStatusHistory, AdvisorOperationDraft, MoneyFlow, RiskAlert, RiskInvestigation, RiskReportDraft, AmlBatchRun, AmlBatchAlert, AmlSchedulerState  # noqa: F401
 
 
 async def ensure_schema(engine: AsyncEngine) -> None:
@@ -59,6 +64,19 @@ async def ensure_schema(engine: AsyncEngine) -> None:
             "ALTER TABLE account ADD COLUMN IF NOT EXISTS risk_restriction_status VARCHAR(32) NOT NULL DEFAULT 'none'",
             "ALTER TABLE account ADD COLUMN IF NOT EXISTS risk_restriction_reason TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE account ADD COLUMN IF NOT EXISTS risk_restricted_until TIMESTAMPTZ",
+            "ALTER TABLE customer_service_session ADD COLUMN IF NOT EXISTS agent_last_heartbeat_at TIMESTAMPTZ",
+            "CREATE INDEX IF NOT EXISTS ix_customer_service_session_agent_last_heartbeat_at ON customer_service_session (agent_last_heartbeat_at)",
+            "ALTER TABLE work_order ADD COLUMN IF NOT EXISTS risk_alert_id VARCHAR(36)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_work_order_risk_alert_id ON work_order (risk_alert_id) WHERE risk_alert_id IS NOT NULL",
+            "ALTER TABLE work_order ADD COLUMN IF NOT EXISTS context_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE advisor_operation_draft ADD COLUMN IF NOT EXISTS recommendation_snapshot_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE advisor_operation_draft ADD COLUMN IF NOT EXISTS evidence_status VARCHAR(32) NOT NULL DEFAULT 'unavailable'",
+            "ALTER TABLE advisor_operation_draft ADD COLUMN IF NOT EXISTS rag_citations_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE advisor_operation_draft ADD COLUMN IF NOT EXISTS customer_revision_note TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE advisor_operation_draft ADD COLUMN IF NOT EXISTS revision_requested_at TIMESTAMPTZ",
+            "ALTER TABLE aml_batch_run ADD COLUMN IF NOT EXISTS run_type VARCHAR(32) NOT NULL DEFAULT 'daily'",
+            "ALTER TABLE aml_batch_run ADD COLUMN IF NOT EXISTS source_batch_id VARCHAR(36)",
+            "CREATE INDEX IF NOT EXISTS ix_aml_batch_run_source_batch_id ON aml_batch_run (source_batch_id)",
 
             "CREATE INDEX IF NOT EXISTS ix_users_status_created_at ON users (status, created_at)",
             "CREATE INDEX IF NOT EXISTS ix_user_roles_role_user ON user_roles (role_id, user_id)",
@@ -75,6 +93,12 @@ async def ensure_schema(engine: AsyncEngine) -> None:
         """))
         await connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_user_idempotency_key ON orders (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"))
         await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_knowledge_chunk_embedding_hnsw ON knowledge_chunk USING hnsw (embedding vector_cosine_ops)"))
+        await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_data_catalog_table_embedding_hnsw ON data_catalog_table USING hnsw (embedding vector_cosine_ops)"))
+        await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_data_catalog_column_embedding_hnsw ON data_catalog_column USING hnsw (embedding vector_cosine_ops)"))
+        await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_data_catalog_example_query_embedding_hnsw ON data_catalog_example_query USING hnsw (embedding vector_cosine_ops)"))
+
+
+
 
 
 

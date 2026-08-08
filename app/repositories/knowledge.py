@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from uuid import UUID, uuid4
 
-from sqlalchemy import Float, func, literal, select, update
+from sqlalchemy import Float, func, literal, or_, select, update
 
 from app.db.session import Database
 from app.models.knowledge import KnowledgeBase, KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion
 from app.models.outbox import OutboxEvent
+from app.common.knowledge_scope import KnowledgeScope
 
 
 class KnowledgeRepository:
@@ -33,15 +34,16 @@ class KnowledgeRepository:
             result = await session.execute(select(KnowledgeBase).where(KnowledgeBase.id == base_id, KnowledgeBase.status == "active"))
             return result.scalar_one_or_none()
 
-    async def create_document(self, *, knowledge_base_id: str, document_key: str, file_name: str, source_path: str, file_type: str, file_size: int, content_hash: str, category: str = "general", permission_level: str = "public") -> KnowledgeDocument:
+    async def create_document(self, *, knowledge_base_id: str, document_key: str, file_name: str, source_path: str, file_type: str, file_size: int, content_hash: str, category: str = "general", permission_level: str = "public") -> tuple[KnowledgeDocument, str]:
         async with self.database.session_factory() as session:
             document = KnowledgeDocument(id=str(uuid4()), knowledge_base_id=knowledge_base_id, document_key=document_key, file_name=file_name, source_path=source_path, file_type=file_type, file_size=file_size, content_hash=content_hash, category=category, permission_level=permission_level)
             session.add(document)
             await session.flush()
-            session.add(OutboxEvent(id=str(uuid4()), event_type="knowledge.document_created", aggregate_type="knowledge_document", aggregate_id=str(document.id), payload_json={"document_id": str(document.id)}, status="pending"))
+            event = OutboxEvent(id=str(uuid4()), event_type="knowledge.document_created", aggregate_type="knowledge_document", aggregate_id=str(document.id), payload_json={"document_id": str(document.id)}, status="pending")
+            session.add(event)
             await session.commit()
             await session.refresh(document)
-            return document
+            return document, str(event.id)
 
     async def enqueue_ingestion(self, document_id: str) -> str:
         async with self.database.session_factory() as session:
@@ -49,6 +51,20 @@ class KnowledgeRepository:
             session.add(event)
             await session.commit()
             return str(event.id)
+
+    async def list_documents(self, *, limit: int = 100, offset: int = 0) -> tuple[int, list[KnowledgeDocument]]:
+        async with self.database.session_factory() as session:
+            total = int((await session.execute(
+                select(func.count()).select_from(KnowledgeDocument).where(KnowledgeDocument.deleted_at.is_(None))
+            )).scalar_one())
+            result = await session.execute(
+                select(KnowledgeDocument)
+                .where(KnowledgeDocument.deleted_at.is_(None))
+                .order_by(KnowledgeDocument.created_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            return total, list(result.scalars().all())
 
     async def get_document(self, document_id: str) -> KnowledgeDocument | None:
         try:
@@ -59,6 +75,20 @@ class KnowledgeRepository:
             result = await session.execute(select(KnowledgeDocument).where(KnowledgeDocument.id == document_id, KnowledgeDocument.deleted_at.is_(None)))
             return result.scalar_one_or_none()
 
+    async def active_chunk_embeddings_by_hash(self, *, document_id: str) -> dict[str, list[float]]:
+        """Return reusable vectors from the currently active document version."""
+        async with self.database.session_factory() as session:
+            result = await session.execute(
+                select(KnowledgeChunk.content_hash, KnowledgeChunk.embedding)
+                .join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id)
+                .where(
+                    KnowledgeChunk.document_id == document_id,
+                    KnowledgeChunk.status == "active",
+                    KnowledgeDocumentVersion.status == "active",
+                    KnowledgeChunk.embedding.is_not(None),
+                )
+            )
+            return {content_hash: embedding for content_hash, embedding in result.all() if embedding is not None}
     async def create_version(self, *, document_id: str, content_hash: str, parser_type: str) -> KnowledgeDocumentVersion:
         async with self.database.session_factory() as session:
             result = await session.execute(select(KnowledgeDocumentVersion.version_no).where(KnowledgeDocumentVersion.document_id == document_id).order_by(KnowledgeDocumentVersion.version_no.desc()).limit(1))
@@ -90,14 +120,14 @@ class KnowledgeRepository:
                 await session.execute(update(KnowledgeDocumentVersion).where(KnowledgeDocumentVersion.id == version_id).values(status="failed", error_message=error_message[:4000]))
             await session.commit()
 
-    async def search_hybrid(self, *, query: str, query_embedding: list[float] | None, top_k: int, knowledge_base_id: str | None = None, category: str | None = None) -> list[tuple[KnowledgeChunk, float]]:
+    async def search_hybrid(self, *, query: str, query_embedding: list[float] | None, top_k: int, knowledge_base_id: str | None = None, category: str | None = None, scope: KnowledgeScope | None = None) -> list[tuple[KnowledgeChunk, float]]:
         async with self.database.session_factory() as session:
             base = select(KnowledgeChunk).join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id).join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id).where(KnowledgeChunk.status == "active", KnowledgeDocument.status == "active", KnowledgeDocument.deleted_at.is_(None), KnowledgeDocumentVersion.status == "active")
             if knowledge_base_id:
                 base = base.where(KnowledgeDocument.knowledge_base_id == knowledge_base_id)
             if category:
                 base = base.where(KnowledgeDocument.category == category)
-            text_rank = func.ts_rank_cd(func.to_tsvector("simple", KnowledgeChunk.content), func.plainto_tsquery("simple", query))
+            text_rank = func.ts_rank_cd(func.to_tsvector("simple", KnowledgeChunk.content), func.websearch_to_tsquery("simple", query))
             lexical = func.coalesce(text_rank, literal(0.0))
             if query_embedding:
                 semantic = (1.0 - KnowledgeChunk.embedding.cosine_distance(query_embedding))
@@ -120,13 +150,18 @@ class KnowledgeRepository:
             result = await session.execute(statement)
             return [(chunk, float(score or 0.0)) for chunk, score in result.all()]
 
-    async def search_text(self, *, query: str, top_k: int, knowledge_base_id: str | None = None, category: str | None = None) -> list[KnowledgeChunk]:
+    async def search_text(self, *, query: str, top_k: int, knowledge_base_id: str | None = None, category: str | None = None, scope: KnowledgeScope | None = None) -> list[KnowledgeChunk]:
         async with self.database.session_factory() as session:
             statement = select(KnowledgeChunk).join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id).join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id).where(KnowledgeChunk.status == "active", KnowledgeDocument.status == "active", KnowledgeDocument.deleted_at.is_(None), KnowledgeDocumentVersion.status == "active")
             if knowledge_base_id:
                 statement = statement.where(KnowledgeDocument.knowledge_base_id == knowledge_base_id)
             if category:
                 statement = statement.where(KnowledgeDocument.category == category)
-            statement = statement.where(KnowledgeChunk.content.ilike(f"%{query}%")).limit(top_k)
+            terms = [term for term in query.replace("，", " ").replace("。", " ").split() if len(term) >= 2]
+            if terms:
+                statement = statement.where(or_(*[KnowledgeChunk.content.ilike(f"%{term}%") for term in terms]))
+            else:
+                statement = statement.where(KnowledgeChunk.content.ilike(f"%{query}%"))
+            statement = statement.limit(top_k)
             result = await session.execute(statement)
             return list(result.scalars().all())

@@ -1,4 +1,18 @@
 import { http } from './http'
-export interface KnowledgeHit { id:string; content:string; title_path:string; document_id:string; version_id:string; chunk_index:number; score:number; metadata:Record<string, unknown> }
-export interface SearchResponse { query:string; hits:KnowledgeHit[]; retrieval_mode:string; embedding_dimension:number }
-export const knowledgeApi = { search: (query:string, top_k=5) => http.post<{data:SearchResponse}>('/knowledge/search',{query,top_k}), defaultBase: () => http.get('/knowledge/default') }
+
+export type KnowledgeUploadResult = {
+  document: { id:string; file_name:string; category:string; permission_level:string; status:string; file_size:number; created_at:string; updated_at:string; error_message?:string|null }
+  event_id: string
+  pipeline_status: string
+}
+
+export const knowledgeApi = {
+  upload: (file: File, category: string, permissionLevel = 'public') => {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('category', category)
+    form.append('permission_level', permissionLevel)
+    return http.post('/knowledge/documents/upload', form, { headers: { 'Content-Type': 'multipart/form-data' } })
+  },
+  documents: (limit = 100, offset = 0) => http.get('/knowledge/documents', { params: { limit, offset } }),
+}

@@ -10,13 +10,13 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
 @router.post("", response_model=ApiResponse[TaskResponse], status_code=202)
-async def create_task(request: Request, payload: TaskCreateRequest, _user=Depends(require_permission("order:write"))) -> ApiResponse[TaskResponse]:
+async def create_task(request: Request, payload: TaskCreateRequest, _user=Depends(require_permission("task:create"))) -> ApiResponse[TaskResponse]:
     task = await request.app.state.task_service.create_task(payload)
     return ApiResponse(data=task, trace_id=get_trace_id())
 
 
 @router.get("/{task_id}", response_model=ApiResponse[TaskResponse])
-async def get_task(request: Request, task_id: str, _user=Depends(require_permission("order:read"))) -> ApiResponse[TaskResponse]:
+async def get_task(request: Request, task_id: str, _user=Depends(require_permission("task:read"))) -> ApiResponse[TaskResponse]:
     task = await request.app.state.task_service.get_task(task_id)
     if task is None:
         raise ResourceNotFoundError("task not found", code="TASK_NOT_FOUND")

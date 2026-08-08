@@ -51,7 +51,7 @@ async def risk_workbench_dashboard(request: Request, user: Annotated[User, Depen
     if any(role.code == "customer" for role in user.roles):
         raise HTTPException(status_code=403, detail={"code":"STAFF_REQUIRED","message":"staff account required"})
     permissions = {permission.code for role in user.roles for permission in role.permissions}
-    if not user.is_super_admin and not ({"order:write", "risk:write", "audit:read"} & permissions):
+    if not user.is_super_admin and not ({"order:review", "operation:read_staff", "risk:alert_read", "risk:alert_action", "risk:scan_execute", "audit:read"} & permissions):
         raise HTTPException(status_code=403, detail={"code":"DASHBOARD_PERMISSION_REQUIRED","message":"dashboard permission required"})
     async with request.app.state.database.session_factory() as session:
         async def count(model, *criteria):

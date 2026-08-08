@@ -121,11 +121,15 @@ class TradingService:
         return order
 
     async def _blocking_risk_alert(self, session, order):
-        """Return an unresolved confirmed-risk alert that blocks order review."""
+        """Return an unresolved risk alert that must be dispositioned before approval.
+
+        A detected alert is an approval gate, not merely a post-trade work item.
+        Only an explicit cleared/false-positive/insufficient-information resolution or a
+        completed non-blocking disposition may allow an order to proceed.
+        """
         rows = list((await session.execute(select(RiskAlert).where(
-            RiskAlert.customer_id == order.user_id,
-            RiskAlert.status.in_(["open", "acknowledged", "investigating", "report_pending"]),
-            RiskAlert.assessment_result == "confirmed_risk",
+            RiskAlert.status.in_(["open", "acknowledged", "investigating", "pending_customer", "report_pending"]),
+            (RiskAlert.order_id == order.id) | ((RiskAlert.order_id.is_(None)) & (RiskAlert.customer_id == order.user_id)),
         ).order_by(RiskAlert.created_at.desc()))).scalars().all())
         return rows[0] if rows else None
 

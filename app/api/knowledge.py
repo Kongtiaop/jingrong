@@ -1,14 +1,93 @@
-from fastapi import APIRouter, Depends, Request
+import hashlib
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 
 from app.common.exceptions import ResourceNotFoundError
 from app.common.middleware.trace import get_trace_id
 from app.common.response import ApiResponse
-from app.common.security.auth import require_permission
+from app.common.security.auth import current_user, require_permission
 from app.repositories.knowledge import KnowledgeRepository
 from app.infrastructure.qwen import QwenProvider
-from app.schemas.knowledge import DocumentCreateRequest, DocumentIngestResponse, DocumentResponse, KnowledgeBaseResponse, KnowledgeSearchRequest, KnowledgeSearchResponse
+from app.schemas.knowledge import AdminKnowledgeUploadResponse, DocumentCreateRequest, DocumentIngestResponse, DocumentResponse, KnowledgeBaseResponse, KnowledgeDocumentListResponse, KnowledgeSearchRequest, KnowledgeSearchResponse
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
+
+
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+SUPPORTED_UPLOAD_SUFFIXES = {".txt", ".md", ".docx"}
+
+
+@router.get("/documents", response_model=ApiResponse[KnowledgeDocumentListResponse])
+async def list_documents(request: Request, limit: int = 100, offset: int = 0, _user=Depends(require_permission("product:write"))) -> ApiResponse[KnowledgeDocumentListResponse]:
+    repository = KnowledgeRepository(request.app.state.database)
+    total, rows = await repository.list_documents(limit=min(max(limit, 1), 100), offset=max(offset, 0))
+    return ApiResponse(
+        data=KnowledgeDocumentListResponse(
+            total=total,
+            items=[DocumentResponse.model_validate(row, from_attributes=True) for row in rows],
+        ),
+        trace_id=get_trace_id(),
+    )
+
+
+@router.post("/documents/upload", response_model=ApiResponse[AdminKnowledgeUploadResponse], status_code=202)
+async def upload_document(
+    request: Request,
+    file: UploadFile = File(...),
+    category: str = Form("faq"),
+    permission_level: str = Form("public"),
+    _user=Depends(require_permission("product:write")),
+) -> ApiResponse[AdminKnowledgeUploadResponse]:
+    original_name = Path(file.filename or "").name
+    suffix = Path(original_name).suffix.lower()
+    if not original_name or suffix not in SUPPORTED_UPLOAD_SUFFIXES:
+        raise HTTPException(status_code=400, detail={"code": "KNOWLEDGE_FILE_TYPE_UNSUPPORTED", "message": "仅支持 TXT、MD、DOCX 文档上传"})
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail={"code": "KNOWLEDGE_FILE_EMPTY", "message": "上传文档不能为空"})
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "KNOWLEDGE_FILE_TOO_LARGE", "message": "单个知识库文档不能超过 20MB"})
+    if suffix in {".txt", ".md"}:
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=400, detail={"code": "KNOWLEDGE_FILE_ENCODING_INVALID", "message": "TXT/MD 文档必须使用 UTF-8 编码"}) from exc
+    upload_dir = Path("uploads") / "knowledge"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{uuid4().hex}{suffix}"
+    stored_path = upload_dir / stored_name
+    stored_path.write_bytes(content)
+    repository = KnowledgeRepository(request.app.state.database)
+    base = await repository.ensure_default_base()
+    content_hash = hashlib.sha256(content).hexdigest()
+    document_key = f"upload:{content_hash}:{uuid4().hex[:12]}"
+    try:
+        document, event_id = await repository.create_document(
+            knowledge_base_id=str(base.id),
+            document_key=document_key,
+            file_name=original_name,
+            source_path=str(stored_path.resolve()),
+            file_type=suffix.lstrip("."),
+            file_size=len(content),
+            content_hash=content_hash,
+            category=category.strip() or "faq",
+            permission_level=permission_level.strip() or "public",
+        )
+    except Exception:
+        stored_path.unlink(missing_ok=True)
+        raise
+    # create_document writes a knowledge.document_created outbox event. The outbox publisher
+    # sends it to Redis and knowledge_worker consumes it to parse, chunk and write pgvector chunks.
+    return ApiResponse(
+        data=AdminKnowledgeUploadResponse(
+            document=DocumentResponse.model_validate(document, from_attributes=True),
+            event_id=event_id,
+            pipeline_status="queued",
+        ),
+        trace_id=get_trace_id(),
+    )
 
 
 @router.get("/default", response_model=ApiResponse[KnowledgeBaseResponse])
@@ -24,7 +103,7 @@ async def create_document(request: Request, payload: DocumentCreateRequest, _use
     base = await repository.ensure_default_base() if payload.knowledge_base_id is None else await repository.get_base(payload.knowledge_base_id)
     if base is None:
         raise ResourceNotFoundError("knowledge base not found", code="KNOWLEDGE_BASE_NOT_FOUND")
-    document = await repository.create_document(knowledge_base_id=str(base.id), document_key=payload.document_key, file_name=payload.file_name, source_path=payload.source_path, file_type=payload.file_type, file_size=payload.file_size, content_hash=payload.content_hash, category=payload.category, permission_level=payload.permission_level)
+    document, _event_id = await repository.create_document(knowledge_base_id=str(base.id), document_key=payload.document_key, file_name=payload.file_name, source_path=payload.source_path, file_type=payload.file_type, file_size=payload.file_size, content_hash=payload.content_hash, category=payload.category, permission_level=payload.permission_level)
     return ApiResponse(data=DocumentResponse.model_validate(document, from_attributes=True), trace_id=get_trace_id())
 
 

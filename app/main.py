@@ -23,6 +23,7 @@ from app.services.trading_seed import ensure_trading_seed
 from app.services.demo_customer_seed import ensure_demo_customer_profiles
 from app.services.demo_product_seed import ensure_demo_products
 from app.services.trading_service import TradingService
+from app.services.data_catalog_seed import ensure_data_catalog_seed
 
 
 @asynccontextmanager
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
     await ensure_trading_seed(database)
     await ensure_demo_products(database)
     await ensure_demo_customer_profiles(database)
+    await ensure_data_catalog_seed(database)
     app.state.settings = settings
     app.state.database = database
     app.state.redis = redis_client

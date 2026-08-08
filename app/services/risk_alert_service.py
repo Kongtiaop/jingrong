@@ -4,6 +4,7 @@ from decimal import Decimal
 from uuid import uuid4
 from sqlalchemy import func, select, text
 from app.models.trading import Account, MoneyFlow, Order, OrderStatusHistory, RiskAlert, RiskInvestigation, RiskReportDraft
+from app.models.workorder import WorkOrder
 
 RULES = {
     "RW-001": {"name": "大额现金交易", "risk_level": "medium", "recommendation": "生成大额交易报告草稿，核实交易目的和资金来源。", "response_deadline": "1_business_day"},
@@ -29,15 +30,18 @@ class RiskAlertService:
         alerts = []
         cash_total = sum((Decimal(str(f.amount)) for f in flows if start_day <= f.occurred_at < end_day and f.flow_type == "cash"), Decimal("0"))
         if current.flow_type == "cash" and Decimal(str(current.amount)) >= Decimal("50000") and cash_total >= Decimal("50000"):
-            alerts.append(await self._save_alert(session, order, "RW-001", {"cash_daily_amount": str(cash_total), "threshold": "50000", "flow_type": "cash"}))
+            alert = await self._save_alert(session, order, "RW-001", {"cash_daily_amount": str(cash_total), "threshold": "50000", "flow_type": "cash"})
+            if alert: alerts.append(alert)
         small = [f for f in history if f.occurred_at >= start_7d and f.direction == "out" and f.flow_type == "transfer" and Decimal(str(f.amount)) < Decimal("200000")]
         if current.flow_type == "transfer" and len(small) >= 19 and sum((Decimal(str(f.amount)) for f in small), Decimal("0")) + Decimal(str(current.amount)) >= Decimal("100000"):
-            alerts.append(await self._save_alert(session, order, "RW-002", {"window_days": 7, "trade_count": len(small)+1, "amount": str(sum((Decimal(str(f.amount)) for f in small), Decimal("0")) + Decimal(str(current.amount))) }))
+            alert = await self._save_alert(session, order, "RW-002", {"window_days": 7, "trade_count": len(small)+1, "amount": str(sum((Decimal(str(f.amount)) for f in small), Decimal("0")) + Decimal(str(current.amount))) })
+            if alert: alerts.append(alert)
         inbound_24h = [f for f in history if f.direction == "in" and now - timedelta(hours=24) <= f.occurred_at <= now]
         in_total = sum((Decimal(str(f.amount)) for f in inbound_24h), Decimal("0"))
         current_out = Decimal(str(current.amount)) if current.direction == "out" else Decimal("0")
         if in_total > 0 and current_out >= Decimal("50000") and current_out >= in_total * Decimal("0.90") and current_out <= in_total * Decimal("1.10"):
-            alerts.append(await self._save_alert(session, order, "RW-003", {"window_hours": 24, "inbound_amount": str(in_total), "outbound_amount": str(current_out), "outbound_ratio": str((current_out / in_total).quantize(Decimal("0.0001")))}))
+            alert = await self._save_alert(session, order, "RW-003", {"window_hours": 24, "inbound_amount": str(in_total), "outbound_amount": str(current_out), "outbound_ratio": str((current_out / in_total).quantize(Decimal("0.0001")))})
+            if alert: alerts.append(alert)
         inbound_5d = [f for f in history if f.direction == "in" and f.occurred_at >= now - timedelta(days=5)]
         outbound_5d = [f for f in history if f.direction == "out" and f.occurred_at >= now - timedelta(days=5)] + ([current] if current.direction == "out" else [])
         sources = len({f.counterparty_id for f in inbound_5d if f.counterparty_id})
@@ -48,23 +52,27 @@ class RiskAlertService:
                 by_cp[f.counterparty_id] = by_cp.get(f.counterparty_id, Decimal("0")) + Decimal(str(f.amount))
         concentration = max(by_cp.values(), default=Decimal("0")) / out_total if out_total else Decimal("0")
         if sources >= 5 and out_total >= Decimal("200000") and concentration >= Decimal("0.80"):
-            alerts.append(await self._save_alert(session, order, "RW-004", {"window_days": 5, "source_account_count": sources, "outbound_amount": str(out_total), "concentration": str(concentration.quantize(Decimal("0.0001")))}))
+            alert = await self._save_alert(session, order, "RW-004", {"window_days": 5, "source_account_count": sources, "outbound_amount": str(out_total), "concentration": str(concentration.quantize(Decimal("0.0001")))})
+            if alert: alerts.append(alert)
         large_in = [f for f in history if f.direction == "in" and f.occurred_at >= now - timedelta(days=5) and Decimal(str(f.amount)) >= Decimal("100000")]
         outs_3d = [f for f in history if f.direction == "out" and f.occurred_at >= now - timedelta(days=3) and Decimal(str(f.amount)) < Decimal("200000")] + ([current] if current.direction == "out" and Decimal(str(current.amount)) < Decimal("200000") else [])
         destinations = len({f.counterparty_id for f in outs_3d if f.counterparty_id})
         if large_in and destinations >= 5:
-            alerts.append(await self._save_alert(session, order, "RW-005", {"large_inbound_amount": str(max(Decimal(str(f.amount)) for f in large_in)), "destination_account_count": destinations}))
+            alert = await self._save_alert(session, order, "RW-005", {"large_inbound_amount": str(max(Decimal(str(f.amount)) for f in large_in)), "destination_account_count": destinations})
+            if alert: alerts.append(alert)
         profile = await self.uow.profiles.get(session, order.user_id)
         income = getattr(profile, "annual_income", None)
         if income is not None:
             income = Decimal(str(income)); day_total = sum((Decimal(str(f.amount)) for f in flows if f.id == current.id and start_day <= f.occurred_at < end_day), Decimal("0"))
             if income > 0 and day_total >= Decimal("100000") and day_total >= income * Decimal("3"):
-                alerts.append(await self._save_alert(session, order, "RW-006", {"daily_amount": str(day_total), "annual_income": str(income), "income_multiple": str((day_total / income).quantize(Decimal("0.01")))}))
+                alert = await self._save_alert(session, order, "RW-006", {"daily_amount": str(day_total), "annual_income": str(income), "income_multiple": str((day_total / income).quantize(Decimal("0.01")))})
+                if alert: alerts.append(alert)
         return alerts
     async def scan_customer_window(self, session, customer_id, as_of=None, days=5):
         as_of = as_of or datetime.now(timezone.utc)
-        start = as_of - timedelta(days=days)
-        end = as_of + timedelta(microseconds=1)
+        window_end = as_of.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        start = window_end - timedelta(days=days)
+        end = window_end
         flows = await self.uow.money_flows.list_window(session, customer_id, start, end)
         if not flows:
             return []
@@ -72,6 +80,47 @@ class RiskAlertService:
         outbound = [f for f in flows if f.direction == "out" and f.flow_type == "transfer"]
         created = []
         def total(items): return sum((Decimal(str(f.amount)) for f in items), Decimal("0"))
+
+        # RW-001/RW-002 are evaluated in both paths. The real-time order path detects
+        # an immediately materializing event; this window scan is a daily reconciliation
+        # job and carries an explicit UTC scan window for deterministic replay/deduplication.
+        cash = [f for f in flows if f.flow_type == "cash"]
+        cash_total = total(cash)
+        if cash_total >= Decimal("50000"):
+            alert = await self._save_window_alert(session, customer_id, "RW-001", {
+                "window_start": start.isoformat(), "window_end": end.isoformat(),
+                "cash_daily_amount": str(cash_total), "threshold": "50000", "flow_type": "cash",
+            })
+            if alert: created.append(alert)
+        small_transfers = [f for f in outbound if Decimal(str(f.amount)) < Decimal("200000")]
+        small_total = total(small_transfers)
+        if len(small_transfers) >= 20 and small_total >= Decimal("100000"):
+            alert = await self._save_window_alert(session, customer_id, "RW-002", {
+                "window_start": start.isoformat(), "window_end": end.isoformat(),
+                "window_days": days, "trade_count": len(small_transfers), "amount": str(small_total),
+                "single_transaction_ceiling": "200000", "threshold": "100000",
+            })
+            if alert: created.append(alert)
+
+        # RW-003: inbound and outbound transfers within the same 24-hour lookback,
+        # with an outbound amount materially equal to the inbound total.
+        last_24h_start = as_of - timedelta(hours=24)
+        inbound_24h = [f for f in inbound if f.occurred_at >= last_24h_start]
+        outbound_24h = [f for f in outbound if f.occurred_at >= last_24h_start]
+        inbound_24h_total = total(inbound_24h)
+        outbound_24h_total = total(outbound_24h)
+        if inbound_24h_total > 0 and outbound_24h_total >= Decimal("50000"):
+            ratio = outbound_24h_total / inbound_24h_total
+            if Decimal("0.90") <= ratio <= Decimal("1.10"):
+                alert = await self._save_window_alert(session, customer_id, "RW-003", {
+                    "window_start": start.isoformat(), "window_end": end.isoformat(),
+                    "window_hours": 24, "inbound_amount": str(inbound_24h_total),
+                    "outbound_amount": str(outbound_24h_total), "outbound_ratio": str(ratio.quantize(Decimal("0.0001"))),
+                    "minimum_outbound_amount": "50000",
+                })
+                if alert: created.append(alert)
+
+        # RW-004: sources are assessed over the configured customer scan window.
         by_cp = {}
         for f in outbound:
             if f.counterparty_id: by_cp[f.counterparty_id] = by_cp.get(f.counterparty_id, Decimal("0")) + Decimal(str(f.amount))
@@ -79,29 +128,128 @@ class RiskAlertService:
         concentration = max(by_cp.values(), default=Decimal("0")) / out_total if out_total else Decimal("0")
         source_count = len({f.counterparty_id for f in inbound if f.counterparty_id})
         if source_count >= 5 and out_total >= Decimal("200000") and concentration >= Decimal("0.80"):
-            alert = await self._save_window_alert(session, customer_id, "RW-004", {"window_days": days, "source_account_count": source_count, "outbound_amount": str(out_total), "concentration": str(concentration.quantize(Decimal("0.0001")))})
+            alert = await self._save_window_alert(session, customer_id, "RW-004", {
+                "window_start": start.isoformat(), "window_end": end.isoformat(), "window_days": days,
+                "source_account_count": source_count, "outbound_amount": str(out_total),
+                "concentration": str(concentration.quantize(Decimal("0.0001"))),
+            })
             if alert: created.append(alert)
+
+        # RW-005: a large inbound in the scan window followed by dispersed outbound
+        # transfers during the last three days of that same scan horizon.
         large_in = [f for f in inbound if Decimal(str(f.amount)) >= Decimal("100000")]
-        recent_out = [f for f in outbound if f.occurred_at >= as_of - timedelta(days=3) and Decimal(str(f.amount)) < Decimal("200000")]
+        recent_out_start = max(start, end - timedelta(days=3))
+        recent_out = [f for f in outbound if f.occurred_at >= recent_out_start and Decimal(str(f.amount)) < Decimal("200000")]
         destinations = len({f.counterparty_id for f in recent_out if f.counterparty_id})
         if large_in and destinations >= 5:
-            alert = await self._save_window_alert(session, customer_id, "RW-005", {"window_days_inbound": days, "window_days_outbound": 3, "large_inbound_amount": str(max(Decimal(str(f.amount)) for f in large_in)), "destination_account_count": destinations})
+            alert = await self._save_window_alert(session, customer_id, "RW-005", {
+                "window_start": start.isoformat(), "window_end": end.isoformat(),
+                "window_days_inbound": days, "window_days_outbound": 3,
+                "large_inbound_amount": str(max(Decimal(str(f.amount)) for f in large_in)),
+                "destination_account_count": destinations,
+            })
             if alert: created.append(alert)
+
+        # RW-006: a UTC-day cash/transfer total inconsistent with declared annual income.
+        profile = await self.uow.profiles.get(session, customer_id)
+        income = getattr(profile, "annual_income", None)
+        day_start = (end - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_flows = [f for f in flows if day_start <= f.occurred_at < end]
+        day_total = total(day_flows)
+        if income is not None:
+            income = Decimal(str(income))
+            if income > 0 and day_total >= Decimal("100000") and day_total >= income * Decimal("3"):
+                alert = await self._save_window_alert(session, customer_id, "RW-006", {
+                    "window_start": start.isoformat(), "window_end": end.isoformat(),
+                    "day_start": day_start.isoformat(), "day_end": end.isoformat(),
+                    "daily_amount": str(day_total), "annual_income": str(income),
+                    "income_multiple": str((day_total / income).quantize(Decimal("0.01"))),
+                    "minimum_daily_amount": "100000", "minimum_income_multiple": "3",
+                })
+                if alert: created.append(alert)
         return created
 
     async def _save_window_alert(self, session, customer_id, rule_code, evidence):
-        existing = (await session.execute(select(RiskAlert).where(RiskAlert.customer_id == customer_id, RiskAlert.rule_code == rule_code, RiskAlert.status.in_(["open", "acknowledged"]), RiskAlert.created_at >= datetime.now(timezone.utc) - timedelta(days=1)).limit(1))).scalar_one_or_none()
+        window_start = evidence.get("window_start", "")
+        window_end = evidence.get("window_end", "")
+        dedupe_key = f"customer_window:{customer_id}:{rule_code}:{window_start}:{window_end}"
+        existing = (await session.execute(select(RiskAlert).where(
+            RiskAlert.customer_id == customer_id,
+            RiskAlert.rule_code == rule_code,
+            RiskAlert.order_id.is_(None),
+            RiskAlert.evidence_json.like(f'%"dedupe_key": "{dedupe_key}"%'),
+        ).limit(1))).scalar_one_or_none()
         if existing:
             return None
         rule = RULES[rule_code]
-        alert = RiskAlert(id=str(uuid4()), customer_id=customer_id, order_id=None, rule_code=rule_code, alert_level=rule["risk_level"], status="open", confidence=1, evidence_json=json.dumps({**evidence, "rule_name": rule["name"], "response_deadline": rule["response_deadline"], "scan_type": "customer_window"}, ensure_ascii=False), recommendation=rule["recommendation"])
+        alert = RiskAlert(
+            id=str(uuid4()), customer_id=customer_id, order_id=None, rule_code=rule_code,
+            alert_level=rule["risk_level"], status="open", confidence=1,
+            evidence_json=json.dumps({**evidence, "rule_name": rule["name"], "response_deadline": rule["response_deadline"], "scan_type": "customer_window", "dedupe_key": dedupe_key}, ensure_ascii=False),
+            recommendation=rule["recommendation"],
+        )
         await self.uow.risk_alerts.save(session, alert)
         return alert
+
+    async def evaluate_pending_order(self, session, order):
+        """Evaluate a pending-review order before staff approval.
+
+        The regular evaluation logic expects a persisted money flow, which is only
+        created after execution. For review-time checks, evaluate the submitted order
+        directly and create idempotent alerts that block approval until risk staff acts.
+        """
+        amount = Decimal(str(order.amount))
+        if amount < Decimal("50000"):
+            return []
+        return [await self._save_alert(session, order, "RW-001", {
+            "cash_daily_amount": str(amount),
+            "threshold": "50000",
+            "flow_type": "cash",
+            "scan_type": "pre_review_order",
+        })]
+
     async def _save_alert(self, session, order, rule_code, evidence):
+        dedupe_key = f"real_time_order:{order.id}:{rule_code}"
+        existing = (await session.execute(select(RiskAlert).where(
+            RiskAlert.order_id == order.id,
+            RiskAlert.rule_code == rule_code,
+        ).limit(1))).scalar_one_or_none()
+        if existing:
+            return None
         rule=RULES[rule_code]
-        alert=RiskAlert(id=str(uuid4()), customer_id=order.user_id, order_id=order.id, rule_code=rule_code, alert_level=rule["risk_level"], status="open", confidence=1, evidence_json=json.dumps({**evidence, "rule_name": rule["name"], "response_deadline": rule["response_deadline"]}, ensure_ascii=False), recommendation=rule["recommendation"])
+        alert=RiskAlert(
+            id=str(uuid4()), customer_id=order.user_id, order_id=order.id, rule_code=rule_code,
+            alert_level=rule["risk_level"], status="open", confidence=1,
+            evidence_json=json.dumps({**evidence, "rule_name": rule["name"], "response_deadline": rule["response_deadline"], "scan_type": evidence.get("scan_type", "real_time_order"), "dedupe_key": dedupe_key}, ensure_ascii=False),
+            recommendation=rule["recommendation"],
+        )
         await self.uow.risk_alerts.save(session, alert)
         return alert
+
+    async def create_material_request_work_order(self, session, alert, actor, note=""):
+        existing = (await session.execute(select(WorkOrder).where(WorkOrder.risk_alert_id == alert.id).limit(1))).scalar_one_or_none()
+        if existing is not None:
+            return existing, False
+        work_order = WorkOrder(
+            id=str(uuid4()),
+            ticket_no=f"WO{datetime.now(timezone.utc):%Y%m%d%H%M%S}{uuid4().hex[:6].upper()}",
+            customer_id=alert.customer_id,
+            created_by=actor.id,
+            assigned_to=actor.id,
+            category="risk_investigation",
+            priority="urgent" if alert.alert_level == "high" else "high",
+            status="pending_customer",
+            title=f"风险核验资料补充：{alert.rule_code}",
+            description=(
+                f"系统检测到风险预警 {alert.rule_code}（{alert.alert_level}）。"
+                "请根据工作人员要求补充交易目的、资金来源或相关证明材料。"
+            ),
+            resolution_note="",
+            risk_alert_id=alert.id,
+        )
+        session.add(work_order)
+        await session.flush()
+        return work_order, True
 
     async def apply_action(self, session, alert, actor, action_code, note=""):
         now = datetime.now(timezone.utc)
@@ -153,6 +301,16 @@ class RiskAlertService:
         elif action_code == "RELEASE_RESTRICTION":
             if account is None:
                 raise ValueError("risk action requires an account")
+            if alert.restriction_status != "restricted":
+                raise ValueError("customer is not currently under a trading restriction")
+            if alert.assessment_result not in {"cleared_after_review", "false_positive"}:
+                raise ValueError("risk review must be cleared_after_review or false_positive before releasing the trading restriction")
+            if not (alert.assessment_note or "").strip():
+                raise ValueError("risk review evidence is required before releasing the trading restriction")
+            if alert.assessment_result == "cleared_after_review" and (
+                not alert.customer_consulted or not (alert.customer_consultation_note or "").strip()
+            ):
+                raise ValueError("customer communication record is required before releasing the trading restriction")
             account.status = "active"
             account.risk_restriction_status = "none"
             account.risk_restriction_reason = ""
@@ -179,34 +337,3 @@ class RiskAlertService:
         alert.handled_note = note
         alert.handled_at = now
         return alert
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

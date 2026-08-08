@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -68,3 +68,47 @@ class KnowledgeSearchResponse(BaseModel):
     hits: list[KnowledgeSearchHit]
     retrieval_mode: str
     embedding_dimension: int
+
+
+class CustomerRagRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=4000)
+    intent: Literal["company_info", "company_business", "faq", "workflow", "policy", "risk_public", "product_recommendation"]
+    top_k: int = Field(default=5, ge=1, le=20)
+
+class CustomerRagResponse(BaseModel):
+    intent: str
+    answer_mode: str
+    evidence_status: str
+    handoff_required: bool
+    message: str
+    citations: list[dict]
+    work_order_id: str | None = None
+    ticket_no: str | None = None
+    work_order_created: bool | None = None
+    answer: str = ""
+    generation_status: str = "not_generated"
+
+
+class AdminKnowledgeUploadResponse(BaseModel):
+    document: DocumentResponse
+    event_id: str
+    pipeline_status: str
+
+
+class KnowledgeDocumentListResponse(BaseModel):
+    total: int
+    items: list[DocumentResponse]
+
+
+class CustomerQueryRouteRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=4000)
+
+
+class CustomerQueryRouteResponse(BaseModel):
+    source_type: Literal["business_fact", "rag_explanation", "handoff"]
+    route: str
+    answer: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_status: str
+    next_action: str = ""

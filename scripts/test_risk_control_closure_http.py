@@ -39,7 +39,7 @@ async def main():
             # Create a pending-review order and an explicit confirmed-risk alert tied to the customer/order.
             created = await client.post('/trading/orders', headers=customer, json={
                 'product_id': product_id,
-                'amount': '1000.00',
+                'amount': '50000.00',
                 'idempotency_key': f'risk-control-{uuid.uuid4()}',
             })
             created.raise_for_status()
@@ -47,7 +47,46 @@ async def main():
             confirmed = await client.post(f'/trading/orders/{order_id}/confirm', headers=customer)
             confirmed.raise_for_status()
 
-            # Directly seed a deterministic confirmed-risk alert fixture; the test targets the service gate, not rule-engine thresholds.
+            # A detected pre-review alert must block approval before a risk officer closes it.
+            detected = await client.post(f'/trading/orders/{order_id}/review', headers=admin, json={'note': '预审风险检测应拦截'})
+            assert detected.status_code == 409 and error_code(detected) == 'RISK_CONTROL_BLOCKED'
+            async with db.engine.begin() as conn:
+                detected_alert = (await conn.execute(text('SELECT id, status, rule_code FROM risk_alert WHERE order_id=:id ORDER BY created_at DESC LIMIT 1'), {'id': order_id})).mappings().one()
+                assert detected_alert['status'] == 'open'
+                assert detected_alert['rule_code'] == 'RW-001'
+
+            material = await client.post(f"/risk-alerts/{detected_alert['id']}/action", headers=admin, json={
+                'action_code': 'REQUEST_MATERIALS', 'note': '请补充本次交易目的、资金来源说明和相关凭证。',
+            })
+            material.raise_for_status()
+            material_handle = await client.post(f"/risk-alerts/{detected_alert['id']}/handle", headers=admin, json={
+                'status': 'pending_customer', 'note': '已向客户发起资料补充。',
+                'assessment_result': 'insufficient_information',
+                'assessment_note': '当前资料不足以完成风险判断。',
+                'disposition_code': 'REQUEST_MATERIALS',
+                'disposition_note': '请补充本次交易目的、资金来源说明和相关凭证。',
+            })
+            assert material_handle.status_code == 200, material_handle.text
+            async with db.engine.begin() as conn:
+                material_work_order = (await conn.execute(text('SELECT id, status, category, risk_alert_id FROM work_order WHERE risk_alert_id=:id'), {'id': detected_alert['id']})).mappings().one()
+                assert material_work_order['status'] == 'pending_customer'
+                assert material_work_order['category'] == 'risk_investigation'
+            customer_supplement = await client.post(f"/workorders/{material_work_order['id']}/supplements", headers=customer, json={
+                'content': '本次交易用于家庭教育支出，资金来自工资收入，相关凭证已通过工单附件补充。',
+            })
+            assert customer_supplement.status_code == 201, customer_supplement.text
+            alerts_after_supplement = await client.get('/risk-alerts', headers=admin)
+            alerts_after_supplement.raise_for_status()
+            material_alert = next(item for item in alerts_after_supplement.json()['data']['items'] if item['id'] == detected_alert['id'])
+            assert material_alert['status'] == 'investigating'
+            assert material_alert['work_order_id'] == material_work_order['id']
+            assert material_alert['work_order_status'] == 'in_progress'
+            assert '家庭教育支出' in material_alert['latest_customer_supplement']
+            async with db.engine.begin() as conn:
+                await conn.execute(text('DELETE FROM work_order WHERE id=:id'), {'id': material_work_order['id']})
+                await conn.execute(text('DELETE FROM risk_alert WHERE id=:id'), {'id': detected_alert['id']})
+
+            # Directly seed a deterministic confirmed-risk alert fixture; the test targets the post-investigation gate.
             async with db.engine.begin() as conn:
                 alert_id = str(uuid.uuid4())
                 await conn.execute(text('''INSERT INTO risk_alert
@@ -79,6 +118,16 @@ async def main():
             })
             assert restricted_order.status_code == 400
             assert error_code(restricted_order) == 'TRADING_ERROR' or 'restricted' in restricted_order.text.lower()
+            premature_release = await client.post(f"/risk-alerts/{alert_id}/action", headers=admin, json={
+                "action_code": "RELEASE_RESTRICTION", "note": "缺少复核结论时不能解除限制",
+            })
+            assert premature_release.status_code == 409
+            reviewed = await client.post(f"/risk-alerts/{alert_id}/handle", headers=admin, json={
+                "status": "investigating", "note": "完成风险复核，准备解除限制",
+                "assessment_result": "cleared_after_review", "assessment_note": "测试确认已解除风险",
+                "customer_consulted": True, "customer_consultation_note": "已完成客户沟通",
+            })
+            reviewed.raise_for_status()
             released = await client.post(f"/risk-alerts/{alert_id}/action", headers=admin, json={
                 "action_code": "RELEASE_RESTRICTION", "note": "风险复核后解除限制",
             })
@@ -90,17 +139,16 @@ async def main():
                 "customer_consulted": True, "customer_consultation_note": "已完成客户沟通",
             })
             handled.raise_for_status()
-            released = await client.post(f"/risk-alerts/{alert_id}/action", headers=admin, json={
-                "action_code": "RELEASE_RESTRICTION", "note": "风险复核后解除限制",
-            })
-            released.raise_for_status()
-            assert released.json()["data"]["restriction_status"] == "none"
 
             async with db.engine.begin() as conn:
                 account_row = (await conn.execute(text('SELECT status, risk_restriction_status FROM account WHERE id=:id'), {'id': account_id})).mappings().one()
                 assert account_row['risk_restriction_status'] == 'none'
 
             result = {
+                'detected_alert_block_status': detected.status_code,
+                'material_request_work_order_status': 'pending_customer',
+                'customer_supplement_alert_status': 'investigating',
+                'customer_supplement_visible_in_alert_list': True,
                 'blocked_review_status': blocked.status_code,
                 'blocked_review_code': error_code(blocked),
                 'restricted_account_status': 'restricted',

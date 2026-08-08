@@ -81,6 +81,9 @@ class AdvisorDraftRequest(BaseModel):
     amount: float = Field(gt=0)
     note: str = ""
 
+class AdvisorDraftRevisionRequest(BaseModel):
+    note: str = Field(min_length=1, max_length=2000)
+
 class AdvisorDraftResponse(BaseModel):
     id: str
     customer_id: str
@@ -203,9 +206,46 @@ class RiskAlertResponse(BaseModel):
     order_no: str = ""
     product_name: str = ""
     handled_by_name: str = ""
+    work_order_id: str | None = None
+    work_order_ticket_no: str = ""
+    work_order_status: str = ""
+    latest_customer_supplement: str = ""
+    latest_customer_supplement_at: datetime | None = None
+
+class AmlBatchRunResponse(BaseModel):
+    id: str
+    batch_key: str
+    scan_window_start: datetime
+    scan_window_end: datetime
+    scan_days: int
+    status: str
+    total_customers: int
+    succeeded_customers: int
+    failed_customers: int
+    created_alerts: int
+    error_summary: str = ""
+    started_at: datetime
+    finished_at: datetime | None = None
+    run_type: str = "daily"
+    source_batch_id: str | None = None
+
+
+class AmlBatchRunListResponse(BaseModel):
+    items: list[AmlBatchRunResponse]
+    total: int
+
+
+class AmlSchedulerStatusResponse(BaseModel):
+    running: bool
+    last_heartbeat_at: datetime | None = None
+    last_scan_started_at: datetime | None = None
+    last_scan_finished_at: datetime | None = None
+    last_scan_status: str = "never"
+    last_error: str = ""
+
 
 class RiskAlertHandleRequest(BaseModel):
-    status: str = Field(pattern="^(acknowledged|investigating|report_pending|resolved|dismissed)$")
+    status: str = Field(pattern="^(acknowledged|investigating|pending_customer|report_pending|resolved|dismissed)$")
     note: str = ""
     assessment_result: str | None = Field(default=None, pattern="^(confirmed_risk|cleared_after_review|false_positive|insufficient_information)$")
     assessment_note: str = ""

@@ -40,3 +40,7 @@ langchain-openai>=0.3,<1
 
 # Optional P5 dependency; install only when Neo4j GraphRAG is enabled.
 # neo4j>=5,<7
+
+python-multipart>=0.0.20,<1
+python-docx>=1.1,<2
+

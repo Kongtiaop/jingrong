@@ -40,10 +40,26 @@ def require_staff_permission(code: str):
 
 
 async def staff_customer_user(user: Annotated[User, Depends(current_user)]) -> User:
+    return await require_staff_permission("customer:read_all")(user)
+
+
+
+def require_advisor_permission(code: str):
+    async def dependency(user: Annotated[User, Depends(current_user)]) -> User:
+        if user.is_super_admin:
+            return user
+        role_codes = {role.code for role in user.roles}
+        permissions = {permission.code for role in user.roles for permission in role.permissions}
+        if "advisor" not in role_codes or code not in permissions:
+            raise HTTPException(status_code=403, detail="advisor permission required")
+        return user
+    return dependency
+
+
+async def advisor_user(user: Annotated[User, Depends(current_user)]) -> User:
     if user.is_super_admin:
         return user
-    permissions = {p.code for role in user.roles for p in role.permissions}
-    if "customer:read" not in permissions or any(role.code == "customer" for role in user.roles):
-        raise HTTPException(status_code=403, detail="staff permission required")
+    role_codes = {role.code for role in user.roles}
+    if "advisor" not in role_codes:
+        raise HTTPException(status_code=403, detail="advisor permission required")
     return user
-

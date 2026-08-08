@@ -8,6 +8,7 @@ from app.models.auth import User
 from app.models.trading import Account, Order, Trade, OrderStatusHistory
 from app.schemas.trading import *
 from app.services.trading_service import TradingError, TradingService
+from app.services.risk_alert_service import RiskAlertService
 
 router = APIRouter(prefix="/trading", tags=["trading"])
 def get_trading_service(request: Request) -> TradingService:
@@ -92,23 +93,30 @@ async def cancel_order(request: Request, order_id: str, user: Annotated[User, De
     except TradingError as exc: err(exc)
 
 @router.get("/orders/pending", response_model=ApiResponse[OrderListResponse])
-async def pending_orders(request: Request, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0), user: Annotated[User, Depends(require_permission("order:write"))] = None):
+async def pending_orders(request: Request, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0), user: Annotated[User, Depends(require_staff_permission("order:review"))] = None):
     trading_service = get_trading_service(request)
     async with request.app.state.database.session_factory() as session:
         total, rows = await trading_service.unit_of_work.orders.list_pending(session, limit=limit, offset=offset)
         return ApiResponse(data=OrderListResponse(items=[await order_response(session, row, trading_service) for row in rows], total=total))
 
 @router.post("/orders/{order_id}/review", response_model=ApiResponse[OrderResponse])
-async def review_order(request: Request, order_id: str, payload: OrderActionRequest, user: Annotated[User, Depends(require_permission("order:write"))]):
+async def review_order(request: Request, order_id: str, payload: OrderActionRequest, user: Annotated[User, Depends(require_staff_permission("order:review"))]):
     trading_service = get_trading_service(request)
     try:
         async with request.app.state.database.session_factory() as session:
+            pending_order = await trading_service.unit_of_work.orders.get_for_update(session, order_id)
+            if pending_order is not None and pending_order.status == "pending_review":
+                await RiskAlertService(trading_service.unit_of_work).evaluate_pending_order(session, pending_order)
+                risk_block = await trading_service._blocking_risk_alert(session, pending_order)
+                if risk_block is not None:
+                    await session.commit()
+                    raise TradingError(f"risk control blocks order: {risk_block.rule_code}")
             order = await trading_service.review_order(session, user, order_id, True, payload.note); await session.commit(); await session.refresh(order)
             return ApiResponse(data=await order_response(session, order, trading_service))
     except TradingError as exc: err(exc)
 
 @router.post("/orders/{order_id}/reject", response_model=ApiResponse[OrderResponse])
-async def reject_order(request: Request, order_id: str, payload: OrderActionRequest, user: Annotated[User, Depends(require_permission("order:write"))]):
+async def reject_order(request: Request, order_id: str, payload: OrderActionRequest, user: Annotated[User, Depends(require_staff_permission("order:review"))]):
     trading_service = get_trading_service(request)
     try:
         async with request.app.state.database.session_factory() as session:

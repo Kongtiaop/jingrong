@@ -7,8 +7,11 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from app.core.settings import get_settings
 from app.db.base import Base
 from app.models.knowledge import KnowledgeBase, KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion  # noqa: F401
+from app.models.data_catalog import DataCatalogColumn, DataCatalogDomain, DataCatalogExampleQuery, DataCatalogRelation, DataCatalogRevision, DataCatalogTable  # noqa: F401
 from app.models.outbox import OutboxEvent  # noqa: F401
 from app.models.task import AsyncTask  # noqa: F401
+from app.models.trading import AmlBatchRun  # noqa: F401
+from app.models.notification import Notification  # noqa: F401
 
 config = context.config
 settings = get_settings()
@@ -47,3 +50,10 @@ else:
     import asyncio
 
     asyncio.run(run_async_migrations())
+
+
+from app.models.workorder_update import WorkOrderUpdate  # noqa: F401
+
+
+from app.models.workorder_attachment import WorkOrderAttachment  # noqa: F401
+

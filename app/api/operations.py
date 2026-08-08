@@ -5,24 +5,28 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from app.common.response import ApiResponse
-from app.common.security.auth import current_user
+from app.common.security.auth import advisor_user, current_user, require_advisor_permission, require_staff_permission
 from app.models.auth import User
 from app.models.audit import AuditLog
 from app.models.operations import BusinessOperation
 import json
-from app.models.profile import CustomerHolding, CustomerProfile
+from app.models.profile import CustomerHolding, CustomerProfile, Product
 from app.models.auth import CustomerAdvisorAuthorization
 from app.services.asset_summary_service import AssetSummaryService
 from app.models.trading import Account, MoneyFlow, RiskAlert
 from app.schemas.operations import *
 
 router=APIRouter(prefix='/operations',tags=['operations'])
+staff_operation_read_user = require_staff_permission('operation:read_staff')
+staff_operation_review_user = require_staff_permission('order:review')
+staff_operation_audit_user = require_staff_permission('operation:audit_read')
+staff_transfer_submit_user = require_staff_permission('transfer:submit_staff')
+advisor_operation_submit_user = require_advisor_permission('order:submit_staff')
 
 async def _operation_risk_block(s, operation):
     alert = (await s.execute(select(RiskAlert).where(
-        RiskAlert.customer_id == operation.user_id,
-        RiskAlert.status.in_(['open','acknowledged','investigating','report_pending']),
-        RiskAlert.assessment_result == 'confirmed_risk',
+        RiskAlert.status.in_(['open','acknowledged','investigating','pending_customer','report_pending']),
+        ((RiskAlert.order_id == operation.id) | ((RiskAlert.order_id.is_(None)) & (RiskAlert.customer_id == operation.user_id))),
     ).order_by(RiskAlert.created_at.desc()))).scalars().first()
     return alert
 
@@ -54,7 +58,7 @@ async def redeem(request:Request,payload:RedeemRequest,user:Annotated[User,Depen
         return ApiResponse(data={'operation_id':operation.id,'operation':'redeem','status':operation.status,'product_id':payload.product_id,'quantity':payload.quantity,'amount':payload.amount})
 
 @router.post('/redeem/{operation_id}/review',response_model=ApiResponse[dict])
-async def review_redeem(request:Request,operation_id:str,payload:OperationReviewRequest,user:Annotated[User,Depends(current_user)]):
+async def review_redeem(request:Request,operation_id:str,payload:OperationReviewRequest,user:Annotated[User,Depends(staff_operation_review_user)]):
     if any(role.code=='customer' for role in user.roles): raise HTTPException(403,detail={'code':'STAFF_REQUIRED','message':'staff account required'})
     async with request.app.state.database.session_factory() as s:
         operation=(await s.execute(select(BusinessOperation).where(BusinessOperation.id==operation_id,BusinessOperation.operation_type=='redeem').with_for_update())).scalar_one_or_none()
@@ -77,7 +81,7 @@ async def review_redeem(request:Request,operation_id:str,payload:OperationReview
         return ApiResponse(data={'operation_id':operation.id,'operation':'redeem','status':operation.status,'amount':operation.amount,'quantity':operation.quantity,'product_id':operation.product_id})
 
 @router.post('/staff/redeem',response_model=ApiResponse[dict])
-async def staff_redeem(request:Request,payload:StaffRedeemRequest,user:Annotated[User,Depends(current_user)]):
+async def staff_redeem(request:Request,payload:StaffRedeemRequest,user:Annotated[User,Depends(advisor_operation_submit_user)]):
     if any(role.code=='customer' for role in user.roles):
         raise HTTPException(403,detail={'code':'STAFF_REQUIRED','message':'staff account required'})
     if not payload.customer_confirmed:
@@ -123,7 +127,7 @@ async def transfer(request:Request,payload:TransferRequest,user:Annotated[User,D
         return ApiResponse(data={'operation_id':operation.id,'operation':'transfer','status':operation.status,'amount':payload.amount,'to_account':payload.to_account})
 
 @router.post('/staff/transfer',response_model=ApiResponse[dict])
-async def staff_transfer(request:Request,payload:StaffTransferRequest,user:Annotated[User,Depends(current_user)]):
+async def staff_transfer(request:Request,payload:StaffTransferRequest,user:Annotated[User,Depends(staff_transfer_submit_user)]):
     if any(role.code=='customer' for role in user.roles):
         raise HTTPException(403,detail={'code':'STAFF_REQUIRED','message':'staff account required'})
     if not payload.customer_confirmed:
@@ -160,7 +164,7 @@ async def staff_transfer(request:Request,payload:StaffTransferRequest,user:Annot
         return ApiResponse(data={'operation_id':operation.id,'operation':'transfer','status':operation.status,'amount':operation.amount,'to_account':operation.to_account,'operator_user_id':user.id,'authorization_id':auth.id,'confirmation_mode':operation.confirmation_mode})
 
 @router.post('/transfer/{operation_id}/review',response_model=ApiResponse[dict])
-async def review_transfer(request:Request,operation_id:str,payload:OperationReviewRequest,user:Annotated[User,Depends(current_user)]):
+async def review_transfer(request:Request,operation_id:str,payload:OperationReviewRequest,user:Annotated[User,Depends(staff_operation_review_user)]):
     if any(role.code=='customer' for role in user.roles): raise HTTPException(403,detail={'code':'STAFF_REQUIRED','message':'staff account required'})
     async with request.app.state.database.session_factory() as s:
         operation=(await s.execute(select(BusinessOperation).where(BusinessOperation.id==operation_id,BusinessOperation.operation_type=='transfer').with_for_update())).scalar_one_or_none()
@@ -183,8 +187,34 @@ async def review_transfer(request:Request,operation_id:str,payload:OperationRevi
 
 
 
+@router.get('/staff/pending',response_model=ApiResponse[dict])
+async def list_staff_pending_operations(request:Request,operation_type:str='',limit:int=20,offset:int=0,user:Annotated[User,Depends(staff_operation_read_user)]=None):
+    if any(role.code=='customer' for role in user.roles): raise HTTPException(403,detail={'code':'STAFF_REQUIRED','message':'staff account required'})
+    if operation_type and operation_type not in {'redeem','transfer'}: raise HTTPException(422,detail={'code':'INVALID_OPERATION_TYPE','message':'operation_type must be redeem or transfer'})
+    async with request.app.state.database.session_factory() as s:
+        query=select(BusinessOperation).where(BusinessOperation.status=='pending_review',BusinessOperation.operation_type.in_(['redeem','transfer']))
+        count_query=select(func.count()).select_from(BusinessOperation).where(BusinessOperation.status=='pending_review',BusinessOperation.operation_type.in_(['redeem','transfer']))
+        if operation_type:
+            query=query.where(BusinessOperation.operation_type==operation_type); count_query=count_query.where(BusinessOperation.operation_type==operation_type)
+        total=int((await s.execute(count_query)).scalar_one())
+        operations=list((await s.execute(query.order_by(BusinessOperation.created_at.asc()).offset(offset).limit(limit))).scalars().all())
+        user_ids={op.user_id for op in operations}|{op.operator_user_id for op in operations if op.operator_user_id}
+        users={row.id:row for row in (await s.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()} if user_ids else {}
+        product_ids={op.product_id for op in operations if op.product_id}
+        products={row.id:row for row in (await s.execute(select(Product).where(Product.id.in_(product_ids)))).scalars().all()} if product_ids else {}
+        customer_ids={op.user_id for op in operations}
+        accounts={row.user_id:row for row in (await s.execute(select(Account).where(Account.user_id.in_(customer_ids)))).scalars().all()} if customer_ids else {}
+        alerts={}
+        if customer_ids:
+            for alert in (await s.execute(select(RiskAlert).where(RiskAlert.customer_id.in_(customer_ids),RiskAlert.status.in_(['open','acknowledged','investigating','report_pending'])).order_by(RiskAlert.created_at.desc()))).scalars().all(): alerts.setdefault(alert.customer_id,alert)
+        items=[]
+        for op in operations:
+            customer=users.get(op.user_id); operator=users.get(op.operator_user_id); alert=alerts.get(op.user_id); product=products.get(op.product_id); account=accounts.get(op.user_id)
+            items.append({'operation_id':op.id,'operation':op.operation_type,'status':op.status,'amount':op.amount,'quantity':op.quantity,'product_id':op.product_id,'product_name':product.name if product else '', 'to_account':op.to_account,'customer_id':op.user_id,'customer_name':customer.display_name if customer else '', 'customer_username':customer.username if customer else '', 'operator_user_id':op.operator_user_id,'operator_name':operator.display_name if operator else '', 'authorization_id':op.authorization_id,'confirmation_mode':op.confirmation_mode,'created_at':op.created_at,'account_status':account.status if account else '', 'risk_status':'restricted' if account and account.risk_restriction_status=='restricted' else ('monitoring' if alert else 'normal'),'risk_rule_code':alert.rule_code if alert else '', 'risk_alert_level':alert.alert_level if alert else ''})
+        return ApiResponse(data={'items':items,'total':total})
+
 @router.get('/audit-logs',response_model=ApiResponse[dict])
-async def list_operation_audits(request:Request,operation_id:str|None=None,action:str='',limit:int=50,offset:int=0,user:Annotated[User,Depends(current_user)]=None):
+async def list_operation_audits(request:Request,operation_id:str|None=None,action:str='',limit:int=50,offset:int=0,user:Annotated[User,Depends(staff_operation_audit_user)]=None):
     if limit < 1 or limit > 100 or offset < 0:
         raise HTTPException(422,detail={'code':'INVALID_PAGING','message':'invalid paging'})
     async with request.app.state.database.session_factory() as s:
@@ -194,7 +224,9 @@ async def list_operation_audits(request:Request,operation_id:str|None=None,actio
         if any(role.code == 'customer' for role in user.roles):
             operation_filter = operation_filter.where(BusinessOperation.user_id == user.id)
         else:
-            operation_filter = operation_filter.where((BusinessOperation.user_id == user.id) | (BusinessOperation.operator_user_id == user.id))
+            # Operations staff review customer requests platform-wide. Advisor-originated
+            # operations stay visible to their originating staff member as well.
+            operation_filter = operation_filter.where((BusinessOperation.operator_user_id.is_(None)) | (BusinessOperation.operator_user_id == user.id) | (BusinessOperation.user_id == user.id))
         query=select(AuditLog).where(AuditLog.resource_type=='business_operation',AuditLog.resource_id.in_(operation_filter))
         count_query=select(func.count()).select_from(AuditLog).where(AuditLog.resource_type=='business_operation',AuditLog.resource_id.in_(operation_filter))
         if action.strip():
@@ -211,6 +243,32 @@ async def list_operation_audits(request:Request,operation_id:str|None=None,actio
             items.append({'id':row.id,'operation_id':row.resource_id,'operation':op.operation_type if op else None,'operation_status':op.status if op else None,'customer_id':op.user_id if op else None,'operator_user_id':op.operator_user_id if op else None,'actor_user_id':row.actor_user_id,'actor_name':actor.display_name if actor else '系统','action':row.action,'detail':row.detail,'created_at':row.created_at})
         return ApiResponse(data={'items':items,'total':total})
 
+@router.get('/me',response_model=ApiResponse[dict])
+async def list_my_operations(request:Request,operation_type:str='',status:str='',limit:int=20,offset:int=0,user:Annotated[User,Depends(current_user)]=None):
+    _customer(user)
+    if operation_type and operation_type not in {'redeem','transfer'}: raise HTTPException(422,detail={'code':'INVALID_OPERATION_TYPE','message':'operation_type must be redeem or transfer'})
+    if limit < 1 or limit > 100 or offset < 0: raise HTTPException(422,detail={'code':'INVALID_PAGING','message':'invalid paging'})
+    async with request.app.state.database.session_factory() as s:
+        query=select(BusinessOperation).where(BusinessOperation.user_id==user.id,BusinessOperation.operation_type.in_(['redeem','transfer']))
+        count_query=select(func.count()).select_from(BusinessOperation).where(BusinessOperation.user_id==user.id,BusinessOperation.operation_type.in_(['redeem','transfer']))
+        if operation_type:
+            query=query.where(BusinessOperation.operation_type==operation_type); count_query=count_query.where(BusinessOperation.operation_type==operation_type)
+        if status:
+            query=query.where(BusinessOperation.status==status); count_query=count_query.where(BusinessOperation.status==status)
+        total=int((await s.execute(count_query)).scalar_one())
+        rows=list((await s.execute(query.order_by(BusinessOperation.created_at.desc()).offset(offset).limit(limit))).scalars().all())
+        product_ids={row.product_id for row in rows if row.product_id}
+        products={row.id:row for row in (await s.execute(select(Product).where(Product.id.in_(product_ids)))).scalars().all()} if product_ids else {}
+        operation_ids={row.id for row in rows}
+        audits={}
+        if operation_ids:
+            for audit in (await s.execute(select(AuditLog).where(AuditLog.resource_type=='business_operation',AuditLog.resource_id.in_(operation_ids)).order_by(AuditLog.created_at.desc()))).scalars().all(): audits.setdefault(audit.resource_id,audit)
+        items=[]
+        for row in rows:
+            audit=audits.get(row.id); product=products.get(row.product_id)
+            items.append({'operation_id':row.id,'operation':row.operation_type,'status':row.status,'amount':row.amount,'quantity':row.quantity,'product_id':row.product_id,'product_name':product.name if product else '', 'to_account':row.to_account,'operator_user_id':row.operator_user_id,'authorization_id':row.authorization_id,'confirmation_mode':row.confirmation_mode,'latest_action':audit.action if audit else '', 'latest_note':audit.detail if audit else '', 'created_at':row.created_at,'updated_at':row.updated_at})
+        return ApiResponse(data={'items':items,'total':total})
+
 @router.get('/me/{operation_id}',response_model=ApiResponse[dict])
 async def get_operation(request:Request,operation_id:str,user:Annotated[User,Depends(current_user)]):
     async with request.app.state.database.session_factory() as s:
@@ -219,7 +277,7 @@ async def get_operation(request:Request,operation_id:str,user:Annotated[User,Dep
         return ApiResponse(data={'operation_id':operation.id,'operation':operation.operation_type,'status':operation.status,'amount':operation.amount,'quantity':operation.quantity,'product_id':operation.product_id,'operator_user_id':operation.operator_user_id,'authorization_id':operation.authorization_id,'confirmation_mode':operation.confirmation_mode})
 
 @router.get('/staff/{operation_id}',response_model=ApiResponse[dict])
-async def get_staff_operation(request:Request,operation_id:str,user:Annotated[User,Depends(current_user)]):
+async def get_staff_operation(request:Request,operation_id:str,user:Annotated[User,Depends(staff_operation_read_user)]):
     if any(role.code=='customer' for role in user.roles): raise HTTPException(403,detail={'code':'STAFF_REQUIRED','message':'staff account required'})
     async with request.app.state.database.session_factory() as s:
         operation=(await s.execute(select(BusinessOperation).where(BusinessOperation.id==operation_id,BusinessOperation.operator_user_id==user.id))).scalar_one_or_none()

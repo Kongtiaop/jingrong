@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     memory_sync_timeout_ms: int = 2500
     task_max_attempts: int = 3
     task_block_ms: int = 5000
+    aml_scheduler_enabled: bool = False
+    aml_scheduler_poll_seconds: int = 60
+    aml_scheduler_hour_utc: int = 1
+    aml_scheduler_minute_utc: int = 10
+    aml_scheduler_days: int = 7
+    customer_service_timeout_worker_enabled: bool = False
+    customer_service_timeout_worker_poll_seconds: int = 30
+    customer_service_heartbeat_timeout_seconds: int = 90
+    workorder_upload_dir: str = "uploads/workorders"
+    workorder_attachment_max_bytes: int = 10 * 1024 * 1024
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -69,6 +79,14 @@ class Settings(BaseSettings):
             raise ValueError("MEMORY_SYNC_TIMEOUT_MS must be positive")
         if self.task_max_attempts <= 0:
             raise ValueError("TASK_MAX_ATTEMPTS must be positive")
+        if self.aml_scheduler_poll_seconds <= 0:
+            raise ValueError("AML_SCHEDULER_POLL_SECONDS must be positive")
+        if not 0 <= self.aml_scheduler_hour_utc <= 23:
+            raise ValueError("AML_SCHEDULER_HOUR_UTC must be between 0 and 23")
+        if not 0 <= self.aml_scheduler_minute_utc <= 59:
+            raise ValueError("AML_SCHEDULER_MINUTE_UTC must be between 0 and 59")
+        if not 1 <= self.aml_scheduler_days <= 30:
+            raise ValueError("AML_SCHEDULER_DAYS must be between 1 and 30")
 
 
 @lru_cache
@@ -76,4 +94,6 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.validate_p0()
     return settings
+
+
 

@@ -149,3 +149,43 @@ class RiskAlert(Base):
 
 
 
+
+
+class AmlBatchRun(Base):
+    __tablename__ = "aml_batch_run"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    batch_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    scan_window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    scan_window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    scan_days: Mapped[int] = mapped_column(default=7)
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    total_customers: Mapped[int] = mapped_column(default=0)
+    succeeded_customers: Mapped[int] = mapped_column(default=0)
+    failed_customers: Mapped[int] = mapped_column(default=0)
+    created_alerts: Mapped[int] = mapped_column(default=0)
+    error_summary: Mapped[str] = mapped_column(Text, default="")
+    run_type: Mapped[str] = mapped_column(String(32), default="daily", nullable=False, index=True)
+    source_batch_id: Mapped[str | None] = mapped_column(ForeignKey("aml_batch_run.id", ondelete="SET NULL"), nullable=True, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AmlBatchAlert(Base):
+    __tablename__ = "aml_batch_alert"
+    batch_id: Mapped[str] = mapped_column(ForeignKey("aml_batch_run.id", ondelete="CASCADE"), primary_key=True)
+    alert_id: Mapped[str] = mapped_column(ForeignKey("risk_alert.id", ondelete="CASCADE"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AmlSchedulerState(Base):
+    __tablename__ = "aml_scheduler_state"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_scan_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_scan_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_scan_status: Mapped[str] = mapped_column(String(32), default="never", nullable=False)
+    last_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
