@@ -20,6 +20,7 @@ from app.services.risk_assessment_service import RiskAssessmentService
 from app.services.asset_summary_service import AssetSummaryService
 from app.services.holding_valuation_service import HoldingValuationService
 from app.services.trading_service import TradingError
+from app.services.advisor_authorization_service import AdvisorAuthorizationService
 
 router=APIRouter(prefix="/profile",tags=["profile"])
 
@@ -375,24 +376,17 @@ async def create_advisor_authorization(request: Request, payload: AdvisorAuthori
         advisor = await uow.users.get(session, payload.advisor_id)
         if advisor is None:
             raise HTTPException(status_code=404, detail={"code": "ADVISOR_NOT_FOUND", "message": "advisor not found"})
-        existing = (await session.execute(select(CustomerAdvisorAuthorization).where(
-            CustomerAdvisorAuthorization.customer_id == user.id,
-            CustomerAdvisorAuthorization.advisor_id == payload.advisor_id,
-            CustomerAdvisorAuthorization.status == "active",
-        ).with_for_update())).scalars().first()
-        if existing is not None:
-            for key, value in payload.model_dump().items():
-                setattr(existing, key, value)
-            existing.effective_to = None
-            existing.revoked_at = None
-            existing.status = "active"
-            authorization = existing
-        else:
-            authorization = CustomerAdvisorAuthorization(customer_id=user.id, **payload.model_dump(), id=str(uuid4()))
-            session.add(authorization)
+        mutation = await AdvisorAuthorizationService.grant_or_update(
+            session, customer_id=user.id, advisor_id=payload.advisor_id, values=payload.model_dump()
+        )
+        authorization = mutation.authorization
         await session.flush()
         await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="grant", resource_type="advisor_authorization", resource_id=authorization.id, detail=payload.model_dump_json()))
-        await session.commit(); await session.refresh(authorization)
+        AdvisorAuthorizationService.enqueue_scope_invalidation_events(
+            session, advisor_ids=[authorization.advisor_id], mutation_source="customer_self_service"
+        )
+        await session.commit()
+        await session.refresh(authorization)
         return ApiResponse(data=AdvisorAuthorizationResponse.model_validate(authorization, from_attributes=True))
 
 @router.get("/me/advisor-authorizations", response_model=ApiResponse[dict])
@@ -413,11 +407,14 @@ async def list_advisor_authorizations(request: Request, limit: int = 20, offset:
 async def revoke_advisor_authorization(request: Request, authorization_id: str, user: Annotated[User, Depends(current_user)]):
     uow = resolve_profile_uow(request)
     async with request.app.state.database.session_factory() as session:
-        row = (await session.execute(select(CustomerAdvisorAuthorization).where(CustomerAdvisorAuthorization.id == authorization_id, CustomerAdvisorAuthorization.customer_id == user.id, CustomerAdvisorAuthorization.status == "active"))).scalar_one_or_none()
+        row = await AdvisorAuthorizationService.revoke_for_customer(session, authorization_id=authorization_id, customer_id=user.id)
         if row is None:
             raise HTTPException(status_code=404, detail={"code": "AUTHORIZATION_NOT_FOUND", "message": "advisor authorization not found"})
-        row.status = "revoked"; row.revoked_at = datetime.now(timezone.utc)
-        await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="revoke", resource_type="advisor_authorization", resource_id=row.id, detail="customer revoked authorization")); await session.commit()
+        await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="revoke", resource_type="advisor_authorization", resource_id=row.id, detail="customer revoked authorization"))
+        AdvisorAuthorizationService.enqueue_scope_invalidation_events(
+            session, advisor_ids=[row.advisor_id], mutation_source="customer_self_service"
+        )
+        await session.commit()
         return ApiResponse(data={"id": row.id, "status": row.status})
 
 @router.get("/staff/advisors", response_model=ApiResponse[dict])
@@ -438,8 +435,16 @@ async def staff_recommendations(request: Request, payload: StaffRecommendationRe
         if profile is None:
             raise HTTPException(status_code=404, detail={"code": "CUSTOMER_NOT_FOUND", "message": "customer not found"})
         service = SuitabilityService(risk_repository=uow.risks, product_repository=uow.products, profile_repository=uow.profiles, asset_service=AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets))
-        recommendation = await service.recommend(session, payload.customer_id)
-        data = StaffRecommendationResponse(user_id=recommendation.user_id, matches=recommendation.matches, excluded=recommendation.excluded, generated_for=payload.customer_id)
+        recommendation = await service.recommend(session, payload.customer_id, risk_operation=await _risk_operation_for_user(session, payload.customer_id))
+        data = StaffRecommendationResponse(
+            user_id=recommendation.user_id,
+            context=recommendation.context,
+            matches=recommendation.matches,
+            excluded=recommendation.excluded,
+            warnings=recommendation.warnings,
+            generated_at=recommendation.generated_at,
+            generated_for=payload.customer_id,
+        )
         return ApiResponse(data=data)
 
 @router.post("/staff/operation-drafts", response_model=ApiResponse[AdvisorDraftResponse], status_code=201)
@@ -652,6 +657,14 @@ async def customer_tier(request: Request, user: Annotated[User, Depends(current_
 
 @router.get("/me/recommendations", response_model=ApiResponse[RecommendationResponse])
 async def recommendations(request: Request, user: Annotated[User, Depends(current_user)]):
+    uow = resolve_profile_uow(request)
+    asset_service = AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets)
+    service = SuitabilityService(
+        risk_repository=uow.risks,
+        product_repository=uow.products,
+        profile_repository=uow.profiles,
+        asset_service=asset_service,
+    )
     async with request.app.state.database.session_factory() as session:
-        data = await SuitabilityService().recommend(session, str(user.id))
+        data = await service.recommend(session, str(user.id), risk_operation=await _risk_operation_for_user(session, str(user.id)))
         return ApiResponse(data=data)

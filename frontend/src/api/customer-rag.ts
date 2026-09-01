@@ -18,12 +18,14 @@ export const customerRagApi = {
 
 
 export const customerServiceApi = {
+  execute: (content: string, conversationId: string, pageContext = '', resourceId?: string) => http.post('/customer-service/sessions/agent/execute', { content, conversation_id: conversationId, page_context: pageContext, resource_id: resourceId }),
   executePlan: (query: string, conversationId: string) => http.post('/customer-service/sessions/execute-plan', { note: query }, { headers: { 'X-Conversation-Id': conversationId } }),
 }
 
 
 export const customerServiceMessageApi = {
-  messages: (sessionId: string) => http.get(`/customer-service/sessions/${sessionId}/messages`),
+  session: (sessionId: string) => http.get(`/customer-service/sessions/${sessionId}`),
+  messages: (sessionId: string, after?: string) => http.get(`/customer-service/sessions/${sessionId}/messages`, { params: after ? { after } : undefined }),
   send: (sessionId: string, content: string) => http.post(`/customer-service/sessions/${sessionId}/messages`, { content }),
   claim: (sessionId: string) => http.post(`/customer-service/sessions/${sessionId}/claim`),
   pause: (sessionId: string, note = '') => http.post(`/customer-service/sessions/${sessionId}/pause`, { note }),
@@ -33,3 +35,4 @@ export const customerServiceMessageApi = {
   customerClose: (sessionId: string) => http.post(`/customer-service/sessions/${sessionId}/customer-close`, { note: 'customer_requested_close' }),
   sessions: (status = 'waiting_human') => http.get('/customer-service/sessions', { params: { status } }),
 }
+

@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { notificationsApi, type Notification } from '../api/notifications'
 
-const emit = defineEmits<{ openWorkOrder: [id: string] }>()
+const emit = defineEmits<{ openWorkOrder: [id: string]; openCustomerService: [id: string] }>()
 const rows = ref<Notification[]>([])
 const unread = ref(0)
 const loading = ref(false)
@@ -30,6 +30,7 @@ async function open(row: Notification) {
       unread.value = result.unread_count
     }
     if (row.resource_type === 'work_order') emit('openWorkOrder', row.resource_id)
+    if (row.resource_type === 'customer_service_session') emit('openCustomerService', row.resource_id)
   } catch (e: any) {
     error.value = e.message || '通知更新失败'
   }
@@ -50,12 +51,12 @@ onMounted(load)
 
 <template>
   <div class="notification-center">
-    <div class="notification-center-head"><div><span class="eyebrow">INBOX</span><h3>工单通知</h3></div><button v-if="unread" class="notification-read-all" @click="markAllRead">全部已读</button></div>
+    <div class="notification-center-head"><div><span class="eyebrow">INBOX</span><h3>通知中心</h3></div><button v-if="unread" class="notification-read-all" @click="markAllRead">全部已读</button></div>
     <p v-if="error" class="error">{{ error }}</p>
     <div v-if="loading" class="notification-empty">正在加载通知…</div>
     <div v-else-if="!rows.length" class="notification-empty">暂无通知。</div>
     <div v-else class="notification-list">
-      <button v-for="row in rows" :key="row.id" :class="['notification-row', { unread: !row.is_read }]" @click="open(row)">
+      <button v-for="row in rows" data-testid="notification-row" :key="row.id" :class="['notification-row', { unread: !row.is_read }]" @click="open(row)">
         <span class="notification-dot" aria-hidden="true"></span><span class="notification-copy"><strong>{{ row.title }}</strong><small>{{ row.content }}</small><time>{{ new Date(row.created_at).toLocaleString('zh-CN') }}</time></span>
       </button>
     </div>

@@ -8,8 +8,11 @@ from uuid import uuid4
 from app.common.response import ApiResponse
 from app.common.security.auth import current_user, require_permission
 from app.models.audit import AuditLog
-from app.models.auth import Permission, Role, User
+from app.services.permission_scoped_cache import bump_permission_context_version
+from app.services.advisor_authorization_service import AdvisorAuthorizationService
+from app.models.auth import CustomerAdvisorAuthorization, Permission, Role, User
 from app.models.operations import BusinessOperation
+from app.models.outbox import OutboxEvent
 from app.models.trading import Account, Order, RiskAlert, Trade
 from app.models.profile import CustomerEnterpriseVerification, CustomerProfile, CustomerRiskAssessment, Product
 from app.schemas.admin import *
@@ -44,6 +47,62 @@ def user_response(user: User) -> AdminUserResponse:
         updated_at=user.updated_at,
         deleted_at=user.deleted_at,
     )
+
+
+def outbox_response(row: OutboxEvent) -> OutboxEventResponse:
+    return OutboxEventResponse(
+        id=str(row.id), event_type=row.event_type, aggregate_type=row.aggregate_type,
+        aggregate_id=str(row.aggregate_id) if row.aggregate_id else None, status=row.status,
+        attempt=row.attempt, error_message=row.error_message, published_at=row.published_at,
+        created_at=row.created_at, updated_at=row.updated_at, payload_json=row.payload_json or {},
+    )
+
+
+@router.get("/outbox-events", response_model=ApiResponse[OutboxEventListResponse])
+async def list_outbox_events(
+    request: Request,
+    status: str = Query("", pattern="^(|pending|published|dead)$"),
+    event_type_prefix: str = Query("notification."),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    user: Annotated[User, Depends(require_permission("audit:read"))] = None,
+):
+    async with request.app.state.database.session_factory() as session:
+        query = select(OutboxEvent)
+        count_query = select(func.count()).select_from(OutboxEvent)
+        criteria = []
+        if status:
+            criteria.append(OutboxEvent.status == status)
+        if event_type_prefix:
+            criteria.append(OutboxEvent.event_type.like(f"{event_type_prefix}%"))
+        if criteria:
+            query = query.where(*criteria)
+            count_query = count_query.where(*criteria)
+        rows = list((await session.execute(query.order_by(OutboxEvent.created_at.desc()).offset(offset).limit(limit))).scalars().all())
+        count_rows = await session.execute(select(OutboxEvent.status, func.count()).where(OutboxEvent.event_type.like("notification.%")).group_by(OutboxEvent.status))
+        counts = {name: int(count) for name, count in count_rows.all()}
+        total = int((await session.execute(count_query)).scalar_one())
+        return ApiResponse(data=OutboxEventListResponse(items=[outbox_response(row) for row in rows], total=total, counts=counts))
+
+
+@router.post("/outbox-events/{event_id}/retry", response_model=ApiResponse[OutboxRetryResponse])
+async def retry_outbox_event(request: Request, event_id: str, user: Annotated[User, Depends(require_permission("audit:read"))] = None):
+    async with request.app.state.database.session_factory() as session:
+        row = await session.get(OutboxEvent, event_id, with_for_update=True)
+        if row is None:
+            raise HTTPException(status_code=404, detail={"code": "OUTBOX_EVENT_NOT_FOUND", "message": "outbox event not found"})
+        if not (row.event_type.startswith("notification.") or row.event_type == "authorization.subject_scope_invalidate" or row.event_type.startswith("knowledge.")):
+            raise HTTPException(status_code=422, detail={"code": "OUTBOX_EVENT_TYPE_NOT_RETRYABLE", "message": "event type is not retryable here"})
+        if row.status != "dead":
+            raise HTTPException(status_code=409, detail={"code": "OUTBOX_EVENT_NOT_DEAD", "message": "only dead events can be retried"})
+        row.status = "pending"
+        row.attempt = 0
+        row.error_message = None
+        row.published_at = None
+        session.add(AuditLog(id=str(uuid4()), actor_user_id=user.id, action="outbox_event_retry", resource_type="outbox_event", resource_id=str(row.id), detail=f"event_type={row.event_type};aggregate_id={row.aggregate_id or ''}"))
+        await session.commit()
+        await session.refresh(row)
+        return ApiResponse(data=OutboxRetryResponse(id=str(row.id), status=row.status, attempt=row.attempt))
 
 
 @router.get("/dashboard/risk-workbench", response_model=ApiResponse[dict])
@@ -166,10 +225,20 @@ async def recycle_bin(request: Request, module: str = Query("user", pattern="^(u
 
 
 @router.get("/audit-logs", response_model=ApiResponse[dict])
-async def audit_logs(request: Request, action: str = Query(""), resource_type: str = Query(""), limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0), user: Annotated[User, Depends(require_permission("audit:read"))] = None):
+async def audit_logs(request: Request, action: str = Query(""), resource_type: str = Query(""), action_prefix: str = Query(""), resource_id: str = Query(""), limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0), user: Annotated[User, Depends(require_permission("audit:read"))] = None):
     uow = resolve_admin_uow(request)
     async with request.app.state.database.session_factory() as session:
-        total, rows = await uow.audit_logs.list(session, action=action, resource_type=resource_type, limit=limit, offset=offset)
+        # The repository supports exact filters; action-prefix/resource-id filters are applied here
+        # so operations can inspect the complete DataAnalysisAgent audit trail safely.
+        repository_limit = 1000 if (action_prefix or resource_id) else limit
+        total, rows = await uow.audit_logs.list(session, action=action, resource_type=resource_type, limit=repository_limit, offset=0 if (action_prefix or resource_id) else offset)
+        if action_prefix:
+            rows = [row for row in rows if row.action.startswith(action_prefix)]
+        if resource_id:
+            rows = [row for row in rows if row.resource_id == resource_id]
+        if action_prefix or resource_id:
+            total = len(rows)
+            rows = rows[offset:offset + limit]
         actor_ids = {row.actor_user_id for row in rows if row.actor_user_id}
         actors = {row.id: row for row in (await session.execute(select(User).where(User.id.in_(actor_ids)))).scalars().all()} if actor_ids else {}
         operation_ids = {row.resource_id for row in rows if row.resource_type == "business_operation"}
@@ -217,6 +286,107 @@ async def audit_logs(request: Request, action: str = Query(""), resource_type: s
 
 
 
+@router.get("/intent-shadow/metrics", response_model=ApiResponse[IntentShadowMetricsResponse])
+async def intent_shadow_metrics(request: Request, limit: int = Query(50, ge=1, le=200), user: Annotated[User, Depends(require_permission("audit:read"))] = None):
+    """Aggregate shadow-mode observations without exposing raw customer query text."""
+    async with request.app.state.database.session_factory() as session:
+        rows = list((await session.execute(
+            select(AuditLog)
+            .where(AuditLog.action == "customer_agent.intent_shadow_evaluated")
+            .order_by(AuditLog.created_at.desc())
+            .limit(limit)
+        )).scalars().all())
+    total = errors = template_matches = template_mismatches = model_trade_candidates = unknown_rule_trade_blocked = verified_customer_confirmation_required = 0
+    recent = []
+    trade_templates = {"T3_RECOMMEND_THEN_PURCHASE_DRAFT", "T4_PURCHASE_DRAFT", "T9_MODIFY_DRAFT", "T10_CANCEL_DRAFT"}
+    for row in rows:
+        total += 1
+        try:
+            payload = json.loads(row.detail or "{}")
+        except json.JSONDecodeError:
+            payload = {"error": "invalid_audit_json"}
+        rule = payload.get("rule") or {}
+        llm = payload.get("llm") or {}
+        resolved = payload.get("resolved") or {}
+        error = payload.get("error")
+        if error:
+            errors += 1
+        rule_template = rule.get("template", "")
+        llm_template = llm.get("template", "")
+        if llm_template:
+            if llm_template == rule_template:
+                template_matches += 1
+            else:
+                template_mismatches += 1
+            if llm_template in trade_templates:
+                model_trade_candidates += 1
+        if rule_template == "T0_UNKNOWN" and llm_template in trade_templates and resolved.get("template") == "T0_UNKNOWN":
+            unknown_rule_trade_blocked += 1
+        if payload.get("verified_customer_confirmation_required") is True:
+            verified_customer_confirmation_required += 1
+        recent.append({
+            "audit_id": row.id,
+            "conversation_id": payload.get("conversation_id"),
+            "rule_template": rule_template or None,
+            "llm_template": llm_template or None,
+            "resolved_template": resolved.get("template") or None,
+            "error": error,
+            "execution_changed": payload.get("execution_changed"),
+            "fallback_decision": payload.get("fallback_decision"),
+            "created_at": row.created_at,
+        })
+    return ApiResponse(data=IntentShadowMetricsResponse(
+        total=total, errors=errors, template_matches=template_matches, template_mismatches=template_mismatches,
+        model_trade_candidates=model_trade_candidates, unknown_rule_trade_blocked=unknown_rule_trade_blocked,
+        verified_customer_confirmation_required=verified_customer_confirmation_required, recent=recent,
+    ))
+
+
+@router.put("/advisor-authorizations/batch", response_model=ApiResponse[dict])
+async def batch_update_advisor_authorizations(request: Request, payload: AdminAdvisorAuthorizationBatchUpdateRequest, user: Annotated[User, Depends(require_permission("admin:write"))] = None):
+    """Administrative bulk grant/revoke with post-commit subject-scope cache invalidation."""
+    ensure_admin(user)
+    if not payload.grants and not payload.revoke_ids:
+        raise HTTPException(status_code=422, detail={"code": "EMPTY_AUTHORIZATION_BATCH", "message": "at least one grant or revoke is required"})
+    uow = resolve_admin_uow(request)
+    affected_advisor_ids: set[str] = set()
+    granted_ids: list[str] = []
+    revoked_ids: list[str] = []
+    async with request.app.state.database.session_factory() as session:
+        for item in payload.grants:
+            advisor = await uow.admin.get_user(session, item.advisor_id)
+            customer = await uow.admin.get_user(session, item.customer_id)
+            if advisor is None or customer is None:
+                raise HTTPException(status_code=404, detail={"code": "ADVISOR_OR_CUSTOMER_NOT_FOUND", "message": "advisor or customer not found"})
+            if customer.status != "active":
+                raise HTTPException(status_code=409, detail={"code": "CUSTOMER_NOT_ACTIVE", "message": "customer must be active"})
+            mutation = await AdvisorAuthorizationService.grant_or_update(
+                session,
+                customer_id=item.customer_id,
+                advisor_id=item.advisor_id,
+                values=item.model_dump(exclude={"advisor_id", "customer_id"}),
+            )
+            affected_advisor_ids.add(item.advisor_id)
+            granted_ids.append(mutation.authorization.id)
+        if payload.revoke_ids:
+            try:
+                rows = await AdvisorAuthorizationService.revoke_ids(session, authorization_ids=payload.revoke_ids)
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail={"code": "AUTHORIZATION_NOT_FOUND", "message": str(exc)}) from exc
+            for row in rows:
+                affected_advisor_ids.add(row.advisor_id)
+                revoked_ids.append(row.id)
+        await uow.audit_logs.save(session, AuditLog(
+            id=str(uuid4()), actor_user_id=user.id, action="batch_update", resource_type="advisor_authorization",
+            resource_id="batch", detail=f"grants={len(granted_ids)};revokes={len(revoked_ids)}",
+        ))
+        event_ids = AdvisorAuthorizationService.enqueue_scope_invalidation_events(
+            session, advisor_ids=affected_advisor_ids, mutation_source="admin_batch"
+        )
+        await session.commit()
+    return ApiResponse(data={"granted_ids": granted_ids, "revoked_ids": revoked_ids, "affected_advisor_ids": sorted(affected_advisor_ids), "invalidation_event_ids": event_ids})
+
+
 @router.get("/permissions", response_model=ApiResponse[list[AdminPermissionResponse]])
 async def list_permissions(request: Request, user: Annotated[User, Depends(require_permission("admin:write"))] = None):
     ensure_admin(user)
@@ -242,6 +412,7 @@ async def update_user_roles(request: Request, user_id: str, payload: AdminRoleUp
         target = await uow.admin.update_user_roles(session, target, roles)
         await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="update_roles", resource_type="user", resource_id=target.id, detail=",".join(payload.roles)))
         await session.commit()
+        await bump_permission_context_version(request.app.state.redis.client, user_id=target.id)
         await session.refresh(target)
         return ApiResponse(data=user_response(target))
 
@@ -314,7 +485,10 @@ async def update_role_permissions(request: Request, role_id: str, payload: Admin
             raise HTTPException(status_code=400, detail={"code":"SUPER_ADMIN_PERMISSIONS_FIXED","message":"super_admin permissions are fixed"})
         await uow.admin.update_role_permissions(session, role, permissions)
         await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="update_permissions", resource_type="role", resource_id=role.id, detail=",".join(payload.permissions)))
+        affected_user_ids = list((await session.execute(select(User.id).join(User.roles).where(Role.id == role.id))).scalars().all())
         await session.commit()
+        for affected_user_id in affected_user_ids:
+            await bump_permission_context_version(request.app.state.redis.client, user_id=affected_user_id)
         await session.refresh(role)
         return ApiResponse(data=AdminRoleResponse(id=role.id, code=role.code, name=role.name, permissions=[permission.code for permission in role.permissions]))
 

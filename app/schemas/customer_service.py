@@ -23,6 +23,13 @@ class CustomerServiceActionRequest(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class UnifiedAgentRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=10000)
+    conversation_id: str | None = Field(default=None, max_length=128)
+    page_context: str = Field(default="", max_length=256)
+    resource_id: str | None = Field(default=None, max_length=128)
+
+
 class CustomerServiceAssignRequest(BaseModel):
     assigned_agent_id: str
     note: str = Field(default="", max_length=2000)
@@ -39,6 +46,7 @@ class IntentTaskResponse(BaseModel):
     arguments: dict
     confidence: float
     status: str
+    execution_mode: str = "controlled_workflow"
 
 
 class CustomerIntentPlanResponse(BaseModel):
@@ -66,6 +74,11 @@ class CustomerTaskExecutionResponse(BaseModel):
     conversation_id: str
     overall_status: str
     answer: str
+    route: str = "customer_service"
+    agents: list[str] = Field(default_factory=lambda: ["CustomerServiceAgent"])
+    available_agents: list[str] = Field(default_factory=list)
+    denied_agents: list[str] = Field(default_factory=list)
+    page_context: str = ""
     results: list[TaskExecutionResultResponse]
     clarification: str | None = None
     requires_handoff: bool = False
@@ -73,6 +86,25 @@ class CustomerTaskExecutionResponse(BaseModel):
     ticket_no: str | None = None
     customer_service_session_id: str | None = None
     customer_service_session_status: str | None = None
+
+
+class AnalysisChartSpec(BaseModel):
+    type: str = Field(pattern="^(metric|table|bar|line|pie)$")
+    title: str
+    dimension: str | None = None
+    metric: str | None = None
+    unit: str = ""
+
+
+class AnalysisQueryPlanResponse(BaseModel):
+    mode: str
+    metric_code: str | None = None
+    source_tables: list[str] = Field(default_factory=list)
+    allowed_roles: list[str] = Field(default_factory=list)
+    required_scope: str = "internal_authorized_scope"
+    read_only: bool = True
+    free_sql: bool = False
+    next_guard: str = "catalog_template_parameter_binding"
 
 
 class CustomerServiceMessageResponse(BaseModel):

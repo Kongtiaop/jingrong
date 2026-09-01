@@ -9,6 +9,7 @@ from app.models.trading import Account, Order, Trade, OrderStatusHistory
 from app.schemas.trading import *
 from app.services.trading_service import TradingError, TradingService
 from app.services.risk_alert_service import RiskAlertService
+from app.services.natural_language_order_draft import NaturalLanguageOrderDraftService
 
 router = APIRouter(prefix="/trading", tags=["trading"])
 def get_trading_service(request: Request) -> TradingService:
@@ -46,6 +47,43 @@ async def account_me(request: Request, user: Annotated[User, Depends(current_use
     async with request.app.state.database.session_factory() as session:
         account = await trading_service.get_or_create_account(session, user.id); await session.commit(); await session.refresh(account)
         return ApiResponse(data=AccountResponse.model_validate(account, from_attributes=True))
+
+@router.post("/order-drafts/natural-language", response_model=ApiResponse[NaturalLanguageOrderDraftPersistedResponse | NaturalLanguageOrderDraftResponse])
+async def draft_order_from_natural_language(request: Request, payload: NaturalLanguageOrderDraftRequest, user: Annotated[User, Depends(current_user)]):
+    trading_service = get_trading_service(request)
+    if not any(role.code == "customer" for role in user.roles):
+        raise HTTPException(status_code=403, detail="customer account required")
+    async with request.app.state.database.session_factory() as session:
+        draft_service = NaturalLanguageOrderDraftService(trading_service)
+        try:
+            result = await draft_service.draft(session=session, user_id=user.id, query=payload.query)
+            await session.commit()
+            return ApiResponse(data=result)
+        except TradingError as exc:
+            err(exc)
+
+
+@router.post("/order-drafts/{draft_id}/confirm", response_model=ApiResponse[OrderResponse], status_code=201)
+async def confirm_natural_language_order_draft(request: Request, draft_id: str, payload: NaturalLanguageOrderDraftConfirmRequest, user: Annotated[User, Depends(current_user)]):
+    trading_service = get_trading_service(request)
+    if not any(role.code == "customer" for role in user.roles):
+        raise HTTPException(status_code=403, detail="customer account required")
+    try:
+        async with request.app.state.database.session_factory() as session:
+            draft_service = NaturalLanguageOrderDraftService(trading_service)
+            order = await draft_service.confirm(session=session, user=user, draft_id=draft_id, payload=payload)
+            await session.commit()
+            await session.refresh(order)
+            return ApiResponse(data=await order_response(session, order, trading_service))
+    except ValueError as exc:
+        message = str(exc)
+        code, status = ("DRAFT_NOT_FOUND", 404) if message == "draft not found" else ("DRAFT_CONFIRMATION_CONFLICT", 409)
+        if message in {"invalid draft confirmation token"}:
+            code, status = "DRAFT_CONFIRMATION_INVALID", 403
+        raise HTTPException(status_code=status, detail={"code": code, "message": message}) from exc
+    except TradingError as exc:
+        err(exc)
+
 
 @router.post("/orders", response_model=ApiResponse[OrderResponse], status_code=201)
 async def create_order(request: Request, payload: OrderCreateRequest, user: Annotated[User, Depends(current_user)]):

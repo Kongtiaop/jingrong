@@ -58,3 +58,43 @@ class TradeResponse(BaseModel):
 class OrderListResponse(BaseModel):
     items: list[OrderResponse]
     total: int
+
+
+class NaturalLanguageOrderDraftRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=1000)
+
+
+class OrderDraftProductOption(BaseModel):
+    id: str
+    name: str
+    risk_level: str
+    minimum_amount: Decimal
+
+
+class NaturalLanguageOrderDraftResponse(BaseModel):
+    status: str
+    side: str = "buy"
+    product_id: str | None = None
+    product_name: str | None = None
+    amount: Decimal | None = None
+    missing_fields: list[str] = []
+    clarification: str | None = None
+    suitable: bool | None = None
+    suitability_reasons: list[str] = []
+    precheck_passed: bool = False
+    warnings: list[str] = []
+    product_options: list[OrderDraftProductOption] = []
+    confirmation_required: bool = True
+    executed: bool = False
+
+
+class NaturalLanguageOrderDraftPersistedResponse(NaturalLanguageOrderDraftResponse):
+    draft_id: str
+    version: int
+    confirmation_token: str
+    expires_at: datetime
+
+
+class NaturalLanguageOrderDraftConfirmRequest(BaseModel):
+    confirmation_token: str = Field(min_length=20, max_length=512)
+    idempotency_key: str | None = Field(default=None, max_length=128)

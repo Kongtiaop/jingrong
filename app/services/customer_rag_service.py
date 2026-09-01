@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from typing import Literal
 
 from app.common.knowledge_scope import KnowledgeScope
+from app.infrastructure.qwen import QwenProvider
 from app.services.knowledge_retrieval import KnowledgeCitation, WealthKnowledgeRetriever
 
 
@@ -69,9 +71,11 @@ def normalize_customer_query(query: str, intent: CustomerKnowledgeIntent) -> str
 
 
 class CustomerRagService:
-    def __init__(self, retriever: WealthKnowledgeRetriever, *, min_score: float = 0.45) -> None:
+    def __init__(self, retriever: WealthKnowledgeRetriever, embedding_provider: QwenProvider | None = None, *, min_score: float = 0.0001, embedding_timeout: float = 8.0) -> None:
         self.retriever = retriever
+        self.embedding_provider = embedding_provider
         self.min_score = min_score
+        self.embedding_timeout = embedding_timeout
 
     async def answer(self, *, query: str, intent: CustomerKnowledgeIntent, top_k: int = 5) -> CustomerRagResult:
         greeting = greeting_message(query)
@@ -80,8 +84,20 @@ class CustomerRagService:
         if intent == "product_recommendation":
             return CustomerRagResult(intent=intent, answer_mode="database_recommendation", evidence_status="not_applicable", citations=[], handoff_required=False, message="产品推荐使用实时 Product 数据和适当性服务，不依赖当前缺失的产品 RAG 文档。")
         normalized_query = normalize_customer_query(query, intent)
-        citations = await self.retriever.search(query=normalized_query, top_k=top_k, scope=scope_for_customer_intent(intent))
+        scope = scope_for_customer_intent(intent)
+        evidence_status = "sufficient"
+        query_embedding = None
+        if self.embedding_provider is not None:
+            try:
+                query_embedding = (await asyncio.wait_for(self.embedding_provider.embed([normalized_query]), timeout=self.embedding_timeout))[0]
+            except Exception:
+                evidence_status = "embedding_degraded"
+        try:
+            citations = await self.retriever.search(query=normalized_query, query_embedding=query_embedding, top_k=top_k, scope=scope)
+        except Exception:
+            citations = await self.retriever.search(query=normalized_query, top_k=top_k, scope=scope)
+            evidence_status = "embedding_degraded" if query_embedding is not None else "text_fallback"
         useful = [item for item in citations if item.score >= self.min_score]
         if not useful:
             return CustomerRagResult(intent=intent, answer_mode="handoff", evidence_status="low_confidence", citations=[], handoff_required=True, message="当前知识库没有足够依据，建议转人工客服或创建工单。")
-        return CustomerRagResult(intent=intent, answer_mode="rag_answer", evidence_status="sufficient", citations=useful, handoff_required=False, message="可基于客服知识库引用生成回答。")
+        return CustomerRagResult(intent=intent, answer_mode="rag_answer", evidence_status=evidence_status, citations=useful, handoff_required=False, message="可基于客服知识库引用生成回答。")

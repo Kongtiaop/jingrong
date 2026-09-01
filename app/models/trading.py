@@ -38,6 +38,25 @@ class Order(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
+class NaturalLanguageOrderDraft(Base):
+    __tablename__ = "natural_language_order_draft"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    customer_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    product_id: Mapped[str] = mapped_column(ForeignKey("product.id"), index=True)
+    side: Mapped[str] = mapped_column(String(16), default="buy")
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(32), default="awaiting_user_confirmation", index=True)
+    input_fingerprint: Mapped[str] = mapped_column(String(128), index=True)
+    confirmation_token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    precheck_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    order_id: Mapped[str | None] = mapped_column(ForeignKey("orders.id", ondelete="SET NULL"), nullable=True, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class Trade(Base):
     __tablename__ = "trades"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)

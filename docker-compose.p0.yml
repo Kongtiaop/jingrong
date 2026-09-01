@@ -88,6 +88,44 @@ services:
     networks:
       - wealth-p0
 
+  authorization-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-wealth}:${POSTGRES_PASSWORD:-wealth_dev}@postgres:5432/${POSTGRES_DB:-wealth_manager}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "workers.authorization_worker"]
+    networks:
+      - wealth-p0
+
+  notification-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-wealth}:${POSTGRES_PASSWORD:-wealth_dev}@postgres:5432/${POSTGRES_DB:-wealth_manager}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "workers.notification_worker"]
+    networks:
+      - wealth-p0
+
   knowledge-worker:
     build:
       context: .
@@ -148,6 +186,8 @@ services:
       CUSTOMER_SERVICE_TIMEOUT_WORKER_ENABLED: "true"
       CUSTOMER_SERVICE_TIMEOUT_WORKER_POLL_SECONDS: ${CUSTOMER_SERVICE_TIMEOUT_WORKER_POLL_SECONDS:-30}
       CUSTOMER_SERVICE_HEARTBEAT_TIMEOUT_SECONDS: ${CUSTOMER_SERVICE_HEARTBEAT_TIMEOUT_SECONDS:-90}
+      CUSTOMER_SERVICE_WAITING_TIMEOUT_SECONDS: ${CUSTOMER_SERVICE_WAITING_TIMEOUT_SECONDS:-1800}
+      CUSTOMER_SERVICE_WAITING_CLEANUP_ENABLED: ${CUSTOMER_SERVICE_WAITING_CLEANUP_ENABLED:-true}
     depends_on:
       postgres:
         condition: service_healthy

@@ -2,6 +2,24 @@
 
 > 当前有效方案以 `docs/P0-P5_IMPLEMENTATION_PLAN.md v2.0` 和 `docs/DECISIONS.md` 为准。
 
+## 组员快速开始
+
+项目已经提供团队脚手架，Windows 新成员可在仓库根目录执行：
+
+```powershell
+.\scripts\team_bootstrap.ps1
+```
+
+然后另开终端启动前端：
+
+```powershell
+Set-Location frontend
+npm run dev -- --host 127.0.0.1
+```
+
+访问 `http://127.0.0.1:5173`。完整目录地图、启动参数、分层约定、危险区和第一批任务见 [`docs/TEAM_ONBOARDING.md`](docs/TEAM_ONBOARDING.md)；文档入口见 [`docs/README.md`](docs/README.md)。
+
+脚手架默认启动 `docker-compose.p0.yml` 的 PostgreSQL、Redis、API 及基础 Worker，不会覆盖已有 `.env`，也不会执行 `down -v`。
 ## 当前文档
 
 ```text
@@ -181,3 +199,4 @@ conda run -n langchain_env python -m scripts.compare_trade_rows
 ## 标准开发门禁
 
 当前没有 CI 流水线；Gitee push/pull 仅负责代码同步。涉及数据库、Repository/UoW 或 MySQL 双读的改动，提交前按 `docs/DEVELOPMENT_WORKFLOW.md` 执行本地标准门禁。
+

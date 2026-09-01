@@ -45,8 +45,16 @@ async def customer_query_route(request: Request, payload: CustomerQueryRouteRequ
 @router.post("/answer", response_model=ApiResponse[CustomerRagResponse])
 async def customer_rag_answer(request: Request, payload: CustomerRagRequest, user=Depends(current_user)):
     retriever = WealthKnowledgeRetriever(KnowledgeRepository(request.app.state.database))
-    result = await CustomerRagService(retriever).answer(query=payload.query, intent=payload.intent, top_k=payload.top_k)
-    answer = await CustomerRagAnswerService(QwenProvider(request.app.state.settings)).generate(query=payload.query, result=result)
+    provider = QwenProvider(request.app.state.settings)
+    try:
+        result = await CustomerRagService(retriever, embedding_provider=provider).answer(query=payload.query, intent=payload.intent, top_k=payload.top_k)
+    finally:
+        await provider.close()
+    answer_provider = QwenProvider(request.app.state.settings)
+    try:
+        answer = await CustomerRagAnswerService(answer_provider).generate(query=payload.query, result=result)
+    finally:
+        await answer_provider.close()
     handoff: dict | None = None
     if result.handoff_required:
         handoff = await CustomerRagHandoffService(request.app.state.database).handoff(

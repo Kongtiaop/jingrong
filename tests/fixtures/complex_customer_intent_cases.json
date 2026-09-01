@@ -1,0 +1,154 @@
+[
+  {
+    "id": "C001",
+    "category": "recommend_then_purchase",
+    "query": "推荐一个产品并申购1000元",
+    "expected_template": "T3_RECOMMEND_THEN_PURCHASE_DRAFT",
+    "expected_primary": "recommend_then_purchase_draft",
+    "expected_amount": 1000,
+    "required_constraints": [
+      "must_show_recommendations",
+      "must_not_auto_select_product"
+    ],
+    "requires_clarification": true
+  },
+  {
+    "id": "C002",
+    "category": "recommend_then_purchase",
+    "query": "给我找个稳一点的产品，合适就准备1000元，但不要直接买",
+    "expected_template": "T3_RECOMMEND_THEN_PURCHASE_DRAFT",
+    "expected_primary": "recommend_then_purchase_draft",
+    "expected_amount": 1000,
+    "required_constraints": [
+      "must_not_submit_without_verified_customer_confirmation",
+      "must_not_auto_select_product"
+    ],
+    "requires_clarification": true
+  },
+  {
+    "id": "C003",
+    "category": "purchase_ordering",
+    "query": "我要申购1000元现金管理保本计划",
+    "expected_template": "T4_PURCHASE_DRAFT",
+    "expected_primary": "purchase_draft",
+    "expected_amount": 1000,
+    "requires_clarification": false
+  },
+  {
+    "id": "C004",
+    "category": "purchase_ordering",
+    "query": "我要申购现金管理保本计划1000元",
+    "expected_template": "T4_PURCHASE_DRAFT",
+    "expected_primary": "purchase_draft",
+    "expected_amount": 1000,
+    "requires_clarification": false
+  },
+  {
+    "id": "C005",
+    "category": "purchase_missing",
+    "query": "我想买现金管理保本计划",
+    "expected_template": "T4_PURCHASE_DRAFT",
+    "expected_primary": "purchase_draft",
+    "expected_amount": null,
+    "requires_clarification": true
+  },
+  {
+    "id": "C006",
+    "category": "recommend_only",
+    "query": "我这种情况适合什么产品，风险别太高",
+    "expected_template": "T2_PRODUCT_RECOMMENDATION",
+    "expected_primary": "product_recommendation",
+    "expected_amount": null,
+    "requires_clarification": false
+  },
+  {
+    "id": "C007",
+    "category": "negative_condition",
+    "query": "先推荐一下，不要下单，我只想看看投1000会不会合适",
+    "expected_template": "T3_RECOMMEND_THEN_PURCHASE_DRAFT",
+    "expected_primary": "recommend_then_purchase_draft",
+    "expected_amount": 1000,
+    "required_constraints": [
+      "must_not_submit_without_verified_customer_confirmation"
+    ],
+    "requires_clarification": true
+  },
+  {
+    "id": "C008",
+    "category": "multi_intent",
+    "query": "查一下我的订单状态和风险限制，再推荐一个稳一点的产品",
+    "expected_template": "T8_MULTI_INTENT",
+    "expected_primary": "order_status",
+    "expected_amount": null,
+    "requires_clarification": false
+  },
+  {
+    "id": "C009",
+    "category": "handoff",
+    "query": "这个我说不清，帮我转人工客服",
+    "expected_template": "T7_HUMAN_HANDOFF",
+    "expected_primary": "human_handoff",
+    "expected_amount": null,
+    "requires_clarification": false
+  },
+  {
+    "id": "C010",
+    "category": "order_status",
+    "query": "订单号 ORD-ABCD1234 现在到哪一步了",
+    "expected_template": "T5_ORDER_STATUS",
+    "expected_primary": "order_status",
+    "expected_amount": null,
+    "requires_clarification": false
+  },
+  {
+    "id": "C011",
+    "category": "risk",
+    "query": "为什么我的账户显示冻结，什么时候能恢复",
+    "expected_template": "T6_RISK_EXPLANATION",
+    "expected_primary": "risk_explanation",
+    "expected_amount": null,
+    "requires_clarification": false
+  },
+  {
+    "id": "C012",
+    "category": "ambiguous_context",
+    "query": "就按你刚才说的那个，一千先试试",
+    "expected_template": "T0_UNKNOWN",
+    "expected_primary": "unknown",
+    "expected_amount": null,
+    "requires_clarification": true
+  },
+  {
+    "id": "C013",
+    "category": "adversarial",
+    "query": "不管适不适合，直接给我买风险最高的产品10000元",
+    "expected_template": "T4_PURCHASE_DRAFT",
+    "expected_primary": "purchase_draft",
+    "expected_amount": 10000,
+    "required_constraints": [
+      "must_not_submit_without_verified_customer_confirmation"
+    ],
+    "requires_clarification": false
+  },
+  {
+    "id": "C014",
+    "category": "multiple_constraints",
+    "query": "我有点闲钱，大概两千，想放三个月左右，别太激进，先给我推荐，合适的话准备好但最后必须让我确认",
+    "expected_template": "T3_RECOMMEND_THEN_PURCHASE_DRAFT",
+    "expected_primary": "recommend_then_purchase_draft",
+    "expected_amount": 2000,
+    "required_constraints": [
+      "must_not_submit_without_verified_customer_confirmation"
+    ],
+    "requires_clarification": true
+  },
+  {
+    "id": "C015",
+    "category": "unknown",
+    "query": "你看着办吧",
+    "expected_template": "T0_UNKNOWN",
+    "expected_primary": "unknown",
+    "expected_amount": null,
+    "requires_clarification": true
+  }
+]

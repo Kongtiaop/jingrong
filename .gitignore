@@ -27,3 +27,10 @@ docs/TESTS.md
 
 # Local-only credentials
 DEMO_ACCOUNTS.txt
+
+# Team onboarding docs are safe to sync; detailed local-only design docs remain ignored.
+!docs/README.md
+!docs/TEAM_ONBOARDING.md
+!docs/DEVELOPMENT_WORKFLOW.md
+!docs/API.md
+!docs/ERROR_CODES.md

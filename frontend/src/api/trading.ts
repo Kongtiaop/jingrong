@@ -3,6 +3,8 @@ export const tradingApi = {
   account: () => http.get('/trading/account/me'),
   orders: (limit=20,offset=0) => http.get('/trading/orders/me',{params:{limit,offset}}),
   createOrder: (payload: { product_id: string; amount: number; idempotency_key?: string }) => http.post('/trading/orders', payload),
+  createNaturalLanguageDraft: (query: string) => http.post('/trading/order-drafts/natural-language', { query }),
+  confirmNaturalLanguageDraft: (draftId: string, payload: { confirmation_token: string; idempotency_key?: string }) => http.post(`/trading/order-drafts/${draftId}/confirm`, payload),
   order: (id: string) => http.get(`/trading/orders/${id}`),
   trades: (limit=20,offset=0) => http.get('/trading/trades/me',{params:{limit,offset}}),
   confirm: (id: string) => http.post(`/trading/orders/${id}/confirm`),

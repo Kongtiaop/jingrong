@@ -22,6 +22,7 @@ class IntentTask:
     arguments: dict[str, Any] = field(default_factory=dict)
     confidence: float = 0.0
     status: str = "planned"
+    execution_mode: str = "controlled_workflow"
 
 @dataclass(frozen=True)
 class IntentPlan:
@@ -29,6 +30,13 @@ class IntentPlan:
     tasks: list[IntentTask]
     clarification: str | None = None
     requires_handoff: bool = False
+
+REACT_INTENTS = {"company_info", "company_business", "faq", "workflow", "policy", "risk_public"}
+
+
+def execution_mode_for_intent(intent: str) -> str:
+    return "bounded_react" if intent in REACT_INTENTS else "controlled_workflow"
+
 
 def extract_entities(query: str) -> dict[str, str]:
     """Extract explicit identifiers without guessing business meaning."""
@@ -61,8 +69,8 @@ class CustomerIntentPlanner:
         ("risk_restriction", "冻结", "business_fact", .92), ("asset_summary", "资产", "business_fact", .92),
         ("asset_summary", "持仓", "business_fact", .92), ("asset_summary", "余额", "business_fact", .90),
         ("product_status", "产品状态", "business_fact", .95), ("product_status", "是否在售", "business_fact", .94),
-        ("product_recommendation", "推荐产品", "suitability", .96), ("product_recommendation", "适合我的产品", "suitability", .96),
-        ("business_operation", "赎回", "draft_operation", .98), ("business_operation", "转账", "draft_operation", .98), ("business_operation", "下单", "draft_operation", .98),
+        ("product_recommendation", "推荐产品", "suitability", .96), ("product_recommendation", "适合我的产品", "suitability", .96), ("product_recommendation", "推荐", "suitability", .88),
+        ("business_operation", "申购", "draft_operation", .98), ("business_operation", "购买", "draft_operation", .98), ("business_operation", "买入", "draft_operation", .98), ("business_operation", "赎回", "draft_operation", .98), ("business_operation", "转账", "draft_operation", .98), ("business_operation", "下单", "draft_operation", .98),
         ("company_info", "公司", "rag_explanation", .70), ("company_business", "业务", "rag_explanation", .75),
         ("faq", "怎么", "rag_explanation", .55), ("workflow", "流程", "rag_explanation", .80),
         ("policy", "政策", "rag_explanation", .80), ("risk_public", "风险", "rag_explanation", .70),
@@ -73,17 +81,19 @@ class CustomerIntentPlanner:
         if not normalized:
             return IntentPlan(normalized_query="", tasks=[], clarification="请描述您需要查询或办理的事项。")
         if re.match(r"^(你好|您好|嗨|hello|hi|谢谢|感谢|再见)[!！。？? ]*$", normalized):
-            return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "greeting", "direct", query, confidence=.99, arguments=extract_entities(query))])
+            return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "greeting", "direct", query, confidence=.99, arguments=extract_entities(query), execution_mode=execution_mode_for_intent("greeting"))])
         if any(x in normalized for x in ("人工", "客服接入", "转人工")):
-            return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "human_handoff", "handoff", query, priority="high", confidence=.99, arguments=extract_entities(query))], requires_handoff=True)
+            return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "human_handoff", "handoff", query, priority="high", confidence=.99, arguments=extract_entities(query), execution_mode=execution_mode_for_intent("human_handoff"))], requires_handoff=True)
         tasks=[]; seen=set()
         for intent, marker, route, confidence in self._patterns:
             if marker in normalized and intent not in seen:
                 task_id=f"t{len(tasks)+1}"; depends=[]
                 if intent in {"workflow", "policy", "faq"} and any(t.intent in {"order_status","workorder_status"} for t in tasks):
                     depends=[next(t.task_id for t in tasks if t.intent in {"order_status","workorder_status"})]
-                tasks.append(IntentTask(task_id, intent, route, query, confidence=confidence, depends_on=depends, arguments=extract_entities(query))); seen.add(intent)
+                if intent == "business_operation" and any(t.intent == "product_recommendation" for t in tasks):
+                    depends=[next(t.task_id for t in tasks if t.intent == "product_recommendation")]
+                tasks.append(IntentTask(task_id, intent, route, query, confidence=confidence, depends_on=depends, arguments=extract_entities(query), execution_mode=execution_mode_for_intent(intent))); seen.add(intent)
         if not tasks:
-            return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "unknown", "handoff", query, confidence=.20)], clarification="您想查询哪一类信息，例如订单、工单、资产、风险限制或公司业务？")
+            return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "unknown", "handoff", query, confidence=.20, execution_mode=execution_mode_for_intent("unknown"))], clarification="您想查询哪一类信息，例如订单、工单、资产、风险限制或公司业务？")
         return IntentPlan(normalized_query=normalized, tasks=tasks, requires_handoff=any(t.intent == "human_handoff" for t in tasks))
 

@@ -98,8 +98,12 @@ class OutboxPublisher:
             suffix = "memory"
         elif event_type.startswith("knowledge."):
             suffix = "ingestion"
+        elif event_type.startswith("notification."):
+            suffix = "notifications"
         elif event_type.startswith("data_catalog."):
             suffix = "catalog"
+        elif event_type.startswith("authorization."):
+            suffix = "authorization"
         else:
             suffix = "tasks"
         return f"{self.settings.redis_stream_prefix}:{suffix}"

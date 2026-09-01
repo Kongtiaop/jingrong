@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Annotated
 import jwt
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, WebSocket, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -63,3 +63,18 @@ async def advisor_user(user: Annotated[User, Depends(current_user)]) -> User:
     if "advisor" not in role_codes:
         raise HTTPException(status_code=403, detail="advisor permission required")
     return user
+
+
+async def websocket_current_user(websocket: WebSocket) -> User | None:
+    token = websocket.query_params.get("access_token")
+    if not token:
+        return None
+    settings = get_settings()
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    except jwt.PyJWTError:
+        return None
+    if payload.get("type") != "access":
+        return None
+    async with websocket.app.state.database.session_factory() as session:
+        return (await session.execute(select(User).options(selectinload(User.roles).selectinload(Role.permissions)).where(User.id == payload.get("sub"), User.status == "active"))).scalar_one_or_none()

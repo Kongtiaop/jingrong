@@ -52,6 +52,19 @@ class KnowledgeRepository:
             await session.commit()
             return str(event.id)
 
+    async def list_ingestion_events(self, *, document_id: str, limit: int = 20) -> list[OutboxEvent]:
+        async with self.database.session_factory() as session:
+            result = await session.execute(
+                select(OutboxEvent)
+                .where(
+                    OutboxEvent.event_type == "knowledge.document_created",
+                    OutboxEvent.aggregate_id == document_id,
+                )
+                .order_by(OutboxEvent.created_at.desc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
     async def list_documents(self, *, limit: int = 100, offset: int = 0) -> tuple[int, list[KnowledgeDocument]]:
         async with self.database.session_factory() as session:
             total = int((await session.execute(
@@ -121,34 +134,69 @@ class KnowledgeRepository:
             await session.commit()
 
     async def search_hybrid(self, *, query: str, query_embedding: list[float] | None, top_k: int, knowledge_base_id: str | None = None, category: str | None = None, scope: KnowledgeScope | None = None) -> list[tuple[KnowledgeChunk, float]]:
+        """Retrieve independent vector/text candidate lists and fuse them with RRF."""
+        candidate_k = max(top_k * 4, 20)
         async with self.database.session_factory() as session:
-            base = select(KnowledgeChunk).join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id).join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id).where(KnowledgeChunk.status == "active", KnowledgeDocument.status == "active", KnowledgeDocument.deleted_at.is_(None), KnowledgeDocumentVersion.status == "active")
+            filters = [
+                KnowledgeChunk.status == "active",
+                KnowledgeDocument.status == "active",
+                KnowledgeDocument.deleted_at.is_(None),
+                KnowledgeDocumentVersion.status == "active",
+            ]
             if knowledge_base_id:
-                base = base.where(KnowledgeDocument.knowledge_base_id == knowledge_base_id)
+                filters.append(KnowledgeDocument.knowledge_base_id == knowledge_base_id)
             if category:
-                base = base.where(KnowledgeDocument.category == category)
-            text_rank = func.ts_rank_cd(func.to_tsvector("simple", KnowledgeChunk.content), func.websearch_to_tsquery("simple", query))
-            lexical = func.coalesce(text_rank, literal(0.0))
+                filters.append(KnowledgeDocument.category == category)
+            if scope:
+                if scope.knowledge_base_ids:
+                    filters.append(KnowledgeDocument.knowledge_base_id.in_(scope.knowledge_base_ids))
+                if scope.categories:
+                    filters.append(KnowledgeDocument.category.in_(scope.categories))
+                if scope.permission_levels:
+                    filters.append(KnowledgeDocument.permission_level.in_(scope.permission_levels))
+
+            text_rank = func.ts_rank_cd(
+                func.to_tsvector("simple", KnowledgeChunk.content),
+                func.websearch_to_tsquery("simple", query),
+            )
+            text_statement = (
+                select(KnowledgeChunk, text_rank.label("rank"))
+                .join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id)
+                .join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id)
+                .where(*filters)
+                .order_by(text_rank.desc())
+                .limit(candidate_k)
+            )
+            text_rows = list((await session.execute(text_statement)).all())
+
+            vector_rows = []
             if query_embedding:
-                semantic = (1.0 - KnowledgeChunk.embedding.cosine_distance(query_embedding))
-                score = (literal(0.65) * semantic + literal(0.35) * lexical).label("score")
-                statement = select(KnowledgeChunk, score).select_from(base.subquery()).order_by(score.desc()).limit(top_k)
-                # Rebuild directly because selecting from an ORM subquery loses entity mapping.
-                statement = select(KnowledgeChunk, score).join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id).join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id).where(KnowledgeChunk.status == "active", KnowledgeDocument.status == "active", KnowledgeDocument.deleted_at.is_(None), KnowledgeDocumentVersion.status == "active", KnowledgeChunk.embedding.is_not(None))
-                if knowledge_base_id:
-                    statement = statement.where(KnowledgeDocument.knowledge_base_id == knowledge_base_id)
-                if category:
-                    statement = statement.where(KnowledgeDocument.category == category)
-                statement = statement.order_by(score.desc()).limit(top_k)
-            else:
-                score = lexical.label("score")
-                statement = select(KnowledgeChunk, score).join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id).join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id).where(KnowledgeChunk.status == "active", KnowledgeDocument.status == "active", KnowledgeDocument.deleted_at.is_(None), KnowledgeDocumentVersion.status == "active").order_by(score.desc()).limit(top_k)
-                if knowledge_base_id:
-                    statement = statement.where(KnowledgeDocument.knowledge_base_id == knowledge_base_id)
-                if category:
-                    statement = statement.where(KnowledgeDocument.category == category)
-            result = await session.execute(statement)
-            return [(chunk, float(score or 0.0)) for chunk, score in result.all()]
+                vector_distance = KnowledgeChunk.embedding.cosine_distance(query_embedding)
+                vector_statement = (
+                    select(KnowledgeChunk)
+                    .join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id)
+                    .join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id)
+                    .where(*filters, KnowledgeChunk.embedding.is_not(None))
+                    .order_by(vector_distance.asc())
+                    .limit(candidate_k)
+                )
+                vector_rows = list((await session.execute(vector_statement)).scalars().all())
+
+            by_id = {str(chunk.id): chunk for chunk, _ in text_rows}
+            for chunk in vector_rows:
+                by_id[str(chunk.id)] = chunk
+            text_rank_by_id = {str(chunk.id): rank for rank, (chunk, _) in enumerate(text_rows, start=1)}
+            vector_rank_by_id = {str(chunk.id): rank for rank, chunk in enumerate(vector_rows, start=1)}
+            fused = []
+            for chunk_id, chunk in by_id.items():
+                rrf = 0.0
+                if chunk_id in text_rank_by_id:
+                    rrf += 1.0 / (60 + text_rank_by_id[chunk_id])
+                if chunk_id in vector_rank_by_id:
+                    rrf += 1.0 / (60 + vector_rank_by_id[chunk_id])
+                fused.append((chunk, rrf))
+            fused.sort(key=lambda item: item[1], reverse=True)
+            return fused[:top_k]
 
     async def search_text(self, *, query: str, top_k: int, knowledge_base_id: str | None = None, category: str | None = None, scope: KnowledgeScope | None = None) -> list[KnowledgeChunk]:
         async with self.database.session_factory() as session:

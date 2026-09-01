@@ -4,26 +4,35 @@ import asyncio
 from dataclasses import dataclass
 
 from app.repositories.data_catalog import DataCatalogRepository
+from app.services.permission_scoped_cache import PermissionContext, PermissionScopedCache
 
 
 @dataclass(frozen=True)
 class CatalogSearchScope:
     role_codes: tuple[str, ...]
+    permission_context: PermissionContext | None = None
 
     @classmethod
-    def from_user(cls, user) -> "CatalogSearchScope":
+    async def from_user(cls, user, backend=None) -> "CatalogSearchScope":
         roles = {role.code for role in user.roles}
         if user.is_super_admin:
             roles.add("super_admin")
-        return cls(role_codes=tuple(sorted(roles)))
+        context = await PermissionContext.from_user_cached(user, backend) if backend is not None else PermissionContext.from_user(user)
+        return cls(role_codes=tuple(sorted(roles)), permission_context=context)
 
 
 class DataCatalogService:
-    def __init__(self, repository: DataCatalogRepository, embedding_provider=None) -> None:
+    def __init__(self, repository: DataCatalogRepository, embedding_provider=None, permission_cache: PermissionScopedCache | None = None) -> None:
         self.repository = repository
         self.embedding_provider = embedding_provider
+        self.permission_cache = permission_cache
 
     async def search(self, *, query: str, scope: CatalogSearchScope, top_k: int = 5, domain_code: str | None = None) -> dict:
+        cache_scope = {"query": query.strip().lower(), "top_k": top_k, "domain_code": domain_code or ""}
+        if self.permission_cache is not None and scope.permission_context is not None:
+            cached = await self.permission_cache.get_json(namespace="data_catalog_search", context=scope.permission_context, scope=cache_scope)
+            if cached is not None:
+                return {**cached, "retrieval_mode": f"{cached.get('retrieval_mode', 'catalog-cache')}+permission-cache"}
         text_tables = await self.repository.search_tables(query=query, role_codes=scope.role_codes, top_k=top_k, domain_code=domain_code)
         text_examples = await self.repository.search_examples(query=query, role_codes=scope.role_codes, top_k=top_k, domain_code=domain_code)
         table_scores: dict[str, float] = {item.id: 0.55 for item in text_tables}
@@ -158,7 +167,7 @@ class DataCatalogService:
                 }
             )
 
-        return {
+        payload = {
             "query": query,
             "domain_code": domain_code,
             "role_codes": list(scope.role_codes),
@@ -179,3 +188,6 @@ class DataCatalogService:
             "nl2sql_ready": False,
             "next_guard": "Catalog retrieval only. SQL generation and execution remain disabled until AST validation, row-scope enforcement, read-only execution, and auditing are implemented.",
         }
+        if self.permission_cache is not None and scope.permission_context is not None:
+            await self.permission_cache.set_json(namespace="data_catalog_search", context=scope.permission_context, scope=cache_scope, value=payload, ttl_seconds=60)
+        return payload

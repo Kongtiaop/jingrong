@@ -28,6 +28,36 @@ class QwenProvider:
             return {"status": "skipped", "reason": "DASHSCOPE_API_KEY is not configured"}
         return {"status": "configured", "model": self.settings.qwen_embedding_model}
 
+    async def classify(self, *, query: str, conversation_summary: str = "") -> dict:
+        """StructuredIntentProvider-compatible alias for intent fallback."""
+        return await self.classify_intent(query=query, conversation_summary=conversation_summary)
+
+    async def classify_intent(self, *, query: str, conversation_summary: str = "") -> dict:
+        if self._client is None:
+            raise RuntimeError("DASHSCOPE_API_KEY is not configured")
+        system = (
+            "你是财富管理客服意图解析器。只返回 JSON，不执行任何交易。"
+            "JSON 字段必须为 template, primary_intent, secondary_intents, entities, constraints, "
+            "missing_required_fields, requires_clarification, explicit_confirmation, confidence, source。"
+            "template 只能是 T1_INFORMATION_QUERY,T2_PRODUCT_RECOMMENDATION,T3_RECOMMEND_THEN_PURCHASE_DRAFT, "
+            "T4_PURCHASE_DRAFT,T5_ORDER_STATUS,T6_RISK_EXPLANATION,T7_HUMAN_HANDOFF,T8_MULTI_INTENT, "
+            "T9_MODIFY_DRAFT,T10_CANCEL_DRAFT,T0_UNKNOWN。source 必须为 llm_fallback。"
+            "entities 的值必须是 {value, certainty}，certainty 只能是 explicit, approximate, inferred, missing。"
+            "不得声称用户已确认交易；不得输出 SQL、订单提交命令或工具调用。"
+        )
+        user = f"conversation_summary={conversation_summary}\nquery={query}"
+        response = await self._client.chat.completions.create(
+            model=self.settings.qwen_chat_model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("empty structured intent response")
+        import json
+        return json.loads(content)
+
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []

@@ -23,6 +23,7 @@ async def ensure_schema(engine: AsyncEngine) -> None:
         statements = (
             "ALTER TABLE async_task ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "ALTER TABLE outbox_event ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "ALTER TABLE notification ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(160)",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "ALTER TABLE product ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
@@ -92,6 +93,7 @@ async def ensure_schema(engine: AsyncEngine) -> None:
               AND duplicate.id > keeper.id
         """))
         await connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_user_idempotency_key ON orders (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"))
+        await connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_notification_user_idempotency ON notification (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"))
         await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_knowledge_chunk_embedding_hnsw ON knowledge_chunk USING hnsw (embedding vector_cosine_ops)"))
         await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_data_catalog_table_embedding_hnsw ON data_catalog_table USING hnsw (embedding vector_cosine_ops)"))
         await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_data_catalog_column_embedding_hnsw ON data_catalog_column USING hnsw (embedding vector_cosine_ops)"))

@@ -2,7 +2,7 @@
 import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { useAuth } from './stores/auth'
-import CustomerServiceBubble from './components/CustomerServiceBubble.vue'
+import AgentBubble from './components/AgentBubble.vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -35,7 +35,7 @@ onUnmounted(() => window.removeEventListener('auth:changed', sync))
 
 <template>
   <div class="shell" @click="closeMenu">
-    <header v-if="auth.initialized.value && (!isPortal || !auth.loggedIn.value)" class="topbar">
+    <header v-if="auth.initialized.value" class="topbar">
       <div><span class="eyebrow">WEALTH MANAGER</span><h1>智能财富管家</h1></div>
       <nav>
         <RouterLink to="/">首页</RouterLink>
@@ -66,6 +66,6 @@ onUnmounted(() => window.removeEventListener('auth:changed', sync))
       </div>
     </header>
     <main><RouterView /></main>
-    <CustomerServiceBubble v-if="auth.loggedIn.value && isCustomer" />
+    <AgentBubble v-if="auth.loggedIn.value && isCustomer" />
   </div>
 </template>

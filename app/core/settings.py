@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     qwen_embedding_model: str = "qwen3.7-text-embedding"
     embedding_dimension: int = 1024
     embedding_smoke_check: bool = False
+    llm_intent_fallback_enabled: bool = False
+    llm_intent_fallback_allowlist: str = "T1_INFORMATION_QUERY,T2_PRODUCT_RECOMMENDATION,T7_HUMAN_HANDOFF"
+    llm_intent_shadow_enabled: bool = False
+    llm_intent_fallback_timeout_seconds: float = 8.0
+    llm_intent_fallback_max_concurrency: int = 4
 
     jwt_secret: str = Field(default="change-me-in-development-please-rotate-32", repr=False)
     jwt_algorithm: str = "HS256"
@@ -51,6 +56,8 @@ class Settings(BaseSettings):
     customer_service_timeout_worker_enabled: bool = False
     customer_service_timeout_worker_poll_seconds: int = 30
     customer_service_heartbeat_timeout_seconds: int = 90
+    customer_service_waiting_timeout_seconds: int = 1800
+    customer_service_waiting_cleanup_enabled: bool = True
     workorder_upload_dir: str = "uploads/workorders"
     workorder_attachment_max_bytes: int = 10 * 1024 * 1024
 

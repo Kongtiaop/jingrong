@@ -449,3 +449,30 @@ OpenAPI：/docs
 
 路由优先级遵循 `DECISION-20260807-01`：实时业务事实优先，RAG 只用于流程、条款和背景解释，不能覆盖实时状态或执行受控操作。
 
+
+## 客服会话消息增量查询与断线补偿
+
+### 查询人工消息
+
+```http
+GET /api/v1/customer-service/sessions/{session_id}/messages
+Authorization: Bearer <access_token>
+```
+
+可选查询参数：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `after` | string | 最后一条已消费消息的 ID。传入后仅返回该游标之后的消息；不传则返回会话消息快照。 |
+
+返回结果按 `created_at ASC, id ASC` 排序，单次最多返回 200 条。客户只能访问自己的会话，坐席只能访问自己已接入的会话；`after` 只用于缩小读取范围，不改变原有权限校验。
+
+### 前端恢复约定
+
+1. 收到人工消息后更新 `lastMessageId`；
+2. 合并增量消息前按消息 ID 去重；
+3. WebSocket `error`/`close` 时显示 recovering 状态并执行一次 `after` 查询；
+4. 固定轮询继续作为降级同步机制；
+5. 会话进入 resolved/closed 后停止轮询并清理浏览器会话缓存。
+
+WebSocket/PubSub 是低延迟通知通道，HTTP 增量查询和 PostgreSQL 才是断线恢复所依赖的事实链路。

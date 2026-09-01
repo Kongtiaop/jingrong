@@ -10,7 +10,7 @@ from app.common.response import ApiResponse
 from app.common.security.auth import current_user, require_permission
 from app.repositories.knowledge import KnowledgeRepository
 from app.infrastructure.qwen import QwenProvider
-from app.schemas.knowledge import AdminKnowledgeUploadResponse, DocumentCreateRequest, DocumentIngestResponse, DocumentResponse, KnowledgeBaseResponse, KnowledgeDocumentListResponse, KnowledgeSearchRequest, KnowledgeSearchResponse
+from app.schemas.knowledge import AdminKnowledgeUploadResponse, DocumentCreateRequest, DocumentIngestResponse, DocumentIngestionStatusResponse, DocumentResponse, KnowledgeBaseResponse, KnowledgeDocumentListResponse, KnowledgeSearchRequest, KnowledgeSearchResponse
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 
@@ -122,6 +122,33 @@ async def search_knowledge(request: Request, payload: KnowledgeSearchRequest, _u
         await provider.close()
     response = KnowledgeSearchResponse(query=payload.query, retrieval_mode=mode, embedding_dimension=request.app.state.settings.embedding_dimension, hits=[{"id": str(hit.id), "content": hit.content, "title_path": hit.title_path, "document_id": str(hit.document_id), "version_id": str(hit.version_id), "chunk_index": hit.chunk_index, "score": score, "metadata": hit.metadata_json} for hit, score in pairs])
     return ApiResponse(data=response, trace_id=get_trace_id())
+
+
+@router.get("/documents/{document_id}/ingestion-status", response_model=ApiResponse[DocumentIngestionStatusResponse])
+async def ingestion_status(request: Request, document_id: str, _user=Depends(require_permission("product:read"))) -> ApiResponse[DocumentIngestionStatusResponse]:
+    repository = KnowledgeRepository(request.app.state.database)
+    document = await repository.get_document(document_id)
+    if document is None:
+        raise ResourceNotFoundError("knowledge document not found", code="KNOWLEDGE_DOCUMENT_NOT_FOUND")
+    events = await repository.list_ingestion_events(document_id=document_id)
+    return ApiResponse(
+        data=DocumentIngestionStatusResponse(
+            document_id=document_id,
+            document_status=document.status,
+            document_error=document.error_message,
+            current_version_id=document.current_version_id,
+            events=[{
+                "id": str(event.id),
+                "status": event.status,
+                "attempt": event.attempt,
+                "error_message": event.error_message,
+                "created_at": event.created_at,
+                "updated_at": event.updated_at,
+                "published_at": event.published_at,
+            } for event in events],
+        ),
+        trace_id=get_trace_id(),
+    )
 
 
 @router.post("/documents/{document_id}/ingest", response_model=ApiResponse[DocumentIngestResponse], status_code=202)

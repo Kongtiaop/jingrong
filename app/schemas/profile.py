@@ -56,8 +56,29 @@ class ProfileSummary(BaseModel):
 class SuitabilityResult(BaseModel):
     product_id: str
     product_name: str
+    product_type: str
+    product_risk_level: str
+    minimum_amount: float
+    minimum_investable_asset: float
+    liquidity: str
+    suitability_rule: str = ""
     matched: bool
     reasons: list[str]
+
+
+class RecommendationWarning(BaseModel):
+    code: str
+    message: str
+
+
+class CustomerRecommendationContext(BaseModel):
+    risk_level: str
+    risk_assessment_status: str
+    total_asset: float
+    investable_asset: float
+    risk_operation: RiskOperationStatusResponse = Field(default_factory=RiskOperationStatusResponse)
+
+
 class CustomerTierResponse(BaseModel):
     user_id: str
     customer_type: str
@@ -66,8 +87,11 @@ class CustomerTierResponse(BaseModel):
     reasons: list[str]
 class RecommendationResponse(BaseModel):
     user_id: str
+    context: CustomerRecommendationContext
     matches: list[SuitabilityResult]
     excluded: list[SuitabilityResult]
+    warnings: list[RecommendationWarning] = Field(default_factory=list)
+    generated_at: datetime
 
 class StaffRecommendationRequest(BaseModel):
     customer_id: str

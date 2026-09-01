@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+from app.models.audit import AuditLog
+from app.models.customer_service import CustomerServiceSession
+from uuid import uuid4
+import json
+from app.schemas.customer_service import CustomerTaskExecutionResponse, TaskExecutionResultResponse
+from app.services.customer_intent import CustomerIntentPlanner, IntentPlan, IntentTask, execution_mode_for_intent
+from app.services.customer_rag_handoff import CustomerRagHandoffService
+from app.services.customer_task_executor import CustomerTaskExecutor
+from app.services.memory_service import CustomerMemoryService
+from app.core.settings import get_settings
+from app.infrastructure.qwen import QwenProvider
+from app.services.llm_intent_fallback import LLMIntentFallbackService
+from app.services.intent_policy_resolver import IntentPolicyResolver
+from app.schemas.intent import StructuredEntity, StructuredIntent
+import asyncio
+
+
+AGENT_ROUTE_BY_INTENT = {
+    "product_recommendation": "customer_recommendation",
+    "risk_restriction": "customer_risk",
+    "asset_summary": "analysis",
+    "business_operation": "customer_trade_draft",
+    "human_handoff": "customer_service",
+    "workorder_status": "customer_service",
+    "order_status": "customer_service",
+    "product_status": "customer_service",
+    "company_info": "customer_service",
+    "company_business": "customer_service",
+    "faq": "customer_service",
+    "workflow": "customer_service",
+    "policy": "customer_service",
+    "risk_public": "customer_service",
+    "greeting": "customer_service",
+}
+AGENTS_BY_ROUTE = {
+    "customer_service": ["CustomerServiceAgent"],
+    "customer_recommendation": ["CustomerRecommendationCapability"],
+    "customer_trade_draft": ["CustomerTradeDraftCapability"],
+    "customer_risk": ["CustomerRiskExplanationCapability"],
+    "advisor_risk": ["AdvisorAgent", "RiskAgent"],
+    "risk": ["RiskAgent"],
+    "analysis": ["DataAnalysisAgent"],
+    "operation_risk": ["BusinessAgent", "RiskAgent"],
+}
+ROUTE_PRIORITY = {"operation_risk": 8, "customer_trade_draft": 7, "advisor_risk": 6, "customer_recommendation": 5, "risk": 4, "customer_risk": 4, "analysis": 3, "customer_service": 1}
+
+
+def route_for_plan(plan) -> tuple[str, list[str]]:
+    routes = [AGENT_ROUTE_BY_INTENT.get(task.intent, "customer_service") for task in plan.tasks]
+    route = max(routes or ["customer_service"], key=lambda item: ROUTE_PRIORITY[item])
+    return route, AGENTS_BY_ROUTE[route]
+
+
+class CustomerAgentExecutionService:
+    _fallback_semaphores: dict[int, asyncio.Semaphore] = {}
+
+    def __init__(self, database, redis_client, *, intent_fallback=None, settings=None) -> None:
+        self.database = database
+        self.redis_client = redis_client
+        self.settings = settings or get_settings()
+        self.intent_fallback = intent_fallback
+
+    def _fallback_semaphore(self) -> asyncio.Semaphore:
+        limit = max(1, int(self.settings.llm_intent_fallback_max_concurrency))
+        semaphore = self._fallback_semaphores.get(limit)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(limit)
+            self._fallback_semaphores[limit] = semaphore
+        return semaphore
+
+    @staticmethod
+    def _structured_from_rule_plan(plan) -> StructuredIntent:
+        task = plan.tasks[0] if plan.tasks else None
+        template = "T0_UNKNOWN"
+        if task:
+            mapping = {"product_recommendation": "T2_PRODUCT_RECOMMENDATION", "business_operation": "T4_PURCHASE_DRAFT", "human_handoff": "T7_HUMAN_HANDOFF"}
+            template = mapping.get(task.intent, "T1_INFORMATION_QUERY")
+        return StructuredIntent(template=template, primary_intent=task.intent if task else "unknown", confidence=task.confidence if task else 0.1, requires_clarification=bool(plan.clarification), missing_required_fields=[], source="rule")
+
+    def _fallback_allowlist(self) -> set[str]:
+        return {value.strip() for value in self.settings.llm_intent_fallback_allowlist.split(",") if value.strip()}
+
+    def _apply_structured_intent(self, plan, intent: StructuredIntent):
+        """Allow only explicitly approved, read/plan-only fallback changes.
+
+        Transaction and draft templates never come from the model: their route remains
+        deterministic and later submission still requires verified customer confirmation.
+        """
+        if intent.template not in self._fallback_allowlist() or intent.requires_clarification:
+            return plan
+        query = plan.tasks[0].query if plan.tasks else plan.normalized_query
+        if intent.template == "T2_PRODUCT_RECOMMENDATION":
+            task = IntentTask("t1", "product_recommendation", "suitability", query, confidence=intent.confidence, arguments={}, execution_mode=execution_mode_for_intent("product_recommendation"))
+            return IntentPlan(normalized_query=plan.normalized_query, tasks=[task])
+        if intent.template == "T7_HUMAN_HANDOFF":
+            task = IntentTask("t1", "human_handoff", "handoff", query, priority="high", confidence=intent.confidence, arguments={}, execution_mode=execution_mode_for_intent("human_handoff"))
+            return IntentPlan(normalized_query=plan.normalized_query, tasks=[task], requires_handoff=True)
+        if intent.template == "T1_INFORMATION_QUERY":
+            # Only map to public-customer RAG. Do not infer an account/order/risk fact from a model label.
+            public_intents = {"company_info", "company_business", "faq", "workflow", "policy", "risk_public"}
+            requested = str(intent.primary_intent or "").strip()
+            safe_intent = requested if requested in public_intents else "faq"
+            task = IntentTask("t1", safe_intent, "rag_explanation", query, confidence=intent.confidence, arguments={}, execution_mode=execution_mode_for_intent(safe_intent))
+            return IntentPlan(normalized_query=plan.normalized_query, tasks=[task])
+        return plan
+
+    async def _audit_intent_shadow(self, *, customer_id: str, conversation_id: str, query: str, rule_intent: StructuredIntent, llm_intent: StructuredIntent | None, resolved_intent: StructuredIntent | None, error: str | None, execution_changed: bool = False, fallback_decision: str = "not_attempted") -> None:
+        detail = json.dumps({
+            "conversation_id": conversation_id,
+            "query_length": len(query),
+            "rule": rule_intent.model_dump(),
+            "llm": llm_intent.model_dump() if llm_intent else None,
+            "resolved": resolved_intent.model_dump() if resolved_intent else None,
+            "error": error,
+            "execution_changed": execution_changed,
+            "fallback_decision": fallback_decision,
+            "verified_customer_confirmation_required": True,
+        }, ensure_ascii=False)
+        async with self.database.session_factory() as session:
+            session.add(AuditLog(id=str(uuid4()), actor_user_id=customer_id, action="customer_agent.intent_shadow_evaluated", resource_type="customer_service_conversation", resource_id=conversation_id, detail=detail))
+            await session.commit()
+
+    async def execute(self, *, customer_id: str, conversation_id: str, query: str) -> CustomerTaskExecutionResponse:
+        planner = CustomerIntentPlanner()
+        memory = CustomerMemoryService(self.database, self.redis_client)
+        short_term = await memory.load_short_term(customer_id=customer_id, conversation_id=conversation_id)
+        active_handoff = short_term.get("handoff") or {}
+        if active_handoff.get("customer_service_session_id"):
+            async with self.database.session_factory() as gate_session:
+                gate = await gate_session.get(CustomerServiceSession, active_handoff["customer_service_session_id"])
+            if gate is not None and gate.status in {"waiting_human", "human_active", "paused"}:
+                # Human handoff does not disable the unified Agent. The UI routes ordinary chat input to
+                # the human-message channel while this session is active; independent read-only Agent
+                # requests must still be able to plan and answer through the Supervisor entry point.
+                short_term = {**short_term, "active_handoff": {**active_handoff, "customer_service_session_status": gate.status}}
+        user_query = query.strip()
+        clarification_count = int(short_term.get("clarification_count") or 0)
+        pending = short_term.get("pending_intent_plan") or {}
+        original_query = short_term.get("original_query") or user_query
+        combined_query = f"{original_query} {user_query}".strip() if pending.get("tasks") and user_query != original_query else user_query
+        plan = planner.plan(combined_query)
+        should_observe = self.settings.llm_intent_shadow_enabled or self.settings.llm_intent_fallback_enabled
+        if should_observe:
+            provider = None
+            try:
+                fallback = self.intent_fallback
+                provider = None
+                if fallback is None:
+                    provider = QwenProvider(self.settings)
+                    fallback = LLMIntentFallbackService(provider)
+                rule_structured = self._structured_from_rule_plan(plan)
+                summary = str(short_term.get("conversation_summary") or "")
+                async with self._fallback_semaphore():
+                    llm_structured = await asyncio.wait_for(fallback.classify(query=combined_query, conversation_summary=summary), timeout=self.settings.llm_intent_fallback_timeout_seconds)
+                resolved = IntentPolicyResolver().resolve(rule_intent=rule_structured, llm_intent=llm_structured)
+                changed = False
+                decision = "shadow_only"
+                if self.settings.llm_intent_fallback_enabled:
+                    fallback_plan = self._apply_structured_intent(plan, resolved)
+                    changed = fallback_plan != plan
+                    plan = fallback_plan
+                    if changed:
+                        decision = "allowlisted_plan_applied"
+                    elif resolved.template not in self._fallback_allowlist():
+                        decision = "template_not_allowlisted"
+                    elif resolved.requires_clarification:
+                        decision = "requires_clarification"
+                    else:
+                        decision = "no_safe_mapping"
+                if self.settings.llm_intent_shadow_enabled or self.settings.llm_intent_fallback_enabled:
+                    await self._audit_intent_shadow(customer_id=customer_id, conversation_id=conversation_id, query=combined_query, rule_intent=rule_structured, llm_intent=llm_structured, resolved_intent=resolved, error=None, execution_changed=changed, fallback_decision=decision)
+            except Exception as exc:
+                if self.settings.llm_intent_shadow_enabled:
+                    await self._audit_intent_shadow(customer_id=customer_id, conversation_id=conversation_id, query=combined_query, rule_intent=self._structured_from_rule_plan(plan), llm_intent=None, resolved_intent=None, error=f"{type(exc).__name__}: {exc}", execution_changed=False, fallback_decision="fallback_error")
+                # Model fallback is advisory only; deterministic planner remains authoritative on failure.
+            finally:
+                if provider is not None:
+                    await provider.close()
+        route, agents = route_for_plan(plan)
+        if plan.clarification:
+            next_count = clarification_count + 1
+            if next_count >= 2:
+                handoff = await CustomerRagHandoffService(self.database).handoff(customer_id=customer_id, query=original_query, intent="unknown", evidence_status="clarification_exhausted", citations=[])
+                await memory.save_short_term(customer_id=customer_id, conversation_id=conversation_id, state={**short_term, "conversation_id": conversation_id, "original_query": original_query, "latest_query": user_query, "clarification_count": next_count, "pending_intent_plan": {}, "clarification": None, "missing_parameter": False, "handoff": handoff})
+                return CustomerTaskExecutionResponse(conversation_id=conversation_id, overall_status="handoff", answer="为避免反复追问，已为您转接人工客服。", route="customer_service", agents=["CustomerServiceAgent"], results=[], clarification=None, requires_handoff=True, work_order_id=handoff["work_order_id"], ticket_no=handoff["ticket_no"], customer_service_session_id=handoff["customer_service_session_id"], customer_service_session_status=handoff["customer_service_session_status"])
+            await memory.save_short_term(customer_id=customer_id, conversation_id=conversation_id, state={**short_term, "conversation_id": conversation_id, "original_query": original_query, "latest_query": user_query, "clarification_count": next_count, "pending_intent_plan": {"tasks": [item.__dict__ for item in plan.tasks], "execution_modes": sorted({item.execution_mode for item in plan.tasks})}, "clarification": plan.clarification, "missing_parameter": True})
+            return CustomerTaskExecutionResponse(conversation_id=conversation_id, overall_status="needs_clarification", answer=plan.clarification, route=route, agents=agents, results=[], clarification=plan.clarification, requires_handoff=plan.requires_handoff)
+        results = await CustomerTaskExecutor(self.database).execute(customer_id=customer_id, plan=plan)
+        overall, clarification, aggregate_answer = CustomerTaskExecutor.summarize(results, requires_handoff=plan.requires_handoff)
+        answer_lines = [aggregate_answer] if aggregate_answer else []
+        needs_handoff = plan.requires_handoff or any(item.error == "low_confidence" for item in results)
+        handoff = None
+        if needs_handoff:
+            handoff = await CustomerRagHandoffService(self.database).handoff(customer_id=customer_id, query=query.strip(), intent=next((item.intent for item in plan.tasks if item.intent != "human_handoff"), "human_handoff"), evidence_status="low_confidence" if any(item.error == "low_confidence" for item in results) else "customer_requested", citations=[])
+            answer_lines.append(f"已为您转接人工客服，工单号：{handoff['ticket_no']}。")
+        react_results = [item for item in results if item.data and item.data.get("execution_mode") == "bounded_react"]
+        if react_results:
+            audit_detail = json.dumps({
+                "conversation_id": conversation_id,
+                "query_length": len(query.strip()),
+                "execution_mode": "bounded_react",
+                "task_count": len(react_results),
+                "tasks": [
+                    {
+                        "task_id": item.task_id,
+                        "intent": item.intent,
+                        "status": item.status,
+                        "error": item.error,
+                        "tool_call_count": len(item.data.get("tool_calls", [])),
+                        "tools": [call.get("tool") for call in item.data.get("tool_calls", [])],
+                    }
+                    for item in react_results
+                ],
+                "private_reasoning_logged": False,
+                "write_tools_used": False,
+            }, ensure_ascii=False)
+            async with self.database.session_factory() as audit_session:
+                audit_session.add(AuditLog(
+                    id=str(uuid4()),
+                    actor_user_id=customer_id,
+                    action="customer_service.bounded_react_executed",
+                    resource_type="customer_service_conversation",
+                    resource_id=conversation_id,
+                    detail=audit_detail,
+                ))
+                await audit_session.commit()
+        state = {**short_term, "conversation_id": conversation_id, "original_query": short_term.get("original_query") or query.strip(), "latest_query": query.strip(), "task_results": [item.__dict__ for item in results], "plan_execution_modes": sorted({item.execution_mode for item in plan.tasks}), "clarification": clarification, "missing_parameter": bool(clarification), "clarification_count": clarification_count, "pending_intent_plan": {}, "handoff": handoff}
+        await memory.save_short_term(customer_id=customer_id, conversation_id=conversation_id, state=state)
+        return CustomerTaskExecutionResponse(conversation_id=conversation_id, overall_status=overall, answer="\n".join(answer_lines) or "当前没有可返回的结果，建议转人工客服。", route=route, agents=agents, results=[TaskExecutionResultResponse(task_id=item.task_id, intent=item.intent, status=item.status, answer=item.answer, data=item.data or {}, error=item.error, clarification=item.clarification) for item in results], clarification=clarification, requires_handoff=needs_handoff, work_order_id=handoff["work_order_id"] if handoff else None, ticket_no=handoff["ticket_no"] if handoff else None, customer_service_session_id=handoff["customer_service_session_id"] if handoff else None, customer_service_session_status=handoff["customer_service_session_status"] if handoff else None)

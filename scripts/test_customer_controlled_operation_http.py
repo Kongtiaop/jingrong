@@ -17,6 +17,10 @@ async def main():
    assert results['business_operation']['status']=='needs_confirmation'
    assert results['business_operation']['data']['executed'] is False
    assert results['business_operation']['data']['confirmation_required'] is True
+   target=results['business_operation']['data']['action_target']
+   assert target in {'/customer-center?tab=operations&action=redeem','/customer-center?tab=operations&action=transfer','/customer-center?tab=operations&action=order'}
+   assert target.startswith('/customer-center?tab=operations&action=')
+   assert 'token' not in results['business_operation']['data']
    assert data['overall_status'] in {'partially_completed','needs_clarification'}
-   print({'read_task_preserved':True,'operation_needs_confirmation':True,'operation_not_executed':True,'pass':True})
+   print({'read_task_preserved':True,'operation_needs_confirmation':True,'operation_not_executed':True,'safe_action_target':True,'pass':True})
 if __name__=='__main__':asyncio.run(main())

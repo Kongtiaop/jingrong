@@ -323,10 +323,11 @@ CORE_CATALOG = {
             "normalized_question": "查询客户过去三个月的净资产趋势",
             "intent_code": "customer_net_asset_trend",
             "target_table_names_json": ["customer_asset_snapshot", "users"],
-            "target_column_names_json": ["customer_asset_snapshot.snapshot_date", "customer_asset_snapshot.net_asset", "users.username"],
+            "target_column_names_json": ["customer_asset_snapshot.user_id", "customer_asset_snapshot.snapshot_date", "customer_asset_snapshot.net_asset", "users.username"],
             "sql_template": "SELECT snapshot_date, net_asset FROM customer_asset_snapshot WHERE user_id = :user_id AND snapshot_date >= :start_date ORDER BY snapshot_date",
             "explanation": "按客户和日期读取资产快照；不要使用 customer_profile 代替历史资产数据。",
             "allowed_roles_json": ["advisor", "customer_manager", "risk_manager", "operations", "auditor", "super_admin"],
+            "metadata_json": {"parameters": {"user_id": {"type": "subject_id", "source": "authorized_scope_only", "required": True}, "date_range": {"type": "date_range", "source": "natural_language", "start_param": "start_date", "end_param": "end_date", "default_days": 90, "max_range_days": 90}}},
         },
         {
             "domain_code": "trading",
@@ -338,6 +339,7 @@ CORE_CATALOG = {
             "sql_template": "SELECT COALESCE(SUM(amount), 0) AS pending_amount FROM orders WHERE status = 'pending_review' AND created_at >= :month_start",
             "explanation": "订单金额来自 orders.amount，最终成交金额应查询 trades.amount。",
             "allowed_roles_json": ["operations", "risk_manager", "auditor", "super_admin"],
+            "metadata_json": {"parameters": {"month_start": {"type": "month_start", "source": "system_now", "required": True}}},
         },
         {
             "domain_code": "risk",
@@ -349,6 +351,7 @@ CORE_CATALOG = {
             "sql_template": "SELECT r.*, u.display_name FROM risk_alert r JOIN users u ON r.user_id = u.id WHERE r.risk_level IN ('high', 'critical') AND r.status NOT IN ('closed', 'resolved') ORDER BY r.created_at DESC LIMIT :limit",
             "explanation": "仅风险/审计授权角色可查询，结果必须按数据范围过滤。",
             "allowed_roles_json": ["risk_manager", "auditor", "super_admin"],
+            "metadata_json": {"parameters": {"limit": {"type": "integer", "source": "natural_language", "min": 1, "max": 100, "default": 100}}},
         },
     ],
 }

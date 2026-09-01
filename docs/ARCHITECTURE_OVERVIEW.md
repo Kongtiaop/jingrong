@@ -456,3 +456,56 @@ conda run -n langchain_env python scripts/query_milvus_knowledge.py
 4. 完成 VectorStore 后端配置切换。
 5. 增加风险预警状态机。
 6. 再实现长期行为画像和动态风险建议。
+
+## 客服人工消息实时同步与断线补偿（2026-08-11）
+
+人工客服消息的同步链路分为三层：
+
+```text
+PostgreSQL customer_service_message
+        │ 事实源
+        ├── HTTP GET /customer-service/sessions/{session_id}/messages
+        │       └── after={last_message_id}：断线后的增量补偿
+        └── Redis Pub/Sub customer-realtime:{customer_id}
+                └── WebSocket relay：在线低延迟通知
+```
+
+客户页面记录最后一条已消费人工消息的 `lastMessageId`。轮询或断线恢复时携带该 ID 请求 `messages?after=`，收到结果后按消息 ID 去重，再追加到当前会话。WebSocket `error`/`close` 会进入 `recovering` 状态并触发一次补偿刷新；正常轮询继续运行，作为最终降级保障。
+
+这条链路只负责“已落库消息的可见性”，不改变客服会话状态机，也不替代 HTTP API 的权限校验。会话变更仍由受控客服 API 提交，Pub/Sub 只在事务提交后发布在线通知；如果客户端离线，恢复时由 HTTP 增量查询补齐。
+
+## 2026-08-11：TencentDB Agent Memory 方法论采纳边界
+
+仓库中的 `TencentDB Agent Memory .md` 作为记忆设计参考被采纳为 Gen2 方法论，而非直接引入外部产品。现有 Redis 短期会话状态和 PostgreSQL `CustomerMemory` / `CustomerMemoryEvent` 是实现基础。
+
+| 层级 | 项目中的对应物 | 采用方式 |
+|---|---|---|
+| L0 原始流水 | 会话、消息、审计记录 | 作为长期记忆的可追溯证据，不由模型改写。 |
+| L1 记忆卡片 | `CustomerMemory` | 只存客户明确确认的参数、服务偏好、非敏感会话事实；P2 收尾升级为版本化卡片。 |
+| L2 场景档案 | 暂无 | P4 后按真实业务场景评估，不作为 P2 依赖。 |
+| L3 稳定摘要 | 暂无 | 仅可用于可撤销、显式确认的服务偏好；不得形成模型推断的金融“人格画像”。 |
+| Gen3 记忆图谱 | 暂无 | P5 可选项，需以跨实体追溯需求证明价值后再引入。 |
+
+金融业务事实的优先级保持不变：业务事实表高于所有记忆。风险、资产、持仓、订单、产品状态、限制和授权信息不能从记忆中读取为最终依据。
+
+## 2026-08-11：实时客服遗留会话与超时策略
+
+### 状态机补充
+
+```text
+waiting_human
+  ├─ 坐席 claim → human_active
+  └─ 超过 CUSTOMER_SERVICE_WAITING_TIMEOUT_SECONDS（默认 1800 秒）未接入 → expired
+
+human_active
+  └─ 超过 CUSTOMER_SERVICE_HEARTBEAT_TIMEOUT_SECONDS（默认 90 秒）无心跳 → paused
+
+paused
+  └─ 坐席重新 claim → human_active
+```
+
+`resolved`、`closed`、`expired` 都是终态：不得 claim，不得作为通知自动聚焦目标，不得恢复浏览器中的人工会话缓存。前端恢复前通过会话详情接口确认状态；发现终态即清除 `customer_service_session_id`、停止轮询和实时订阅。
+
+### 坐席交互边界
+
+坐席从待接入队列 claim 成功后进入专注实时对话窗口。坐席后台不显示统一 Agent 气泡；统一气泡仅是客户侧未来 Supervisor 的单一入口，避免与人工坐席会话状态机混用。

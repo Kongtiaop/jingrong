@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.services.customer_query_router import CustomerQueryRouter
+from app.infrastructure.qwen import QwenProvider
+from app.core.settings import get_settings
 from app.repositories.knowledge import KnowledgeRepository
 from app.services.customer_rag_service import CustomerRagService
 from app.services.knowledge_retrieval import WealthKnowledgeRetriever
@@ -34,7 +36,7 @@ class CustomerReadTools:
         if name in {"search_customer_knowledge", "explain_order_status", "explain_workorder_status"}:
             selected_intent = intent or ("workflow" if name != "search_customer_knowledge" else "faq")
             retriever = WealthKnowledgeRetriever(KnowledgeRepository(self.database))
-            rag = await CustomerRagService(retriever).answer(query=query, intent=selected_intent)
+            rag = await CustomerRagService(retriever, embedding_provider=QwenProvider(get_settings())).answer(query=query, intent=selected_intent)
             return CustomerReadToolResult(name=name, success=not rag.handoff_required, data={"citations": [item.__dict__ for item in rag.citations], "evidence_status": rag.evidence_status}, answer=rag.message, error="low_confidence" if rag.handoff_required else None)
         async with self.database.session_factory() as session:
             result = await CustomerQueryRouter().route(session=session, customer_id=customer_id, query=query, entities=entities)

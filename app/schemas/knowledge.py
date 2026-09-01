@@ -29,6 +29,14 @@ class DocumentIngestResponse(BaseModel):
     event_id: str | None = None
 
 
+class DocumentIngestionStatusResponse(BaseModel):
+    document_id: str
+    document_status: str
+    document_error: str | None = None
+    current_version_id: str | None = None
+    events: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class DocumentResponse(BaseModel):
     id: str
     knowledge_base_id: str

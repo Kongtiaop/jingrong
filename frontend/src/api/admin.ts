@@ -11,6 +11,8 @@ export const adminApi = {
   recycleBin: (module = 'user', limit = 50, offset = 0) => http.get('/admin/recycle-bin', { params: { module, limit, offset } }),
   auditLogs: (action = '', resourceType = '', limit = 50, offset = 0) => http.get('/admin/audit-logs', { params: { action, resource_type: resourceType, limit, offset } }),
   riskWorkbench: () => http.get('/admin/dashboard/risk-workbench'),
+  outboxEvents: (status = '', limit = 50, offset = 0) => http.get('/admin/outbox-events', { params: { status, limit, offset } }),
+  retryOutboxEvent: (id: string) => http.post(`/admin/outbox-events/${id}/retry`),
 }
 
 

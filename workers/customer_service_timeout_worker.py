@@ -18,12 +18,14 @@ async def run_timeout_sweep(database: Database, service: CustomerServiceTimeoutS
         data = await service.sweep(
             session,
             timeout_seconds=settings.customer_service_heartbeat_timeout_seconds,
+            waiting_timeout_seconds=settings.customer_service_waiting_timeout_seconds,
+            cleanup_waiting=settings.customer_service_waiting_cleanup_enabled,
             actor_user_id=None,
             now=now,
         )
     logger.info(
-        "customer_service_timeout_sweep paused_count=%s timeout_seconds=%s",
-        data["paused_count"], data["timeout_seconds"],
+        "customer_service_timeout_sweep paused_count=%s expired_count=%s timeout_seconds=%s waiting_timeout_seconds=%s",
+        data["paused_count"], data["expired_count"], data["timeout_seconds"], data["waiting_timeout_seconds"],
     )
     return data
 

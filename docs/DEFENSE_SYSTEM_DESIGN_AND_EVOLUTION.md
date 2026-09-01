@@ -2,7 +2,7 @@
 
 > **文档用途**：公司答辩、项目交接、技术复盘。  
 > **项目名称**：智能财富管理平台（Wealth Manager）  
-> **文档日期**：2026 年 8 月 5 日  
+> **文档日期**：2026 年 8 月 8 日  
 > **说明**：本文以当前代码、`docs/PLAN.md`、`docs/ISSUES.md`、`docs/TESTS.md`、`docs/DECISIONS.md` 和 `docs/WORKORDER_DESIGN.md` 为依据。文中明确区分“已实现”与“后续增强”，避免将设计目标误表述为已上线能力。
 
 ---
@@ -25,6 +25,7 @@
 13. [数据模型与核心实体关系](#13-数据模型与核心实体关系)
 14. [分阶段迭代路线](#14-分阶段迭代路线)
 15. [当前能力边界与后续计划](#15-当前能力边界与后续计划)
+15A. [2026 年 8 月新增能力与维护闭环补录](#15a-2026-年-8-月新增能力与维护闭环补录)
 16. [答辩演示建议与常见问题](#16-答辩演示建议与常见问题)
 
 ---
@@ -3692,6 +3693,211 @@ AML 扫描
    - 当前以 ASGI HTTP 回归、构建和现场验收为主；
    - 后续可增加 Playwright/Cypress 自动化浏览器测试。
 
+
+---
+
+## 15A. 2026 年 8 月新增能力与维护闭环补录
+
+> 本节用于补录原文形成后已经落地、但尚未完整写入系统设计与演进文档的功能。状态以当前代码、`CODE_CHANGELOG.md`、`PLAN.md` 和 `TESTS.md` 为准。
+
+### 15A.1 客户智能客服已经从单一 RAG 查询演进为受控主 Agent
+
+当前客户智能客服入口为 `/customer-center/service`，客户页面在 `sessionStorage` 中维护稳定的 `customer_service_conversation_id`，每次请求通过 `X-Conversation-Id` 传递同一个会话上下文。前端只展示一个客服窗口；后端由主 Agent/Orchestrator 统一完成意图识别、任务拆分、任务执行和结果汇总。
+
+当前链路为：
+
+```text
+客户气泡/智能客服页面
+  → 主 Agent / Intent Planner
+  → IntentTask 列表
+  → CustomerTaskExecutor
+  → 业务事实 Tool / 知识库 Tool / 人工客服 Handoff
+  → CustomerTaskExecutionResponse
+  → 同一个客服窗口展示
+```
+
+子 Agent 或 Tool 不建立自己的前端会话，也不能自行扩大身份和数据范围。每个业务任务必须继承主请求的客户身份、当前客户范围、会话标识和追踪上下文；查询仍由 Service/Repository 根据当前认证用户执行。
+
+### 15A.2 多意图、多任务执行与部分完成
+
+`CustomerIntentPlanner` 可以把一条复合问题拆成多个 `IntentTask`，例如：
+
+```json
+{
+  "conversation_id": "same-conversation",
+  "tasks": [
+    {"intent": "order_status", "agent": "business_fact_agent"},
+    {"intent": "risk_restriction", "agent": "business_fact_agent"},
+    {"intent": "asset_summary", "agent": "business_fact_agent"}
+  ]
+}
+```
+
+`CustomerTaskExecutor` 按依赖关系分批执行，并限制并行任务数。任务结果包含 `task_id`、`intent`、`status`、`answer`、`data`、`error` 和 `clarification`。聚合层据此返回 `succeeded`、`partially_completed`、`needs_clarification`、`waiting_human` 等整体状态，而不是把多任务结果压缩成单一模糊回答。
+
+前端 `CustomerRagView.vue` 已展示：
+
+- 整体状态；
+- 任务明细；
+- 每个任务的回答、状态、错误和澄清信息；
+- 事实数据卡片与知识库引用；
+- 人工客服会话状态。
+
+### 15A.3 实体精确查询与客户数据隔离
+
+Planner 当前支持提取并传递：
+
+- `order_no`；
+- `ticket_no`；
+- `product_name`。
+
+实体通过 `IntentTask.arguments` 传递给 Tool 和 Query Router。订单和工单在当前客户数据范围内优先按明确编号过滤；产品名称唯一匹配时返回产品状态，同名或无法匹配时返回澄清，不把不确定结果伪装成成功。
+
+这一链路必须保持以下安全性质：
+
+```text
+当前认证用户
+  → 当前客户资源范围
+  → Service / Repository / Query Router
+  → 结果脱敏与审计
+```
+
+跨客户订单、工单或资产不得因为 Agent 提取了明确编号而泄露。实体参数只是查询条件，不是权限凭证。
+
+### 15A.4 澄清复用与人工 Handoff
+
+当意图识别缺少必要信息时，系统保存当前会话的短期记忆和 pending intent plan。客户补充信息后，系统复用原始问题、待处理任务和澄清次数，而不是完全从零规划；澄清成功后清空 pending plan，避免旧任务污染新问题。
+
+连续澄清仍无法形成可执行任务时，系统转入人工客服 Handoff，并在同一个 `conversation_id` 下关联工单号、人工会话号和会话状态。人工客服接管后，智能客服不再重复执行新的自动任务，直到会话关闭或恢复条件满足。
+
+### 15A.5 实时人工客服、单坐席接管与 heartbeat
+
+人工客服已经形成最小实时闭环：
+
+- 客服接入客户会话；
+- 同一会话同一时刻只能有一个 `human_active` 坐席；
+- 并发 claim 通过数据库状态约束产生单赢家；
+- 客服可以暂停、恢复、解决和关闭会话；
+- 客户可以查看消息、补充消息并主动结束允许关闭的会话；
+- heartbeat 记录坐席活跃状态；
+- 超时 sweep 将失活坐席会话转为可回收状态；
+- 前端在断线时显示恢复中/暂停状态，恢复后重新拉取消息。
+
+heartbeat Worker 与 API 进程职责分离。API 负责在线请求和状态变更，Worker 负责超时扫描、回收和恢复判定。实时通信失败不能直接修改客户业务事实，也不能绕过人工会话状态机。
+
+### 15A.6 客服低置信度转人工和知识引用
+
+客服 RAG 已接入知识检索、引用回答和低置信度转人工工单闭环。客服回答应保留引用快照、证据状态和下一步建议；资料不足、涉及个性化投资建议、资金操作、风险限制或投诉争议时，不能由模型补写事实，应转人工或创建工单。
+
+客服 RAG 与投顾 Evidence Service 共用版本化知识底座，但拥有不同的权限 Scope、查询模板、阈值和审计事件。客服 RAG 不能读取其他客户资料，也不能执行交易、转账、赎回、解限或风险结案。
+
+### 15A.7 受控业务操作确认边界与安全导航
+
+识别到赎回、转账或下单时，主 Agent 只返回：
+
+```json
+{
+  "status": "needs_confirmation",
+  "data": {
+    "operation": "赎回",
+    "confirmation_required": true,
+    "executed": false,
+    "action_target": "/customer-center?tab=operations&action=redeem"
+  }
+}
+```
+
+客服窗口显示“前往办理”按钮，跳转到既有客户中心业务办理入口。前端不会把操作 token、已确认状态、自动提交参数或可执行命令传给客服接口；客户必须在业务页面重新填写对象、金额等参数，并经过原有权限、参数完整性、适当性、风控、幂等和最终确认流程。
+
+因此，以下表述均不成立：
+
+- “Agent 识别到赎回就已经赎回”；
+- “客服按钮等价于业务提交”；
+- “conversation_id 可以替代业务确认”；
+- “前端 action_target 可以绕过业务 API 权限”。
+
+`action_target` 只是受控导航信息，且仅允许白名单路径：
+
+- `/customer-center?tab=operations&action=redeem`；
+- `/customer-center?tab=operations&action=transfer`；
+- `/customer-center?tab=operations&action=order`。
+
+### 15A.8 工单、通知、附件与风控调查维护闭环
+
+工单系统已经从 MVP 扩展为可追踪协同闭环：
+
+- 类型化工单和状态机；
+- 分派、认领、处理、待客户补充、解决、关闭；
+- 客户补充文字和附件；
+- 工作人员认证下载附件；
+- 站内通知和未读提醒；
+- 风控调查工单与风险预警关联；
+- 风险处置要求结构化原因和材料清单；
+- 关联订单、资金流水、AML 批次和审计记录。
+
+附件当前使用受控本地目录和鉴权下载，不暴露静态 URL。后续生产化可迁移到对象存储，并增加病毒扫描和内容预览，但不能降低认证下载和数据范围校验要求。
+
+### 15A.9 AML 批次补跑、迟到流水补扫与 Worker 可观测性
+
+AML 已支持日批、失败客户补跑和迟到流水补扫。不同运行类型使用稳定键、来源批次和独立批次血缘：
+
+- 已完成日批不能通过覆盖原批次来处理迟到流水；
+- 迟到流水使用独立 `late_rescan` 批次；
+- 重复点击同一补扫请求应幂等复用；
+- 原批次窗口、错误和审计信息不能被覆盖。
+
+AML Scheduler 记录心跳、运行状态、扫描窗口、批次类型、来源批次和失败摘要。风险后台可以区分“尚未到扫描时间”“Worker 在线等待”“扫描完成”“扫描失败”和“Worker 离线”。API 与 AML Worker 使用不同容器入口，避免长任务和在线 HTTP 进程共用生命周期。
+
+### 15A.10 Data Catalog 与知识治理
+
+Data Catalog 第一、二阶段已建立未来受控数据查询和 NL2SQL 的治理地基，包括：
+
+- 数据集、表、字段和业务含义元数据；
+- 版本记录和治理后台；
+- 数据 Scope 与字段敏感级别；
+- 异步知识导入和向量化 Pipeline；
+- 文档上传后的自动跟踪；
+- 以 PostgreSQL 为事实源、Outbox + Redis Streams 为可靠异步机制。
+
+当前阶段不允许自由 NL2SQL 直接访问生产业务库。任何未来的数据 Agent 都必须先经过数据目录、字段白名单、客户范围、SQL 模板/AST 校验、只读连接、结果脱敏、限流、超时和审计。
+
+### 15A.11 工程维护和质量门禁
+
+项目当前没有统一 CI，因此以文档化门禁维持可重复性：
+
+1. 修改前阅读相关 `PLAN.md`、`ISSUES.md`、`DECISIONS.md` 和领域设计文档；
+2. 代码变更写入 `CODE_CHANGELOG.md`；
+3. 测试命令、通过标准和失败原因写入 `TESTS.md`；
+4. 计划状态写入 `PLAN.md`；
+5. Python 修改至少执行语法编译或对应测试；
+6. 前端修改至少执行 `npm run build`；
+7. API 变更执行 ASGI/HTTP 回归；
+8. 客服、工单、风险、AML、迁移变更优先执行对应领域回归；
+9. 测试环境失败要区分“代码断言失败”和“服务未启动/数据未准备”等环境问题；
+10. 文档必须明确区分“已实现”“已验证”“设计目标”和“后续增强”。
+
+Docker 运行边界也已固化：默认 Compose 启动 PostgreSQL、Redis 和 API；AML Scheduler 通过独立 profile/容器显式启动。前端本地开发使用 Vite，Network Error 首先检查 API、代理、端口和容器状态，不把基础设施故障误判为业务代码故障。
+
+### 15A.12 当前维护优先级
+
+后续维护按以下顺序执行：
+
+1. 先保护身份、权限、客户数据范围和业务状态机；
+2. 再保护资金/交易操作的风控、幂等和最终确认；
+3. 再保护客服会话、人工接管和跨进程 Worker 的恢复能力；
+4. 再保护 RAG 引用、知识版本和 Scope 隔离；
+5. 最后扩展 UI、推荐体验和非关键自动化。
+
+任何新 Agent、Tool、页面或 Worker 接入，都必须回答：
+
+- 继承了哪个认证上下文？
+- 只能访问哪个数据范围？
+- 是否只读？
+- 若可写，经过哪些业务权限、风控、幂等和确认？
+- 如何记录审计和 trace_id？
+- 失败、超时、重复请求和恢复如何处理？
+- 是否有对应的测试和维护文档？
+
 ---
 
 ## 16. 答辩演示建议与常见问题
@@ -3914,3 +4120,90 @@ RAG 知识底座应同时支撑客服与投顾，但两者的输入、权限和�
 `C:\simple_rag` 提供多格式解析、MinerU PDF、LangChain 中文切分、批量 embedding、Milvus dense/BM25/RRF、查询改写、子问题分解、缓存及完整踩坑记录，可作为当前项目的算法和工程参考。但当前财富管理项目保持 PostgreSQL 为事实源、Outbox + Redis Streams 为可靠异步机制、RBAC 为权限边界；不复制其 SQLite 任务状态、固定本机路径或将 LLM 输出直接绑定业务执行的做法。
 
 当前优先迁移其成熟的解析、结构化切分、批量向量化、召回去重和质量阈值思想，并结合现有 `knowledge_document_version`、`knowledge_chunk.content_hash` 实现真正的 Chunk 差异更新：未变化 Chunk 复用既有向量，新增/变化 Chunk 才嵌入，删除 Chunk 标记失效，最后原子激活新版本。
+
+### 今日实现状态补录（2026-08-08）
+
+截至今日停工，客服会话已经接入站内通知第一阶段：客服接入通知客户，客户消息通知当前坐席，人工回复通知客户；通知资源绑定同一 `customer_service_session`，后台点击通知后进入实时客服工作台，后端再次执行会话范围和坐席权限校验。
+
+已验证通知列表、未读数和跨用户标记已读隔离。通知目前仍在客服主事务中同步写入，幂等键、Outbox 异步投递、客户侧通知入口和完整浏览器 E2E 留待后续，不应表述为已完成能力。
+
+### 2026-08-10：客服 Agent 从 HTTP 问答到双向 WebSocket 实时会话
+
+### 已实现的传输与事件模型
+
+客服 Agent 的主通道已由“HTTP `execute-plan` 等待全部任务结束后一次性返回”演进为已鉴权 WebSocket。每个事件均带有 `conversation_id`、`request_id` 与单调递增 `sequence`，形成同一会话内可关联、可审计的实时协议。
+
+```text
+浏览器
+  ├─ agent.request / agent.amend / agent.cancel
+  ▼
+FastAPI WebSocket Session
+  ├─ session.ready
+  ├─ agent.accepted
+  ├─ agent.progress
+  ├─ agent.output.chunk
+  ├─ agent.task.completed
+  ├─ agent.final / agent.cancelled / agent.error
+  ▼
+CustomerAgentExecutionService
+  ├─ 客户短期记忆（conversation_id）
+  ├─ 意图规划与确定性业务工具
+  └─ 低置信度或澄清耗尽时转人工
+```
+
+其中，`session.ready` 仅表示连接和鉴权已完成；`agent.final` 才表示一次请求完成。前端将“连接建立超时”与“Agent 执行时长”分离：连接阶段使用 5 秒保护，连接成功后不再以 2.5 秒硬超时打断正常查询；只有连接错误、提前关闭或明确 `agent.error` 才使用 HTTP 兼容路径。
+
+### 取消、澄清补充与安全边界
+
+1. **请求取消**：后端以 `request_id → asyncio.Task` 管理活动请求。客户端发送 `agent.cancel` 后，服务端取消对应 Task，并用 `asyncio.shield` 保护 `agent.cancelled` 确认事件，避免“任务被取消”同时吞掉“取消已确认”。重复 request_id 和取消非活动请求会返回明确协议错误。
+2. **澄清补充**：当确定性 Planner 返回 `needs_clarification` 时，前端展示补充信息输入；客户端以新的 request_id 发送 `agent.amend`，但仍复用同一 `conversation_id`。短期记忆中的 `original_query`、`pending_intent_plan`、`clarification_count` 继续参与组合查询，避免客户从头开始。
+3. **不可越权执行**：实时协议只改变交互和反馈方式，不绕过业务门禁。交易、赎回、转账、风险限制解除和人工接管仍由后端状态机、权限校验、风险规则与确认流程控制；HTTP `execute-plan` 保留为兼容/降级路径，而不是新的执行权限来源。
+
+### 前端实时体验与质量证据
+### 人工会话生命周期实时化
+
+AI 到人工的切换不只是在数据库中把会话状态改为 `human_active`。系统在 claim、pause、release、resolve、customer-close、close 和人工回复事务提交成功后，以客户 ID 为隔离键发布 Redis Pub/Sub 在线事件；客户已鉴权 WebSocket relay 将事件转发给页面。PostgreSQL 仍是事实源，Outbox/Redis Streams 仍负责可靠通知；Pub/Sub 只承担“在线即刻刷新”，HTTP 轮询继续承担断线补偿。因此实时层失败不会回滚人工接入或人工回复主事务，也不会破坏后续恢复一致性。
+
+客户页面对 `human.session.claimed/paused/released/resolved/closed` 更新生命周期、控制轮询和清理会话缓存；对 `human.message.received` 按消息 ID 去重追加。这样客户能立即感知人工接入、暂停、重新排队和服务结束，坐席与客户的可见状态仍受原有 RBAC、单坐席约束和状态机控制。
+实时进度不是把最终结果提前伪装出来，而是直接映射后端已发送的协议事件：`agent.accepted` 表示请求已进入会话，`agent.progress` 表示编排阶段变化，`agent.task.completed` 表示一个确定性任务已经完成，`agent.final` 才提供最终聚合结果。这样答辩时可以区分“模型正在生成文本”“业务任务已经完成”和“整体请求已经结束”三个不同层次。
+
+客户页面已支持流式文本、任务完成结果、取消查询和澄清补充。浏览器端测试不依赖当前环境中不稳定的 Playwright WebSocket frame 观察，而是包装页面原生 `WebSocket`，直接验证真实页面发送 `agent.request` / `agent.amend` / `agent.cancel`，并接收 `agent.output.chunk`、`agent.final`、`agent.cancelled`。
+
+截至 **2026 年 8 月 10 日**，P0 Docker API、独立 Python WebSocket 回归、前端生产构建与 installed Chrome Playwright 回归均已通过；浏览器回归覆盖正常流式、请求取消和澄清补充三条路径。该能力证明系统已从“后端异步计算、前端等待最终结果”演进为“可反馈、可取消、可补充、仍受业务边界约束”的实时客服会话。
+
+---
+## 2026-08-10：通知浏览器回归与部署一致性边界
+
+通知资源范围 Playwright 回归已在稳定 Vite 环境下通过。测试环境要求前端显式监听 127.0.0.1:5173，不能只监听 IPv6 ::1。同时发现 HTTP 生命周期测试与外部运行 API 实例可能加载不同版本代码；金融系统的验收应同时验证“当前工作区代码”和“实际运行实例”，不能只以其中之一证明功能已部署。
+
+### 2026-08-10：后台通知到客服会话的可追溯导航闭环
+
+后台通知不只显示文本：客服消息通知携带 customer_service_session 资源 ID。坐席点击后，前端先按本人权限将通知标记已读，再携带 customer_service_session_id 进入实时客服工作台；工作台优先从待接入队列选择会话，若会话已被 claim 而不在队列，则通过既有授权消息接口确认访问范围并加载消息。这样通知跳转不依赖前端伪造客户资料，也不绕过会话的坐席权限校验。
+
+### 2026-08-10：客服通知的可靠异步投递与幂等边界
+
+客服会话的 claim、客户消息和人工回复属于主业务事实；站内通知属于派生协同结果。系统因此采用事务 Outbox，而不是在客服 API 中同步依赖 Notification 写入：同一个数据库事务同时保存客服会话或消息、审计记录和 notification.customer_service OutboxEvent。API 成功提交后，Outbox Worker 将事件发布到 Redis notifications Stream，Notification Worker 再创建站内通知。
+
+通知事件包含接收用户、通知类型、客服会话资源、内容和稳定 idempotency_key。Notification 表按接收用户与 idempotency_key 建立唯一约束，因此 Redis 重复投递、Worker pending 重领、网络重试或唯一冲突都不会产生重复通知。通知消费者只创建 Notification 并确认 Stream 消息，不直接改变客服会话状态；即使通知投递失败，已提交的客服 claim 或消息仍保持有效。
+
+该链路已在 P0 Docker 环境完成真实验证：API、Outbox Worker、Notification Worker、PostgreSQL 和 Redis 正常运行，claim 与两条不同客户消息均异步产生对应通知，每个事件只生成一条通知，消费者完成 Redis ACK。
+
+
+### 2026-08-10：Outbox dead-letter 观测、受控重试与恢复投递
+
+异步通知采用 Outbox 后，故障不能只停留在日志中。系统把连续发布失败的事件保留在 OutboxEvent：每次发布尝试递增 attempt，失败原因写入 error_message，超过最大尝试次数后事件状态从 pending 转为 dead。dead 不代表客服主业务失败；它表示派生通知尚未完成，需要进入运维处置。
+
+后台新增“通知投递监控”入口，仅向具备 audit:read 权限的工作人员开放。管理员可以按 pending、published、dead 查看 notification 类型事件的状态、尝试次数、资源、失败原因和时间。普通客户不能查询此运维数据。
+
+受控重试仅允许 notification 类型且状态为 dead 的事件：管理员发起 retry 后，事件恢复为 pending，attempt 重置为 0，error_message 与 published_at 清空，并写入 AuditLog。非 dead 事件重复重试返回冲突，非 notification 事件不能通过此入口重试。随后已有 Outbox Worker 重新发布到 Redis notifications Stream，Notification Worker 以幂等键创建通知并 ACK 消息。
+
+真实 P0 Docker 回归覆盖了可控发布失败、pending 到 dead、管理员可见、客户 403、dead retry、重复 retry 409，以及恢复后由 Outbox Worker 和 Notification Worker 实际投递通知的完整路径。
+
+
+
+
+## 2026-08-11：实时客服断线补偿与增量消息同步
+
+实时 WebSocket 是低延迟通道，但不是唯一事实来源。客户页面记录已消费的最后一条人工消息 ID；实时连接异常时进入 recovering 状态，并通过 `GET /customer-service/sessions/{session_id}/messages?after={last_message_id}` 读取断线期间新增消息。增量结果按消息 ID 去重后合并到当前会话，固定轮询继续作为最终降级保障。
+
+这套边界将三类职责分开：PostgreSQL 保存消息事实，WebSocket/PubSub 负责在线低延迟通知，HTTP after 查询负责断线补偿。因而即使实时连接短暂失败，也不会把网络故障误判为业务失败，恢复后可以在不重复拉取全部历史的前提下回到一致状态。
