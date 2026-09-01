@@ -22,6 +22,7 @@ DEMO_CUSTOMERS = (
         "cash": Decimal("4000000"),
         "investable": Decimal("12000000"),
         "goal": "资产保值与传承",
+        "password": "Demo@2026HighNetWorth",
     },
     {
         "username": "enterprise_demo",
@@ -32,7 +33,14 @@ DEMO_CUSTOMERS = (
         "cash": Decimal("3000000"),
         "investable": Decimal("5000000"),
         "goal": "企业资金稳健配置",
+        "password": "Demo@2026Enterprise",
     },
+    # 风险分层测试账号：每个风险等级一个，便于验证偏好排序
+    {"username": "risk_c1_demo", "display_name": "风险C1测试", "customer_type": "individual", "customer_tier": "ordinary", "asset": Decimal("1000000"), "cash": Decimal("500000"), "investable": Decimal("1000000"), "goal": "保本优先", "password": "Demo@2026Risk"},
+    {"username": "risk_c2_demo", "display_name": "风险C2测试", "customer_type": "individual", "customer_tier": "ordinary", "asset": Decimal("2000000"), "cash": Decimal("800000"), "investable": Decimal("2000000"), "goal": "稳健增值", "password": "Demo@2026Risk"},
+    {"username": "risk_c3_demo", "display_name": "风险C3测试", "customer_type": "individual", "customer_tier": "gold", "asset": Decimal("3000000"), "cash": Decimal("1000000"), "investable": Decimal("3000000"), "goal": "均衡配置", "password": "Demo@2026Risk"},
+    {"username": "risk_c4_demo", "display_name": "风险C4测试", "customer_type": "individual", "customer_tier": "platinum", "asset": Decimal("5000000"), "cash": Decimal("1500000"), "investable": Decimal("5000000"), "goal": "成长增值", "password": "Demo@2026Risk"},
+    {"username": "risk_c5_demo", "display_name": "风险C5测试", "customer_type": "individual", "customer_tier": "private_bank", "asset": Decimal("10000000"), "cash": Decimal("2000000"), "investable": Decimal("10000000"), "goal": "高风险进取", "password": "Demo@2026Risk"},
 )
 
 
@@ -50,7 +58,7 @@ async def ensure_demo_customer_profiles(database: Database) -> None:
                 user = User(
                     id=str(uuid4()),
                     username=item["username"],
-                    password_hash=hash_password("Demo@2026HighNetWorth" if item["username"] == "hNW_demo" else "Demo@2026Enterprise"),
+                    password_hash=hash_password(item["password"]),
                     display_name=item["display_name"],
                     status="active",
                     is_super_admin=False,
@@ -90,14 +98,15 @@ async def ensure_demo_customer_profiles(database: Database) -> None:
             if holding is None:
                 holding = CustomerHolding(id=str(uuid4()), user_id=user.id, product_id=product.id, quantity=item["asset"] - item["cash"], cost_amount=item["asset"] - item["cash"], market_value=item["asset"] - item["cash"], profit_loss=Decimal("0"), holding_days=90, status="active")
                 session.add(holding)
-        demo_risks = {"hNW_demo": "C3", "enterprise_demo": "C2"}
+        demo_risks = {"hNW_demo": "C3", "enterprise_demo": "C2", "risk_c1_demo": "C1", "risk_c2_demo": "C2", "risk_c3_demo": "C3", "risk_c4_demo": "C4", "risk_c5_demo": "C5"}
+        _level_score = {"C1": 20, "C2": 35, "C3": 50, "C4": 70, "C5": 88}
+        _level_willingness = {"C1": 10, "C2": 30, "C3": 55, "C4": 80, "C5": 95}
         for username, level in demo_risks.items():
             demo_user = (await session.execute(select(User).where(User.username == username))).scalar_one_or_none()
             if demo_user is None: continue
             risk = (await session.execute(select(CustomerRiskAssessment).where(CustomerRiskAssessment.user_id == demo_user.id, CustomerRiskAssessment.status == "active").order_by(CustomerRiskAssessment.assessed_at.desc()).limit(1))).scalars().first()
             if risk is None:
-                answers = {"investment_experience_years": 5, "max_loss_tolerance": 30, "investment_horizon_years": 5, "liquidity_need": "medium", "investment_goal": "balanced", "risk_willingness": 40}
-                if level == "C3": answers["risk_willingness"] = 60
-                risk = CustomerRiskAssessment(id=str(uuid4()), user_id=demo_user.id, risk_level=level, score=50 if level == "C3" else 35, answers_json=__import__("json").dumps(answers, ensure_ascii=False), status="active", source_type="synthetic_demo")
+                answers = {"investment_experience_years": 5, "max_loss_tolerance": 30, "investment_horizon_years": 5, "liquidity_need": "medium", "investment_goal": "balanced", "risk_willingness": _level_willingness[level]}
+                risk = CustomerRiskAssessment(id=str(uuid4()), user_id=demo_user.id, risk_level=level, score=_level_score[level], answers_json=__import__("json").dumps(answers, ensure_ascii=False), status="active", source_type="synthetic_demo")
                 session.add(risk)
         await session.commit()

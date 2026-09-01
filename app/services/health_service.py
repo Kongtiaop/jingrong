@@ -1,3 +1,5 @@
+import time
+
 from app.core.settings import Settings
 from app.db.health import DatabaseHealth
 from app.infrastructure.redis_client import RedisClient
@@ -10,9 +12,15 @@ class HealthService:
         self.redis = redis_client
         self.qwen = qwen
         self.settings = settings
+        # 短 TTL 缓存，避免每次 /health 请求都 ping PG+Redis（高并发下是瓶颈）
+        self._cache_ts: float = 0.0
+        self._cache: dict[str, dict[str, str]] | None = None
 
     async def check_all(self) -> dict[str, dict[str, str]]:
-        return {
+        now = time.monotonic()
+        if self._cache is not None and now - self._cache_ts < 5.0:
+            return self._cache
+        result = {
             "postgresql": await self.database_health.check(),
             "redis": await self.redis.check(),
             "qwen": await self.qwen.check_config(),
@@ -22,3 +30,6 @@ class HealthService:
                 "model": self.settings.qwen_embedding_model,
             },
         }
+        self._cache = result
+        self._cache_ts = now
+        return result

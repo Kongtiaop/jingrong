@@ -33,7 +33,7 @@ class SuitabilityService:
         self.profile_repository = profile_repository
         self.asset_service = asset_service or AssetSummaryService()
 
-    async def recommend(self, session, user_id: str, *, risk_operation=None) -> RecommendationResponse:
+    async def recommend(self, session, user_id: str, *, risk_operation=None, preferences: dict | None = None) -> RecommendationResponse:
         profile = await self.profile_repository.get(session, user_id) if self.profile_repository else None
         asset = await self.asset_service.latest_or_derived(session, user_id)
         products = await self.product_repository.list_active(session)
@@ -116,6 +116,15 @@ class SuitabilityService:
                 )
             )
 
+        matches = [item for item in results if item.matched]
+        excluded = [item for item in results if not item.matched]
+        preference_note = ""
+        pref = preferences or {}
+        if matches and pref:
+            score_fn = self._preference_score_mapper(pref)
+            if score_fn is not None:
+                matches = sorted(matches, key=lambda item: score_fn(item.product_risk_level))
+                preference_note = "已根据您近期的风险/产品偏好调整推荐顺序；以下产品仍均通过适当性匹配。"
         return RecommendationResponse(
             user_id=user_id,
             context=CustomerRecommendationContext(
@@ -125,8 +134,27 @@ class SuitabilityService:
                 investable_asset=investable_asset,
                 risk_operation=risk_operation,
             ),
-            matches=[item for item in results if item.matched],
-            excluded=[item for item in results if not item.matched],
+            matches=matches,
+            excluded=excluded,
             warnings=warnings,
+            preference_note=preference_note,
             generated_at=datetime.now(timezone.utc),
         )
+
+    @staticmethod
+    def _preference_score_mapper(preferences: dict) -> callable | None:
+        """偏好 → (产品风险等级)->int 的排序打分；无可用偏好则 None。"""
+        risk_pref = (preferences.get("risk_preference") or "").strip().lower()
+        product_pref = (preferences.get("product_preference") or "").strip().lower()
+        target: set[str] | None = None
+        if risk_pref in {"conservative", "balanced", "aggressive"}:
+            target = {"conservative": {"C1", "C2"}, "balanced": {"C2", "C3"}, "aggressive": {"C4", "C5"}}[risk_pref]
+        elif product_pref == "steady":
+            target = {"C1", "C2"}
+        if not target:
+            return None
+
+        def score(level: str) -> int:
+            return 0 if (level or "").upper() in target else 1
+
+        return score

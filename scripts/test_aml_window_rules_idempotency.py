@@ -33,7 +33,7 @@ async def main() -> None:
         async with db.session_factory() as session:
             cash_flow = MoneyFlow(
                 id=str(uuid.uuid4()), customer_id=customer_id, account_id=account_id, order_id=None,
-                amount=Decimal('50000.00'), currency='CNY', flow_type='cash', direction='out',
+                amount=Decimal('200000.00'), currency='CNY', flow_type='cash', direction='out',
                 channel='aml_window_test', occurred_at=as_of - timedelta(hours=1),
             )
             session.add(cash_flow)
@@ -70,7 +70,7 @@ async def main() -> None:
             third_as_of = as_of + timedelta(days=2)
             next_cash = MoneyFlow(
                 id=str(uuid.uuid4()), customer_id=customer_id, account_id=account_id, order_id=None,
-                amount=Decimal('50000.00'), currency='CNY', flow_type='cash', direction='out',
+                amount=Decimal('200000.00'), currency='CNY', flow_type='cash', direction='out',
                 channel='aml_window_test', occurred_at=third_as_of.replace(hour=12, minute=0),
             )
             session.add(next_cash)

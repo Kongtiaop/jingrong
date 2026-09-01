@@ -79,6 +79,15 @@ async def ensure_schema(engine: AsyncEngine) -> None:
             "ALTER TABLE aml_batch_run ADD COLUMN IF NOT EXISTS source_batch_id VARCHAR(36)",
             "CREATE INDEX IF NOT EXISTS ix_aml_batch_run_source_batch_id ON aml_batch_run (source_batch_id)",
 
+            "ALTER TABLE bad_case ADD COLUMN IF NOT EXISTS labeled_intent VARCHAR(64) NOT NULL DEFAULT ''",
+            "ALTER TABLE bad_case ADD COLUMN IF NOT EXISTS requires_clarification BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE bad_case ADD COLUMN IF NOT EXISTS category VARCHAR(64) NOT NULL DEFAULT ''",
+            "ALTER TABLE bad_case ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE bad_case ADD COLUMN IF NOT EXISTS split VARCHAR(16) NOT NULL DEFAULT 'train'",
+            "ALTER TABLE bad_case ADD COLUMN IF NOT EXISTS labeled_by VARCHAR(36)",
+            "ALTER TABLE bad_case ADD COLUMN IF NOT EXISTS labeled_at TIMESTAMPTZ",
+            "CREATE INDEX IF NOT EXISTS ix_bad_case_status_labeled ON bad_case (status, labeled_at)",
+
             "CREATE INDEX IF NOT EXISTS ix_users_status_created_at ON users (status, created_at)",
             "CREATE INDEX IF NOT EXISTS ix_user_roles_role_user ON user_roles (role_id, user_id)",
         )

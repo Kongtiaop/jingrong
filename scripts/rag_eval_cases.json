@@ -1,0 +1,24 @@
+{
+  "description": "RAG 检索质量评测集 v2（query → 期望命中的真实知识内容片段），数据飞轮 · 三分法",
+  "version": "2.0",
+  "split_note": "train=调优 top_k/rrf_k/min_score；val=筛选参数；test=最终验证。gold_fragments 为真实公开知识文档中应命中的子串。",
+  "corpus_note": "仅覆盖公共 scope 实际可检索的内容：企业信息.md(company_info/company_business)、个人投资者适当性管理指南.md(policy/risk_public，需 fix_rag_knowledge_meta 把 general→policy)、客服FAQ。workflow/内部文档(高净值客户服务规范=staff)不进公共评测。",
+  "cases": [
+    {"id": "rag_01", "split": "train", "intent": "company_info", "query": "你们公司服务多少客户", "gold_fragments": ["累计服务客户", "客户规模"]},
+    {"id": "rag_02", "split": "train", "intent": "company_info", "query": "客服电话是多少", "gold_fragments": ["客户服务热线", "400"]},
+    {"id": "rag_03", "split": "train", "intent": "company_info", "query": "你们公司有哪些牌照", "gold_fragments": ["基金销售业务资格", "保险经纪业务许可证", "证券投资咨询业务资格"]},
+    {"id": "rag_04", "split": "train", "intent": "company_business", "query": "你们有没有机构金融业务", "gold_fragments": ["机构金融事业部", "企业信贷"]},
+    {"id": "rag_05", "split": "train", "intent": "company_business", "query": "有没有私人银行服务", "gold_fragments": ["私人银行", "高净值"]},
+    {"id": "rag_06", "split": "train", "intent": "policy", "query": "什么是适当性管理", "gold_fragments": ["适当性管理"]},
+    {"id": "rag_07", "split": "train", "intent": "risk_public", "query": "风险测评怎么分级", "gold_fragments": ["风险测评", "风险类型"]},
+    {"id": "rag_08", "split": "train", "intent": "risk_public", "query": "什么算专业投资者", "gold_fragments": ["专业投资者"]},
+    {"id": "rag_09", "split": "train", "intent": "faq", "query": "客服热线是多少", "gold_fragments": ["客户服务热线", "400"]},
+    {"id": "rag_10", "split": "train", "intent": "company_info", "query": "你们公司有什么数字化系统", "gold_fragments": ["智能财富管家", "AI投顾引擎"]},
+    {"id": "rag_11", "split": "val", "intent": "company_info", "query": "公司规模怎么样", "gold_fragments": ["客户规模", "营业网点"]},
+    {"id": "rag_12", "split": "val", "intent": "policy", "query": "投资者适当性是什么意思", "gold_fragments": ["适当性管理"]},
+    {"id": "rag_13", "split": "val", "intent": "risk_public", "query": "测评结果怎么对应风险类型", "gold_fragments": ["风险类型"]},
+    {"id": "rag_14", "split": "test", "intent": "company_info", "query": "你们服务多少客户", "gold_fragments": ["累计服务客户"]},
+    {"id": "rag_15", "split": "test", "intent": "company_business", "query": "有没有机构客户业务", "gold_fragments": ["机构金融"]},
+    {"id": "rag_16", "split": "test", "intent": "policy", "query": "适当性管理包括什么", "gold_fragments": ["适当性管理"]}
+  ]
+}

@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.admin import router as admin_router
+from app.api.annotation import router as annotation_router
 from app.api.auth import router as auth_router
 from app.api.customer_rag import router as customer_rag_router
 from app.api.customer_service import router as customer_service_router
@@ -27,6 +28,7 @@ api_router.include_router(customer_service_router)
 api_router.include_router(data_catalog_router)
 api_router.include_router(trading_router)
 api_router.include_router(admin_router)
+api_router.include_router(annotation_router)
 api_router.include_router(risk_router)
 api_router.include_router(operations_router)
 api_router.include_router(workorders_router)

@@ -429,6 +429,8 @@ class AgentRecoveryWorker:
 
 ## 5. Phase 2：LangGraph Checkpointer 接入
 
+> ✅ **2026-08-29 已接入**：`app/agents/checkpointer.py`（`memory_checkpointer` / `postgres_checkpointer` / `thread_config` / `with_interrupt`）；`SupervisorGraph.build(checkpointer=..., interrupt_before=..., interrupt_after=...)` 已支持。**MemorySaver 可用并测试通过**（`tests/test_agent_graph.py` 覆盖"summarize 前中断→恢复续跑→完成"）。**AsyncPostgresSaver 代码就绪，需装 `langgraph-checkpoint-postgres` 额外包 + DB**（本环境未装未跑）。下方方案为完整设计说明。
+
 ### 5.1 目标
 
 客服 Agent 的多轮 LLM 推理（ReAct 循环）可以中断恢复，避免重复消耗 Token。

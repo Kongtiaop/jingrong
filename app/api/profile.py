@@ -21,6 +21,7 @@ from app.services.asset_summary_service import AssetSummaryService
 from app.services.holding_valuation_service import HoldingValuationService
 from app.services.trading_service import TradingError
 from app.services.advisor_authorization_service import AdvisorAuthorizationService
+from app.services.memory_service import CustomerMemoryService
 
 router=APIRouter(prefix="/profile",tags=["profile"])
 
@@ -603,6 +604,13 @@ async def submit_risk_assessment(request: Request, payload: RiskAssessmentReques
         item = await RiskAssessmentService(repository=uow.risks).assess(session, user.id, payload.model_dump())
         await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="submit", resource_type="risk_assessment", resource_id=item.id, detail=f"risk_level={item.risk_level};score={item.score}"))
         await session.commit(); await session.refresh(item)
+        # 长时记忆：把测评得出的风险等级持久化为"风险偏好"（低风险、可后续供推荐参考）
+        if item.risk_level:
+            try:
+                memory = CustomerMemoryService(request.app.state.database, request.app.state.redis.client)
+                await memory.remember(customer_id=user.id, key="risk_preference", value=str(item.risk_level), memory_type="conversation_fact", source="risk_assessment")
+            except Exception:  # noqa: BLE001 - 记忆失败不阻塞测评结果返回
+                pass
         return ApiResponse(data=RiskAssessmentResponse(id=item.id,user_id=item.user_id,risk_level=item.risk_level,score=item.score,answers=payload.model_dump(),status=item.status,source_type=item.source_type,assessed_at=item.assessed_at,expires_at=item.expires_at))
 
 @router.get("/me/enterprise-verification", response_model=ApiResponse[EnterpriseVerificationResponse | None])

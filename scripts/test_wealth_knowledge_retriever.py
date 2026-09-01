@@ -12,7 +12,7 @@ class FakeRepository:
 
     async def search_hybrid(self, **kwargs):
         chunk = (await self.search_text())[0]
-        return [(chunk, 0.91)]
+        return [(chunk, 0.91, 0.8)]
 
 
 async def main():

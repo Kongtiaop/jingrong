@@ -17,6 +17,10 @@ class KnowledgeCitation:
     title_path: str
     page_number: int | None
     metadata: dict[str, Any]
+    # 向量余弦相似度（1 - cosine_distance）；无向量/纯文本降级时为 None。
+    # RRF score 是排名融合值（相关与无关都约 0.016），不能直接当"证据置信度"；
+    # 拒答/转人工应按真实语义相似度判定。
+    vector_similarity: float | None = None
 
 
 class WealthKnowledgeRetriever:
@@ -34,6 +38,7 @@ class WealthKnowledgeRetriever:
         knowledge_base_id: str | None = None,
         category: str | None = None,
         scope: KnowledgeScope | None = None,
+        rrf_k: int | None = None,
     ) -> list[KnowledgeCitation]:
         if query_embedding is not None:
             pairs = await self.repository.search_hybrid(
@@ -43,6 +48,7 @@ class WealthKnowledgeRetriever:
                 knowledge_base_id=knowledge_base_id,
                 category=category,
                 scope=scope,
+                rrf_k=rrf_k,
             )
         else:
             chunks = await self.repository.search_text(
@@ -52,7 +58,7 @@ class WealthKnowledgeRetriever:
                 category=category,
                 scope=scope,
             )
-            pairs = [(chunk, 1.0) for chunk in chunks]
+            pairs = [(chunk, 1.0, None) for chunk in chunks]
         return [
             KnowledgeCitation(
                 chunk_id=str(chunk.id),
@@ -63,6 +69,7 @@ class WealthKnowledgeRetriever:
                 title_path=chunk.title_path,
                 page_number=chunk.page_number,
                 metadata=chunk.metadata_json or {},
+                vector_similarity=sim,
             )
-            for chunk, score in pairs
+            for chunk, score, sim in pairs
         ]

@@ -1,0 +1,55 @@
+# 理解层配置（模型可自调，运行时加载，不需部署）
+# ⚠️ 执行层闸门不在此配置域内，模型不可改。
+#
+# 说明：
+# - 模型自调（auto_repair）只允许写"理解层"键；execution_guard 保留为只读声明。
+# - 改此文件即生效；生产建议走版本化 + 灰度 + 回滚。
+# - 本次已回滚 auto-repair 写入的 few_shot/intent_mappings（保持干净，人工审核后再落）。
+
+# 难度模型路由（按问题难易选模型）
+model_routing:
+  default: qwen-plus
+  tiers:
+    # S：简单（单意图、明确、规则置信度高）
+    - {max: "S", model: "qwen-turbo"}
+    # M：中等（多意图、需检索、略模糊）
+    - {max: "M", model: "qwen-plus"}
+    # L：复杂（否定/指代/歧义/对抗/长句/缺参）
+    - {max: "L", model: "qwen-max"}
+
+# 难度判定信号权重（0-1）
+difficulty_weights:
+  rule_confidence: 0.4      # 规则置信度：高→简单
+  intent_count: 0.2         # 意图数：多→复杂
+  negation: 0.15            # 含否定词
+  conjunction: 0.15         # 含连词（并/然后/再）
+  ambiguous: 0.1            # 含歧义词
+
+# 检索参数（RAG / 目录）
+retrieval:
+  top_k: 5
+  rrf_k: 60
+  min_score: 0.0001
+  min_similarity: 0.55   # 无 judge 时的兜底阈值（ambiguous 带）
+  reject_similarity: 0.35   # 低于此 → 直接拒答转人工（明显无关，便宜，安全下限）
+  answer_similarity: 0.65   # 高于此 → 直接作答（明显相关，便宜）
+  judge_ambiguous: true     # ambiguous 带（0.35~0.65）是否用 LLM-judge 判证据充分性
+
+# 切片参数（结构感知切块，字节验证效果好；改配置即改切片，不用改代码）
+chunking:
+  mode: structure         # structure=按标题/段落/表格切（保语义单元）；fixed=滑动窗口
+  size: 400               # 目标 chunk 字符数（更小→相似度区分度更高）
+  overlap: 40             # 重叠（仅 fixed 滑动窗口用）
+
+# 意图解析提示词覆盖（可选；缺省用代码内置；auto_repair 可追加 few_shot）
+intent_prompt:
+  system_template: ""       # 空=用代码内置
+  few_shot: []              # 追加示例 [{query, output}]
+
+# 意图关键词映射覆盖（可选；auto_repair 可写 rule_mapping；与代码内置合并）
+intent_mappings:
+  keywords: {}
+
+# 安全声明：执行层闸门不在此域，模型不可改（仅文档用途）
+execution_guard:
+  immutable: ["permission", "subject_scope", "suitability", "risk", "confirmation", "idempotency", "audit", "write", "illegal_mutation", "trade_no_upgrade", "must_not_submit"]

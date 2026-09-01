@@ -5,7 +5,7 @@ from app.models.customer_service import CustomerServiceSession
 from uuid import uuid4
 import json
 from app.schemas.customer_service import CustomerTaskExecutionResponse, TaskExecutionResultResponse
-from app.services.customer_intent import CustomerIntentPlanner, IntentPlan, IntentTask, execution_mode_for_intent
+from app.services.customer_intent import CustomerIntentPlanner, IntentPlan, IntentTask, execution_mode_for_intent, extract_preference_statement
 from app.services.customer_rag_handoff import CustomerRagHandoffService
 from app.services.customer_task_executor import CustomerTaskExecutor
 from app.services.memory_service import CustomerMemoryService
@@ -53,6 +53,54 @@ def route_for_plan(plan) -> tuple[str, list[str]]:
     return route, AGENTS_BY_ROUTE[route]
 
 
+def _active_product_from_short_term(short_term: dict) -> str | None:
+    """从短时记忆里取"当前对话活跃产品"，供指代消解。"""
+    ap = short_term.get("active_product")
+    if isinstance(ap, str) and ap.strip():
+        return ap.strip()
+    for res in reversed(short_term.get("task_results") or []):
+        if not isinstance(res, dict):
+            continue
+        data = res.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        rec = data.get("recommendation") or {}
+        matches = rec.get("matches") or []
+        if matches and isinstance(matches[-1], dict) and matches[-1].get("name"):
+            return str(matches[-1]["name"])
+        for key in ("product_name", "name"):
+            if data.get(key):
+                return str(data[key])
+    return None
+
+
+def _active_product_from_results(results) -> str | None:
+    """从本轮执行结果里取活跃产品（供持久化到短时记忆）。"""
+    for res in reversed(results):
+        data = res.data or {}
+        rec = data.get("recommendation") or {}
+        matches = rec.get("matches") or []
+        if matches and isinstance(matches[-1], dict) and matches[-1].get("name"):
+            return str(matches[-1]["name"])
+        for key in ("product_name", "name"):
+            if data.get(key):
+                return str(data[key])
+    return None
+
+
+# 长时记忆可读 key 白名单：只把低风险、非敏感的事实注入上下文/LLM
+LONG_TERM_READ_KEYS = {"active_product", "risk_preference", "product_preference", "investment_horizon_preference"}
+
+
+def long_term_facts(rows) -> dict:
+    """从长时记忆行里抽白名单内的低风险事实。"""
+    facts: dict[str, str] = {}
+    for row in rows:
+        if getattr(row, "key", None) in LONG_TERM_READ_KEYS and getattr(row, "value", ""):
+            facts[row.key] = str(row.value)
+    return facts
+
+
 class CustomerAgentExecutionService:
     _fallback_semaphores: dict[int, asyncio.Semaphore] = {}
 
@@ -81,6 +129,15 @@ class CustomerAgentExecutionService:
 
     def _fallback_allowlist(self) -> set[str]:
         return {value.strip() for value in self.settings.llm_intent_fallback_allowlist.split(",") if value.strip()}
+
+    def _intent_model_enabled(self) -> bool:
+        """Return whether the model may affect low-risk routing.
+
+        Shadow mode observes only. The execution switch remains separate so
+        transaction/draft paths cannot be enabled accidentally by observability
+        configuration.
+        """
+        return bool(self.settings.llm_intent_fallback_enabled)
 
     def _apply_structured_intent(self, plan, intent: StructuredIntent):
         """Allow only explicitly approved, read/plan-only fallback changes.
@@ -140,7 +197,19 @@ class CustomerAgentExecutionService:
         pending = short_term.get("pending_intent_plan") or {}
         original_query = short_term.get("original_query") or user_query
         combined_query = f"{original_query} {user_query}".strip() if pending.get("tasks") and user_query != original_query else user_query
-        plan = planner.plan(combined_query)
+        # 偏好表态：用户明确自述偏好时，持久化到长时记忆（低风险、可撤销）
+        pref = extract_preference_statement(user_query)
+        if pref:
+            pref_key, pref_value = pref
+            try:
+                await memory.remember(customer_id=customer_id, key=pref_key, value=pref_value, memory_type="conversation_fact", source="customer_stated", conversation_id=conversation_id)
+            except Exception:  # noqa: BLE001 - 记忆失败不阻塞主流程
+                pass
+        # 长时记忆（跨会话）：读取白名单内的低风险事实，补充短时记忆的不足
+        long_term = await memory.load_long_term(customer_id=customer_id)
+        facts = long_term_facts(long_term)
+        active_product = _active_product_from_short_term(short_term) or facts.get("active_product")
+        plan = planner.plan(combined_query, context={"active_product": active_product})
         should_observe = self.settings.llm_intent_shadow_enabled or self.settings.llm_intent_fallback_enabled
         if should_observe:
             provider = None
@@ -152,6 +221,8 @@ class CustomerAgentExecutionService:
                     fallback = LLMIntentFallbackService(provider)
                 rule_structured = self._structured_from_rule_plan(plan)
                 summary = str(short_term.get("conversation_summary") or "")
+                if facts:
+                    summary = (summary + "\n" if summary else "") + f"用户长期事实: {json.dumps(facts, ensure_ascii=False)}"
                 async with self._fallback_semaphore():
                     llm_structured = await asyncio.wait_for(fallback.classify(query=combined_query, conversation_summary=summary), timeout=self.settings.llm_intent_fallback_timeout_seconds)
                 resolved = IntentPolicyResolver().resolve(rule_intent=rule_structured, llm_intent=llm_structured)
@@ -183,9 +254,9 @@ class CustomerAgentExecutionService:
             next_count = clarification_count + 1
             if next_count >= 2:
                 handoff = await CustomerRagHandoffService(self.database).handoff(customer_id=customer_id, query=original_query, intent="unknown", evidence_status="clarification_exhausted", citations=[])
-                await memory.save_short_term(customer_id=customer_id, conversation_id=conversation_id, state={**short_term, "conversation_id": conversation_id, "original_query": original_query, "latest_query": user_query, "clarification_count": next_count, "pending_intent_plan": {}, "clarification": None, "missing_parameter": False, "handoff": handoff})
+                await memory.save_short_term(customer_id=customer_id, conversation_id=conversation_id, state={**short_term, "conversation_id": conversation_id, "original_query": original_query, "latest_query": user_query, "clarification_count": next_count, "pending_intent_plan": {}, "clarification": None, "missing_parameter": False, "handoff": handoff, "active_product": active_product})
                 return CustomerTaskExecutionResponse(conversation_id=conversation_id, overall_status="handoff", answer="为避免反复追问，已为您转接人工客服。", route="customer_service", agents=["CustomerServiceAgent"], results=[], clarification=None, requires_handoff=True, work_order_id=handoff["work_order_id"], ticket_no=handoff["ticket_no"], customer_service_session_id=handoff["customer_service_session_id"], customer_service_session_status=handoff["customer_service_session_status"])
-            await memory.save_short_term(customer_id=customer_id, conversation_id=conversation_id, state={**short_term, "conversation_id": conversation_id, "original_query": original_query, "latest_query": user_query, "clarification_count": next_count, "pending_intent_plan": {"tasks": [item.__dict__ for item in plan.tasks], "execution_modes": sorted({item.execution_mode for item in plan.tasks})}, "clarification": plan.clarification, "missing_parameter": True})
+            await memory.save_short_term(customer_id=customer_id, conversation_id=conversation_id, state={**short_term, "conversation_id": conversation_id, "original_query": original_query, "latest_query": user_query, "clarification_count": next_count, "pending_intent_plan": {"tasks": [item.__dict__ for item in plan.tasks], "execution_modes": sorted({item.execution_mode for item in plan.tasks})}, "clarification": plan.clarification, "missing_parameter": True, "active_product": active_product})
             return CustomerTaskExecutionResponse(conversation_id=conversation_id, overall_status="needs_clarification", answer=plan.clarification, route=route, agents=agents, results=[], clarification=plan.clarification, requires_handoff=plan.requires_handoff)
         results = await CustomerTaskExecutor(self.database).execute(customer_id=customer_id, plan=plan)
         overall, clarification, aggregate_answer = CustomerTaskExecutor.summarize(results, requires_handoff=plan.requires_handoff)
@@ -226,6 +297,13 @@ class CustomerAgentExecutionService:
                     detail=audit_detail,
                 ))
                 await audit_session.commit()
-        state = {**short_term, "conversation_id": conversation_id, "original_query": short_term.get("original_query") or query.strip(), "latest_query": query.strip(), "task_results": [item.__dict__ for item in results], "plan_execution_modes": sorted({item.execution_mode for item in plan.tasks}), "clarification": clarification, "missing_parameter": bool(clarification), "clarification_count": clarification_count, "pending_intent_plan": {}, "handoff": handoff}
+        state = {**short_term, "conversation_id": conversation_id, "original_query": short_term.get("original_query") or query.strip(), "latest_query": query.strip(), "task_results": [item.__dict__ for item in results], "plan_execution_modes": sorted({item.execution_mode for item in plan.tasks}), "clarification": clarification, "missing_parameter": bool(clarification), "clarification_count": clarification_count, "pending_intent_plan": {}, "handoff": handoff, "active_product": _active_product_from_results(results) or active_product}
         await memory.save_short_term(customer_id=customer_id, conversation_id=conversation_id, state=state)
+        # 长时记忆（跨会话）：把本轮出现的活跃产品持久化，供后续新会话消解"那个产品"
+        resolved_product = _active_product_from_results(results) or active_product
+        if resolved_product:
+            try:
+                await memory.remember(customer_id=customer_id, key="active_product", value=resolved_product, memory_type="conversation_fact", source="conversation", conversation_id=conversation_id)
+            except Exception:  # noqa: BLE001 - 记忆失败不阻塞主流程
+                pass
         return CustomerTaskExecutionResponse(conversation_id=conversation_id, overall_status=overall, answer="\n".join(answer_lines) or "当前没有可返回的结果，建议转人工客服。", route=route, agents=agents, results=[TaskExecutionResultResponse(task_id=item.task_id, intent=item.intent, status=item.status, answer=item.answer, data=item.data or {}, error=item.error, clarification=item.clarification) for item in results], clarification=clarification, requires_handoff=needs_handoff, work_order_id=handoff["work_order_id"] if handoff else None, ticket_no=handoff["ticket_no"] if handoff else None, customer_service_session_id=handoff["customer_service_session_id"] if handoff else None, customer_service_session_status=handoff["customer_service_session_status"] if handoff else None)

@@ -28,3 +28,4 @@ from app.models.data_catalog import DataCatalogColumn, DataCatalogDomain, DataCa
 from app.models.customer_service import CustomerServiceSession, CustomerServiceMessage
 
 from app.models.memory import CustomerMemory, CustomerMemoryEvent
+from app.models.bad_case import BadCase

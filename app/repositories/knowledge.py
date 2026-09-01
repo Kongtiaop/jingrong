@@ -8,6 +8,7 @@ from app.db.session import Database
 from app.models.knowledge import KnowledgeBase, KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion
 from app.models.outbox import OutboxEvent
 from app.common.knowledge_scope import KnowledgeScope
+from app.services.understanding_config import understanding_config
 
 
 class KnowledgeRepository:
@@ -88,10 +89,14 @@ class KnowledgeRepository:
             result = await session.execute(select(KnowledgeDocument).where(KnowledgeDocument.id == document_id, KnowledgeDocument.deleted_at.is_(None)))
             return result.scalar_one_or_none()
 
-    async def active_chunk_embeddings_by_hash(self, *, document_id: str) -> dict[str, list[float]]:
-        """Return reusable vectors from the currently active document version."""
+    async def active_chunk_embeddings_by_hash(self, *, document_id: str, embedding_model: str | None = None) -> dict[str, list[float]]:
+        """Return reusable vectors from the currently active document version.
+
+        仅返回可复用的向量（有值）；若给定 embedding_model，只返回**用同一模型**算出的
+        向量——避免 embedding 模型变化后增量入库静默复用不兼容的旧向量。
+        """
         async with self.database.session_factory() as session:
-            result = await session.execute(
+            stmt = (
                 select(KnowledgeChunk.content_hash, KnowledgeChunk.embedding)
                 .join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id)
                 .where(
@@ -101,6 +106,9 @@ class KnowledgeRepository:
                     KnowledgeChunk.embedding.is_not(None),
                 )
             )
+            if embedding_model:
+                stmt = stmt.where(KnowledgeChunk.metadata_json["embedding_model"].astext == embedding_model)
+            result = await session.execute(stmt)
             return {content_hash: embedding for content_hash, embedding in result.all() if embedding is not None}
     async def create_version(self, *, document_id: str, content_hash: str, parser_type: str) -> KnowledgeDocumentVersion:
         async with self.database.session_factory() as session:
@@ -133,9 +141,14 @@ class KnowledgeRepository:
                 await session.execute(update(KnowledgeDocumentVersion).where(KnowledgeDocumentVersion.id == version_id).values(status="failed", error_message=error_message[:4000]))
             await session.commit()
 
-    async def search_hybrid(self, *, query: str, query_embedding: list[float] | None, top_k: int, knowledge_base_id: str | None = None, category: str | None = None, scope: KnowledgeScope | None = None) -> list[tuple[KnowledgeChunk, float]]:
-        """Retrieve independent vector/text candidate lists and fuse them with RRF."""
+    async def search_hybrid(self, *, query: str, query_embedding: list[float] | None, top_k: int, knowledge_base_id: str | None = None, category: str | None = None, scope: KnowledgeScope | None = None, rrf_k: int | None = None) -> list[tuple[KnowledgeChunk, float, float | None]]:
+        """Retrieve independent vector/text candidate lists and fuse them with RRF.
+
+        返回 (chunk, rrf_score, best_cosine_similarity)。rrf_score 是排名融合值（相关/无关都约 0.016），
+        不适合当"证据置信度"；best_cosine_similarity（1-余弦距离，无向量时 None）用于拒答/转人工判定。
+        """
         candidate_k = max(top_k * 4, 20)
+        rrf_k = rrf_k if rrf_k is not None else understanding_config.get_rrf_k()
         async with self.database.session_factory() as session:
             filters = [
                 KnowledgeChunk.status == "active",
@@ -168,33 +181,38 @@ class KnowledgeRepository:
                 .limit(candidate_k)
             )
             text_rows = list((await session.execute(text_statement)).all())
+            # 中文全文检索在 'simple' 配置下不切词，ts_rank 多为 0 → 那些"噪声"文本结果
+            # 会以固定顺序拉满候选池、拖垮 RRF 融合（相关 chunk 反而排不进 top-k）。
+            # 只保留真正有全文命中的文本结果（rank>0）；中文整句无命中则文本分支退空→纯向量。
+            text_rows = [row for row in text_rows if (row.rank or 0) > 0]
 
             vector_rows = []
             if query_embedding:
                 vector_distance = KnowledgeChunk.embedding.cosine_distance(query_embedding)
                 vector_statement = (
-                    select(KnowledgeChunk)
+                    select(KnowledgeChunk, vector_distance.label("dist"))
                     .join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id)
                     .join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id)
                     .where(*filters, KnowledgeChunk.embedding.is_not(None))
                     .order_by(vector_distance.asc())
                     .limit(candidate_k)
                 )
-                vector_rows = list((await session.execute(vector_statement)).scalars().all())
+                vector_rows = [(chunk, float(dist)) for chunk, dist in (await session.execute(vector_statement)).all()]
 
             by_id = {str(chunk.id): chunk for chunk, _ in text_rows}
-            for chunk in vector_rows:
+            for chunk, _ in vector_rows:
                 by_id[str(chunk.id)] = chunk
             text_rank_by_id = {str(chunk.id): rank for rank, (chunk, _) in enumerate(text_rows, start=1)}
-            vector_rank_by_id = {str(chunk.id): rank for rank, chunk in enumerate(vector_rows, start=1)}
+            vector_rank_by_id = {str(chunk.id): rank for rank, (chunk, _) in enumerate(vector_rows, start=1)}
+            vector_sim_by_id = {str(chunk.id): max(0.0, 1.0 - dist) for chunk, dist in vector_rows}
             fused = []
             for chunk_id, chunk in by_id.items():
                 rrf = 0.0
                 if chunk_id in text_rank_by_id:
-                    rrf += 1.0 / (60 + text_rank_by_id[chunk_id])
+                    rrf += 1.0 / (rrf_k + text_rank_by_id[chunk_id])
                 if chunk_id in vector_rank_by_id:
-                    rrf += 1.0 / (60 + vector_rank_by_id[chunk_id])
-                fused.append((chunk, rrf))
+                    rrf += 1.0 / (rrf_k + vector_rank_by_id[chunk_id])
+                fused.append((chunk, rrf, vector_sim_by_id.get(chunk_id)))
             fused.sort(key=lambda item: item[1], reverse=True)
             return fused[:top_k]
 

@@ -66,7 +66,7 @@ services:
         condition: service_healthy
     volumes:
       - ./uploads:/app/uploads
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
     networks:
       - wealth-p0
   outbox-worker:
@@ -213,6 +213,25 @@ services:
       postgres:
         condition: service_healthy
     command: ["python", "-m", "workers.aml_scheduler"]
+    networks:
+      - wealth-p0
+
+  bad-case-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-wealth}:${POSTGRES_PASSWORD:-wealth_dev}@postgres:5432/${POSTGRES_DB:-wealth_manager}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "-m", "workers.bad_case_worker"]
     networks:
       - wealth-p0
 

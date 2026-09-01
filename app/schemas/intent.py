@@ -25,6 +25,18 @@ class StructuredEntity(BaseModel):
     certainty: Literal["explicit", "approximate", "inferred", "missing"] = "missing"
 
 
+class StructuredIntentTask(BaseModel):
+    """A model-understood task; it is still not an execution command."""
+
+    intent: str
+    task_type: Literal["read_only_query", "recommendation", "trade_workflow", "human_handoff", "unknown"] = "unknown"
+    template: IntentTemplateCode = "T0_UNKNOWN"
+    entities: dict[str, StructuredEntity] = Field(default_factory=dict)
+    constraints: list[str] = Field(default_factory=list)
+    requires_clarification: bool = False
+    confidence: float = Field(ge=0, le=1, default=0.0)
+
+
 class StructuredIntent(BaseModel):
     """Constrained model/fallback output. It is never an execution command."""
 
@@ -38,6 +50,7 @@ class StructuredIntent(BaseModel):
     explicit_confirmation: bool = False
     confidence: float = Field(ge=0, le=1)
     source: Literal["rule", "llm_fallback"] = "rule"
+    tasks: list[StructuredIntentTask] = Field(default_factory=list)
 
 
 class IntentTemplate(BaseModel):

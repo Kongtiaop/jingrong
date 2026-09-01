@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,19 +39,60 @@ OPERATION_ACTION_TARGETS = {"赎回": "/customer-center?tab=operations&action=re
 class CustomerTaskExecutor:
     """Plan executor with a bounded, read-only ReAct-style fallback for knowledge tasks."""
 
-    MAX_REACT_ITERATIONS = 3
-    MAX_REACT_TOOL_CALLS = 3
+    MAX_REACT_ITERATIONS = 20
+    MAX_REACT_TOOL_CALLS = 20
     REACT_INTENTS = {"company_info", "company_business", "faq", "workflow", "policy", "risk_public"}
 
-    def __init__(self, database, max_parallel_tasks: int = 4):
+    def __init__(self, database, max_parallel_tasks: int = 4, max_iterations: int | None = None, max_tool_calls: int | None = None):
         self.database = database
         self.tools = CustomerReadTools(database)
         self.max_parallel_tasks = max_parallel_tasks
+        if max_iterations is not None:
+            self.MAX_REACT_ITERATIONS = max_iterations
+        if max_tool_calls is not None:
+            self.MAX_REACT_TOOL_CALLS = max_tool_calls
+        # 有界改写模板：仅在 low_confidence 时逐条尝试；重复结果由 hash 早停兜底
+        self._rewrite_pool = [
+            "请提供官方流程、适用条件和注意事项",
+            "请说明相关制度或流程，并给出依据",
+        ]
+
+    async def _load_preference_facts(self, customer_id: str) -> dict:
+        """读长时记忆里的偏好事实（软排序用，只取低风险白名单 key）。"""
+        from app.services.memory_service import CustomerMemoryService
+        whitelist = {"risk_preference", "product_preference", "investment_horizon_preference"}
+        memory = CustomerMemoryService(self.database, None)
+        rows = await memory.load_long_term(customer_id=customer_id)
+        return {row.key: str(row.value) for row in rows if getattr(row, "key", None) in whitelist and getattr(row, "value", "")}
+
+    @staticmethod
+    def _result_signature(result) -> str:
+        """对工具返回结果做规范化哈希（引用+证据状态+回答），用于检测"重复结果→局部最优/已完成"的早停。"""
+        data = result.data if result.data else {}
+        citations = data.get("citations") or []
+        key = []
+        for c in citations:
+            if isinstance(c, dict):
+                key.append((c.get("chunk_id") or c.get("id") or "", c.get("content") or ""))
+        key.sort(key=lambda x: x[0])
+        canonical = {
+            "citations": key,
+            "evidence_status": data.get("evidence_status"),
+            "answer": result.answer,
+        }
+        return hashlib.sha256(json.dumps(canonical, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
     async def _bounded_react_knowledge(self, *, customer_id: str, item: IntentTask) -> TaskExecutionResult:
-        """Run a deterministic, read-only retrieve→observe→refine loop without storing private reasoning."""
+        """确定性只读 ReAct：硬上限(20) + 结果哈希早停。
+
+        每轮都对工具返回结果算哈希；若某结果之前已出现过（重复 hash）→ 判定进入局部最优 /
+        实际已完成但模型未意识到 → 早停，避免空转。只要结果在变化就继续（最多 20 轮）。
+        """
         attempts: list[dict[str, object]] = []
+        seen_results: set[str] = set()
         query = item.query.strip()
+        result = None
+        rewrite_index = 0
         for iteration in range(1, self.MAX_REACT_ITERATIONS + 1):
             if len(attempts) >= self.MAX_REACT_TOOL_CALLS:
                 break
@@ -65,12 +108,16 @@ class CustomerTaskExecutor:
                 "iteration": iteration,
                 "success": result.success,
                 "error": result.error,
-                "evidence_status": result.data.get("evidence_status"),
+                "evidence_status": result.data.get("evidence_status") if result.data else None,
             })
+            # 结果哈希早停：任意两轮结果相同 → 无进展
+            sig = self._result_signature(result)
+            if sig in seen_results:
+                attempts[-1]["early_stop"] = "repeated_result"
+                break
+            seen_results.add(sig)
             if result.success:
-                final_answer = result.answer
-                generation_status = "not_generated"
-                citations = result.data.get("citations", [])
+                citations = result.data.get("citations", []) if result.data else []
                 if citations:
                     from app.services.customer_rag_service import CustomerRagResult
                     from app.services.knowledge_retrieval import KnowledgeCitation
@@ -83,30 +130,27 @@ class CustomerTaskExecutor:
                         message=result.answer,
                     )
                     generated = await CustomerRagAnswerService(QwenProvider(get_settings())).generate(query=item.query, result=rag_result)
-                    final_answer = generated.answer
-                    generation_status = generated.generation_status
-                return TaskExecutionResult(
-                    item.task_id,
-                    item.intent,
-                    "succeeded",
-                    answer=final_answer,
-                    data={**result.data, "generation_status": generation_status, "execution_mode": "bounded_react", "tool_calls": attempts},
-                )
-            # A low-confidence first retrieval receives exactly one query refinement; other failures
-            # must clarify or hand off rather than letting the agent keep probing.
-            if iteration == 1 and result.error == "low_confidence" and query != item.query.strip():
-                break
-            if iteration == 1 and result.error == "low_confidence":
-                query = f"{item.query.strip()} 请提供官方流程、适用条件和注意事项"
+                    return TaskExecutionResult(
+                        item.task_id,
+                        item.intent,
+                        "succeeded",
+                        answer=generated.answer,
+                        data={**result.data, "generation_status": generated.generation_status, "execution_mode": "bounded_react", "tool_calls": attempts},
+                    )
+                break  # success 但无引用 → 无法生成
+            # 失败（low_confidence）→ 尝试下一种有界改写（重复结果由早停兜底）
+            if result.error == "low_confidence" and rewrite_index < len(self._rewrite_pool):
+                query = f"{item.query.strip()} {self._rewrite_pool[rewrite_index]}"
+                rewrite_index += 1
                 continue
             break
         return TaskExecutionResult(
             item.task_id,
             item.intent,
             "needs_clarification",
-            answer=result.answer if "result" in locals() else "当前资料不足。",
+            answer=result.answer if result else "当前资料不足。",
             data={"execution_mode": "bounded_react", "tool_calls": attempts},
-            error=result.error if "result" in locals() else "tool_budget_exhausted",
+            error=result.error if result else "tool_budget_exhausted",
             clarification="当前资料不足，可以补充问题或转人工客服。",
         )
 
@@ -136,6 +180,20 @@ class CustomerTaskExecutor:
             if is_purchase and recommendation_result is not None:
                 recommendation = (recommendation_result.data or {}).get("recommendation", {})
                 matches = recommendation.get("matches") or []
+                if not matches:
+                    return TaskExecutionResult(
+                        item.task_id, item.intent, "needs_clarification",
+                        answer="当前没有可直接推荐的适配产品，请先补充风险偏好、投资期限或转人工客服。",
+                        data={
+                            "operation": "申购",
+                            "recommended_purchase": True,
+                            "recommendation": recommendation,
+                            "explicit_amount_text": item.query,
+                            "confirmation_required": True,
+                            "executed": False,
+                        },
+                        clarification="当前没有通过适当性匹配的产品；系统不会自动选择产品或创建订单。",
+                    )
                 return TaskExecutionResult(
                     item.task_id, item.intent, "needs_clarification",
                     answer="已完成适当性推荐。请从推荐产品中明确选择一个产品后，再为您生成申购草稿。",
@@ -160,7 +218,9 @@ class CustomerTaskExecutor:
                 asset_service=AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets),
             )
             async with self.database.session_factory() as session:
-                recommendation = await suitability.recommend(session, customer_id)
+                # 长时记忆偏好（软排序，不改变适当性硬门禁）
+                preferences = await self._load_preference_facts(customer_id)
+                recommendation = await suitability.recommend(session, customer_id, preferences=preferences)
             return TaskExecutionResult(
                 item.task_id, item.intent, "succeeded",
                 answer="根据当前风险测评、客户类型和资产门槛，以下产品通过适当性匹配。",

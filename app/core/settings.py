@@ -30,7 +30,10 @@ class Settings(BaseSettings):
     dashscope_api_key: str = Field(default="", repr=False)
     qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     qwen_chat_model: str = "qwen-plus"
-    qwen_embedding_model: str = "qwen3.7-text-embedding"
+    qwen_max_model: str = "qwen-max"   # LLM-as-judge 用更强模型（judge ≠ 生成模型，减少自评偏置）
+    # 与 docker 生产一致：真实 DashScope 通义千问 embedding 模型。旧默认 "qwen3.7-text-embedding"
+    # 非真实模型名，曾导致入库向量与 API 查询向量模型不一致（向量检索失效）。必须与重嵌入用同一模型。
+    qwen_embedding_model: str = "text-embedding-v4"
     embedding_dimension: int = 1024
     embedding_smoke_check: bool = False
     llm_intent_fallback_enabled: bool = False

@@ -101,3 +101,23 @@ def test_fallback_concurrency_limit_is_at_least_one():
     )
     service = CustomerAgentExecutionService(SimpleNamespace(session_factory=FakeFactory()), None, settings=settings)
     assert service._fallback_semaphore()._value == 1
+
+
+def test_model_execution_switch_is_separate_from_shadow_switch():
+    observed_only = SimpleNamespace(
+        llm_intent_shadow_enabled=True, llm_intent_fallback_enabled=False,
+        llm_intent_fallback_timeout_seconds=1,
+        llm_intent_fallback_allowlist="T1_INFORMATION_QUERY",
+        llm_intent_fallback_max_concurrency=1,
+    )
+    service = CustomerAgentExecutionService(SimpleNamespace(session_factory=FakeFactory()), None, settings=observed_only)
+    assert service._intent_model_enabled() is False
+
+    enabled = SimpleNamespace(
+        llm_intent_shadow_enabled=True, llm_intent_fallback_enabled=True,
+        llm_intent_fallback_timeout_seconds=1,
+        llm_intent_fallback_allowlist="T1_INFORMATION_QUERY",
+        llm_intent_fallback_max_concurrency=1,
+    )
+    service = CustomerAgentExecutionService(SimpleNamespace(session_factory=FakeFactory()), None, settings=enabled)
+    assert service._intent_model_enabled() is True

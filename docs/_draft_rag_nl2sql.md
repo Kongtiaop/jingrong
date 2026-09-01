@@ -22,7 +22,7 @@
 ### 1.3 Embedding（`app/infrastructure/qwen.py::embed` L61-91）
 
 - 调用 DashScope OpenAI 兼容端点（`app/core/settings.py` L31 `qwen_base_url=https://dashscope.aliyuncs.com/compatible-mode/v1`），`model = settings.qwen_embedding_model`（L77），**强制 `dimensions=1024`**（L79，`settings.embedding_dimension`；`settings.validate_p0` L83-84 校验必须等于 1024）。
-- **模型名要如实说**：代码默认值（`app/core/settings.py` L33）是 `qwen3.7-text-embedding`；`.env.example` L16 声明的是 `QWEN_EMBEDDING_MODEL=text-embedding-v4`；实际 `.env` **没有**覆盖该项，所以当前运行态是默认 `qwen3.7-text-embedding`。两者都是 Qwen/DashScope 系 embedding，**1024 维是硬约束**（库表 `VECTOR(1024)`、Milvus `dim=1024`、`QwenProvider.embed` L89-90 校验返回维度，不符直接抛 `ValueError`）。答辩话术：**"Embedding 走 DashScope Qwen 系模型（text-embedding-v4 / qwen3.7-text-embedding 可配），统一 1024 维，维度不符直接抛错。"**
+- **模型名要如实说**：统一用 **`text-embedding-v4`**（`settings.py` 默认、`.env.example`、docker-compose 三者一致）。旧默认 `qwen3.7-text-embedding` 非真实 DashScope 模型名、已废弃（曾导致入库向量与 API 查询向量模型不一致）。**1024 维是硬约束**（库表 `VECTOR(1024)`、Milvus `dim=1024`、`QwenProvider.embed` 校验返回维度，不符直接抛 `ValueError`）。答辩话术：**"Embedding 走 DashScope Qwen 系 `text-embedding-v4`，统一 1024 维，维度不符直接抛错。"**
 - 实现细节：**一次请求只嵌一条文本**（L66-68 注释：DashScope 对多输入会重置连接；逐条发送保证顺序确定，牺牲吞吐换确定性）；每条最多重试 3 次（L74-85）；返回条数必须等于入参（`knowledge_ingestion.py` L68-69）。ingestion 侧按 **batch=4** 分组调 embed（`knowledge_ingestion.py` L65-66）。
 
 ### 1.4 存储（pgvector）

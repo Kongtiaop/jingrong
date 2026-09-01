@@ -56,12 +56,12 @@ API 层 `app/api/customer_service.py` 有三个调用点，全部汇聚到同一
 
 | 文件 | 状态 | 证据 |
 |---|---|---|
-| `app/agents/graph.py` | **纯占位** | 类 docstring 原文（`graph.py:12-17`）："P0 LangGraph wiring placeholder. P0 only validates that the state graph can be constructed. Domain Agent nodes and tools are added from P1/P2/P3." `supervisor_node` 只做 `iteration_count+1`（`graph.py:23-24`）；`build()` 只有 START→supervisor→END 两个节点（`graph.py:26-30`）；`max_iterations/max_tool_calls` 参数（`graph.py:19`）在节点内从未使用。除 `app/agents/__init__.py` 导出外无任何调用点。 |
+| `app/agents/graph.py` | **2026-08-29 已从占位升级为真实 StateGraph**（intent_plan→route→澄清分支→execute→summarize，节点复用确定性 handler、有单测 `tests/test_agent_graph.py`）；生产默认仍走确定性管线，二者共享 handler。下方历史占位描述仅作演进记录 | 原占位 docstring（`graph.py:12-17`）："P0 LangGraph wiring placeholder. P0 only validates that the state graph can be constructed. Domain Agent nodes and tools are added from P1/P2/P3." `supervisor_node` 只做 `iteration_count+1`（`graph.py:23-24`）；`build()` 只有 START→supervisor→END 两个节点（`graph.py:26-30`）；`max_iterations/max_tool_calls` 参数（`graph.py:19`）在节点内从未使用。除 `app/agents/__init__.py` 导出外无任何调用点。 |
 | `app/agents/orchestrator.py` | **基础设施/规划** | `AgentOrchestrator` 只是 name→Agent 的字典注册表（`orchestrator.py:6-13`），run 对未注册 Agent 返回 `AgentResult(status="error", summary="agent not registered")`（`orchestrator.py:15-18`）。未接入客服运行时。 |
 | `app/ports/agent.py` | **真实接口契约** | `Agent` Protocol（`name` + `async run(message, context) -> AgentResult`，`agent.py:13-15`）、`AgentContext` dataclass（`agent.py:7-11`）——为未来 P1/P2/P3 的 Supervisor 多 Agent 预留的端口；P0 的客服路径并不通过它。 |
 | `app/services/intent_templates.py` | **真实注册表** | 11 个模板的 `IntentTemplate` 字典（`intent_templates.py:6-18`），定义 execution_mode/required_fields/prohibited_actions，供策略与后续执行参考；`get_template` 兜底 T0_UNKNOWN（`:21-22`）。 |
 
-**结论**：P0 的真实链路完全不走 LangGraph / AgentOrchestrator，是一条**确定性管线**：`api/customer_service.py → CustomerAgentExecutionService.execute → CustomerIntentPlanner.plan → CustomerTaskExecutor.execute → CustomerReadTools.execute → CustomerQueryRouter.route`。graph.py 只是"图可构建"的自检占位。
+**结论**：生产真实链路走**确定性管线**：`api/customer_service.py → CustomerAgentExecutionService.execute → CustomerIntentPlanner.plan → CustomerTaskExecutor.execute → CustomerReadTools.execute → CustomerQueryRouter.route`。LangGraph 真图已实现可运行（见上），但生产默认不走它——二者共享 handler，图作为编排表达。
 
 ---
 

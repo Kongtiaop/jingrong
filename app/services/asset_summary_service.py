@@ -43,7 +43,6 @@ class AssetSummaryService:
 
     async def latest_or_derived(self, session: AsyncSession, user_id: str) -> CustomerAssetSnapshot:
         now = datetime.now(timezone.utc)
-        values = await self.calculate(session, user_id, revalue=True)
         day_start = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
         day_end = datetime.combine(now.date(), datetime.max.time(), tzinfo=timezone.utc)
         # Historical event/daily snapshots are immutable. Only a same-day derived snapshot may be refreshed on read.
@@ -55,21 +54,18 @@ class AssetSummaryService:
                 CustomerAssetSnapshot.snapshot_time < day_end,
             ).order_by(CustomerAssetSnapshot.snapshot_time.desc(), CustomerAssetSnapshot.id.desc()).limit(1)
         )).scalars().first()
-        if latest is None:
-            latest = CustomerAssetSnapshot(
-                id=str(uuid4()),
-                user_id=user_id,
-                source_type='derived',
-                snapshot_time=now,
-                created_at=now,
-                **values,
-            )
-            await self.assets.save(session, latest)
-        else:
-            for key, value in values.items():
-                setattr(latest, key, value)
-            latest.snapshot_time = now
-            if latest.created_at is None:
-                latest.created_at = now
-            await self.assets.update_values(session, latest)
+        if latest is not None:
+            # 复用当日派生快照，避免每次读都全量重估（account+holdings+assets 多次 DB 往返）
+            return latest
+        # 无当日快照才做完整计算
+        values = await self.calculate(session, user_id, revalue=True)
+        latest = CustomerAssetSnapshot(
+            id=str(uuid4()),
+            user_id=user_id,
+            source_type='derived',
+            snapshot_time=now,
+            created_at=now,
+            **values,
+        )
+        await self.assets.save(session, latest)
         return latest

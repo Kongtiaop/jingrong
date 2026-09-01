@@ -23,7 +23,7 @@ class IntentPolicyResolver:
             return self._merge_constraints(rule_intent, llm_intent)
         # Do not let an ambiguous deterministic interpretation become a state-changing workflow
         # solely because the model inferred a product/transaction from missing conversational context.
-        if rule_intent.template == "T0_UNKNOWN" and llm_intent.template in {"T3_RECOMMEND_THEN_PURCHASE_DRAFT", "T4_PURCHASE_DRAFT", "T9_MODIFY_DRAFT", "T10_CANCEL_DRAFT"}:
+        if rule_intent.template == "T0_UNKNOWN" and llm_intent.template in {"T2_PRODUCT_RECOMMENDATION", "T3_RECOMMEND_THEN_PURCHASE_DRAFT", "T4_PURCHASE_DRAFT", "T9_MODIFY_DRAFT", "T10_CANCEL_DRAFT"}:
             return rule_intent.model_copy(update={
                 "constraints": sorted(set(rule_intent.constraints) | {"must_not_submit_without_verified_customer_confirmation", "must_not_auto_select_product"}),
                 "requires_clarification": True,

@@ -26,8 +26,12 @@ def evaluate_case(case, result):
     if result.template != case["expected_template"]:
         failures.append(f"template:{result.template}")
     # Template is the executable routing contract; model-owned free-form labels are diagnostic only.
-    if result.source != "llm_fallback" and result.primary_intent != case["expected_primary"]:
+    expected_primary = case["expected_primary"]
+    if result.source != "llm_fallback" and result.primary_intent != expected_primary:
         failures.append(f"primary:{result.primary_intent}")
+    if result.source == "llm_fallback" and result.template == case["expected_template"]:
+        # LLM labels are diagnostic, while the template is the stable routing contract.
+        pass
     amount = result.entities.get("amount")
     actual_amount = amount.value if amount else None
     expected_amount = case.get("expected_amount")
@@ -41,6 +45,18 @@ def evaluate_case(case, result):
     return failures
 
 
+def security_flags(case, result):
+    flags = []
+    if result.template in {"T3_RECOMMEND_THEN_PURCHASE_DRAFT", "T4_PURCHASE_DRAFT"}:
+        if result.explicit_confirmation:
+            flags.append("model_claimed_confirmation")
+        if "must_not_submit_without_verified_customer_confirmation" not in result.constraints:
+            flags.append("missing_trade_confirmation_guard")
+    if "must_not_auto_select_product" in case.get("required_constraints", []) and "must_not_auto_select_product" not in result.constraints:
+        flags.append("missing_no_auto_select_guard")
+    return flags
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture", default="tests/fixtures/complex_customer_intent_cases.json")
@@ -51,7 +67,8 @@ async def main() -> int:
     baseline = []
     for case in cases:
         result = rule_intent(case["query"])
-        baseline.append({"id": case["id"], "failures": evaluate_case(case, result), "template": result.template, "primary_intent": result.primary_intent})
+        failures = evaluate_case(case, result)
+        baseline.append({"id": case["id"], "failures": failures, "security_flags": security_flags(case, result), "template": result.template, "primary_intent": result.primary_intent})
     report = {"fixture": args.fixture, "case_count": len(cases), "baseline_failures": sum(bool(row["failures"]) for row in baseline), "baseline": baseline, "live": False}
     if args.live:
         settings = get_settings()
@@ -64,12 +81,16 @@ async def main() -> int:
                 try:
                     candidate = await fallback.classify(query=case["query"])
                     resolved = IntentPolicyResolver().resolve(rule_intent=rule, llm_intent=candidate)
-                    live_rows.append({"id": case["id"], "failures": evaluate_case(case, resolved), "template": resolved.template, "primary_intent": resolved.primary_intent, "source": resolved.source})
+                    live_rows.append({"id": case["id"], "failures": evaluate_case(case, resolved), "security_flags": security_flags(case, resolved), "template": resolved.template, "primary_intent": resolved.primary_intent, "source": resolved.source})
                 except Exception as exc:
                     live_rows.append({"id": case["id"], "error": f"{type(exc).__name__}: {exc}"})
             report["live"] = True
             report["live_results"] = live_rows
             report["live_failures"] = sum(bool(row.get("failures") or row.get("error")) for row in live_rows)
+            report["live_model_source_count"] = sum(row.get("source") == "llm_fallback" for row in live_rows)
+            report["live_rule_source_count"] = sum(row.get("source") == "rule" for row in live_rows)
+            report["live_template_match_rate"] = sum(not row.get("failures") and not row.get("error") for row in live_rows) / len(live_rows) if live_rows else 0
+            report["live_security_flag_count"] = sum(len(row.get("security_flags", [])) for row in live_rows)
         finally:
             await provider.close()
     output = Path(args.output)

@@ -60,6 +60,10 @@ class CustomerQueryRouter:
     async def route(self, *, session, customer_id: str, query: str, entities: dict[str, str] | None = None) -> CustomerQueryRouteResult | None:
         route = self.detect_route(query)
         if route is None:
+            # 裸产品评估句（如"现金管理保本计划靠谱吗"）：兜底路由到产品状态
+            from app.services.customer_intent import is_bare_product_assessment
+            if is_bare_product_assessment(query):
+                return await self._product_status(session=session, query=query, product_name=(entities or {}).get("product_name"))
             return None
         if route == "workorder_status":
             return await self._workorders(session=session, customer_id=customer_id, ticket_no=(entities or {}).get("ticket_no"))

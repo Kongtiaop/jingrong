@@ -116,11 +116,11 @@ async def search_knowledge(request: Request, payload: KnowledgeSearchRequest, _u
         pairs = await repository.search_hybrid(query=payload.query, query_embedding=query_embedding[0], top_k=payload.top_k, knowledge_base_id=payload.knowledge_base_id, category=payload.category)
         mode = "hybrid-ftS-pgvector"
     except Exception:
-        pairs = [(hit, 1.0) for hit in await repository.search_text(query=payload.query, top_k=payload.top_k, knowledge_base_id=payload.knowledge_base_id, category=payload.category)]
+        pairs = [(hit, 1.0, None) for hit in await repository.search_text(query=payload.query, top_k=payload.top_k, knowledge_base_id=payload.knowledge_base_id, category=payload.category)]
         mode = "text-ilike-fallback"
     finally:
         await provider.close()
-    response = KnowledgeSearchResponse(query=payload.query, retrieval_mode=mode, embedding_dimension=request.app.state.settings.embedding_dimension, hits=[{"id": str(hit.id), "content": hit.content, "title_path": hit.title_path, "document_id": str(hit.document_id), "version_id": str(hit.version_id), "chunk_index": hit.chunk_index, "score": score, "metadata": hit.metadata_json} for hit, score in pairs])
+    response = KnowledgeSearchResponse(query=payload.query, retrieval_mode=mode, embedding_dimension=request.app.state.settings.embedding_dimension, hits=[{"id": str(hit.id), "content": hit.content, "title_path": hit.title_path, "document_id": str(hit.document_id), "version_id": str(hit.version_id), "chunk_index": hit.chunk_index, "score": score, "metadata": hit.metadata_json} for hit, score, _ in pairs])
     return ApiResponse(data=response, trace_id=get_trace_id())
 
 

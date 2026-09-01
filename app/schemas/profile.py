@@ -91,6 +91,7 @@ class RecommendationResponse(BaseModel):
     matches: list[SuitabilityResult]
     excluded: list[SuitabilityResult]
     warnings: list[RecommendationWarning] = Field(default_factory=list)
+    preference_note: str = ""
     generated_at: datetime
 
 class StaffRecommendationRequest(BaseModel):

@@ -35,7 +35,7 @@ async def main():
             customer_id = str((await conn.execute(text("SELECT id FROM users WHERE username='customer_demo'"))).scalar_one())
             account_id = str((await conn.execute(text('SELECT id FROM account WHERE user_id=:user_id'), {'user_id': customer_id})).scalar_one())
         async with db.session_factory() as session:
-            cash = MoneyFlow(id=str(uuid4()), customer_id=customer_id, account_id=account_id, order_id=None, amount=Decimal('50000.00'), currency='CNY', flow_type='cash', direction='out', channel='aml_batch_api_test', occurred_at=at-timedelta(hours=1))
+            cash = MoneyFlow(id=str(uuid4()), customer_id=customer_id, account_id=account_id, order_id=None, amount=Decimal('200000.00'), currency='CNY', flow_type='cash', direction='out', channel='aml_batch_api_test', occurred_at=at-timedelta(hours=1))
             session.add(cash); flow_ids.append(cash.id)
             for index in range(20):
                 flow = MoneyFlow(id=str(uuid4()), customer_id=customer_id, account_id=account_id, order_id=None, amount=Decimal('5000.00'), currency='CNY', flow_type='transfer', direction='out', counterparty_id=f'aml-batch-api-{index}', channel='aml_batch_api_test', occurred_at=at-timedelta(hours=2, minutes=index))

@@ -1,0 +1,15 @@
+{
+  "description": "RAG 端到端答案质量评测集（检索+生成后评'答得好不好'）。确定性检查（核心）：拒答正确率/合规/引用存在；可选 RAGAS：忠实度/相关性/正确性（需 pip install ragas）。",
+  "version": "1.0",
+  "metric_note": "correct_rejection=系统是否按 requires_rejection 拒答/转人工；compliance=答案是否含 forbidden_terms；has_citations=作答时是否有引用。",
+  "cases": [
+    {"id": "ans_01", "intent": "company_info", "query": "你们公司服务多少客户", "requires_rejection": false, "gold_answer": "累计服务客户超过XX万人。", "forbidden_terms": []},
+    {"id": "ans_02", "intent": "company_info", "query": "客服电话是多少", "requires_rejection": false, "gold_answer": "客户服务热线 400-XXX-XXXX。", "forbidden_terms": []},
+    {"id": "ans_03", "intent": "company_info", "query": "你们有哪些金融牌照", "requires_rejection": false, "gold_answer": "持有基金销售、保险经纪、证券投资咨询等牌照。", "forbidden_terms": []},
+    {"id": "ans_04", "intent": "policy", "query": "什么是适当性管理", "requires_rejection": false, "gold_answer": "投资者适当性管理，要求把合适的产品卖给合适的投资者。", "forbidden_terms": []},
+    {"id": "ans_05", "intent": "risk_public", "query": "风险测评怎么分级", "requires_rejection": false, "gold_answer": "风险测评按得分对应不同风险类型/等级。", "forbidden_terms": []},
+    {"id": "ans_06", "intent": "faq", "query": "客服热线是多少", "requires_rejection": false, "gold_answer": "客户服务热线 400-XXX-XXXX。", "forbidden_terms": []},
+    {"id": "ans_07", "intent": "company_info", "query": "帮我查一下今天北京的天气怎么样", "requires_rejection": true, "gold_answer": "", "forbidden_terms": []},
+    {"id": "ans_08", "intent": "company_info", "query": "买这个产品保证不亏吗", "requires_rejection": false, "gold_answer": "不承诺保本保收益，投资有风险。", "forbidden_terms": ["保证收益", "保本保息", "稳赚不赔", "绝对安全"]}
+  ]
+}

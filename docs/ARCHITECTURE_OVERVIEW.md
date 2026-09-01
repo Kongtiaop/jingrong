@@ -1,8 +1,10 @@
 # 智能财富管家整体架构说明
 
-> 文档版本：v1.0
-> 更新日期：2026-07-31
+> 文档版本：v1.1
+> 更新日期：2026-07-31（v1.1 补记：2026-08-28）
 > 系统定位：可运行、可演示、可扩展的财富管理 Mock/MVP 系统
+
+> **【2026-08-28 补记】本说明新增章节：§15 受控 NL2SQL 与数据目录、§16 分层记忆实现、§17 异步可靠性（Outbox/Streams/Worker）、§18 客服实时链路补全、§19 受控子代理并行（设计）、§20 数据飞轮。数据库具体表结构以 `docs/DATABASE_TABLE_REFERENCE.md` 为准（50 张表）。**
 
 ## 1. 架构目标
 
@@ -406,7 +408,7 @@ VectorStore
 | MySQL 8 | 迁移验证 | 隔离容器 |
 | Redis | 会话、缓存、Streams、Outbox | 使用中 |
 | Milvus | 向量迁移验证 | 已连接 |
-| Qwen/DashScope | Embedding 和模型入口 | 配置中 |
+| Qwen/DashScope | Embedding 和模型入口 | 配置中（对应蚂蚁百灵商用模型：qwen-turbo↔Ling-tiny、qwen-plus↔Ling-flash、qwen-max↔Ring）|
 | Docker | 基础设施隔离 | 使用中 |
 
 ## 11. 配置抽象
@@ -509,3 +511,44 @@ paused
 ### 坐席交互边界
 
 坐席从待接入队列 claim 成功后进入专注实时对话窗口。坐席后台不显示统一 Agent 气泡；统一气泡仅是客户侧未来 Supervisor 的单一入口，避免与人工坐席会话状态机混用。
+
+---
+
+## 15. 受控 NL2SQL 与数据目录
+
+- **核心策略**：不让模型自由生成 SQL，采用"数据目录召回 + 批准模板 + 参数契约 + 只读执行"，`nl2sql_ready=False` 明确关闭自由 SQL。
+- **数据目录**：`data_catalog_domain/table/column/relation/example_query/revision` 六表；表/列/示例带 `VECTOR(1024)` 语义向量；目录检索文本+向量混合 + `allowed_roles_json` 角色过滤 + `retrieval_mode` 可观测。
+- **安全四层**：①入口只收自然语言（直接 SELECT 拒）；②模板白名单（`is_approved` + 角色 + 只读结构校验）；③目录引用范围（SQL 引用表/列 ⊆ 模板声明 ⊆ 活跃可查询目录非敏感列）；④执行层 SQLAlchemy 绑定参数 + 外层 LIMIT + 失败 rollback。
+- **实现**：`app/services/data_analysis_agent.py`、`nl2sql_policy.py`、`data_catalog_service.py`。
+
+## 16. 分层记忆实现
+
+- **短期（Redis）**：key=`customer:memory:short:{customer_id}:{conversation_id}`，TTL 30 分钟，存澄清上下文/待执行计划/转人工状态；已接入 Agent。
+- **长期（PG）**：`CustomerMemory`（记忆卡片，部分唯一索引同 key 一条 active）+ `CustomerMemoryEvent`（事件审计）；服务已实现、链路 P3 接线。
+- **边界**：业务事实表永远高于记忆；只存客户确认参数/偏好/非敏感事实。
+- **演进（P3）**：版本化卡片（valid_from/valid_to）+ 乐观锁（if_version）+ 记忆污染过滤，对齐 Claude Opus 5 记忆文件系统。
+
+## 17. 异步可靠性（Outbox / Redis Streams / Worker）
+
+- **Outbox**：业务与 `outbox_event` 同事务提交；`outbox_worker` 用 `FOR UPDATE SKIP_LOCKED` 认领 → 发布到 Redis Stream → 至少一次 + 幂等消费 + 死信重试。
+- **Redis Streams**：`XREADGROUP` 消费组 + `XCLAIM` 30s 崩溃接管 + `MAXLEN ~10000`。
+- **Worker**：`knowledge`/`notification`/`authorization`/`tasks` 流消费者；`aml_scheduler`/`customer_service_timeout` 定时轮询；`runner` 通用任务执行器（业务分发占位，P4 补全）。
+- **AsyncTask**：任务状态机 queued→running→success/failed/dead + 幂等 + 死信。
+
+## 18. 客服实时链路补全
+
+- 事实源在 PG（`customer_service_message`），在线用 Redis Pub/Sub（`customer-realtime:{customer_id}`）+ WebSocket 低延迟，断线用 HTTP `messages?after=` 增量补偿。
+- 会话状态机：`waiting_human → human_active → paused → resolved/closed/expired`；心跳/超时由 worker 处理。
+
+## 19. 受控子代理并行（设计，见 `docs/受控子代理并行层设计方案.md`）
+
+- **原则**：部分领域可并行（只读分析），严格场景必须确定性。
+- 可并行：风控只读分析/产品解释/RAG 检索/画像分析（`SubagentExecutor` + 只读工具 + 并发信号量 + 结构化结果 + 确定性融合）。
+- **绝不并行**：订单/资金/赎回/风控结论/写操作——走确定性 Service + 人工。
+- 安全：只读工具强制、RBAC+capability、SubjectScope 数据范围注入、三重预算、审计、失败降级。
+
+## 20. 数据飞轮（改运行时不改代码，见 `docs/Agent & RAG 数据飞轮：从规划到落地.md`）
+
+- 信号（评测 Bad Case）→ 积累（记忆/Skill）→ 落地（配置库）→ 控制（人机审核/灰度/回滚）→ 回流评测。
+- 已有基础：Bad Case 收集（6 类）、回归集、100% 审计、证据状态门禁、动态模型路由。
+- 原则："评测可信度 > 系统复杂度"；先保证评测信号准，再谈自动化。

@@ -36,8 +36,8 @@ async def main() -> None:
             risk = await execute(RISK, "我的账户是否有风险限制", "/backoffice")
             super_admin_operation = await execute(SUPER_ADMIN, "我要赎回产品", "/backoffice")
 
-            assert customer_advice["available_agents"] == ["CustomerServiceAgent"], customer_advice
-            assert customer_advice["agents"] == ["CustomerServiceAgent"], customer_advice
+            assert set(customer_advice["available_agents"]) == {"CustomerServiceAgent", "CustomerRecommendationCapability", "CustomerTradeDraftCapability", "CustomerRiskExplanationCapability"}, customer_advice
+            assert customer_advice["route"] == "customer_recommendation" and customer_advice["agents"] == ["CustomerRecommendationCapability"], customer_advice
             assert "AdvisorAgent" in customer_advice["denied_agents"], customer_advice
             assert advisor_advice["available_agents"] == ["DataAnalysisAgent", "AdvisorAgent"], advisor_advice
             assert advisor_advice["route"] == "advisor_risk" and advisor_advice["agents"] == ["AdvisorAgent"], advisor_advice

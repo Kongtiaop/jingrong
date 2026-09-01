@@ -26,11 +26,14 @@ class RiskAlertService:
         current = next((f for f in flows if f.order_id == order.id), None)
         if current is None:
             return []
+        # 产品申购/购买（wealth_order）是投资行为，不是可疑资金划转，不进入 AML 结构可疑监测
+        if getattr(current, "channel", "") == "wealth_order":
+            return []
         history = [f for f in flows if f.id != current.id]
         alerts = []
         cash_total = sum((Decimal(str(f.amount)) for f in flows if start_day <= f.occurred_at < end_day and f.flow_type == "cash"), Decimal("0"))
-        if current.flow_type == "cash" and Decimal(str(current.amount)) >= Decimal("50000") and cash_total >= Decimal("50000"):
-            alert = await self._save_alert(session, order, "RW-001", {"cash_daily_amount": str(cash_total), "threshold": "50000", "flow_type": "cash"})
+        if current.flow_type == "cash" and Decimal(str(current.amount)) >= Decimal("200000") and cash_total >= Decimal("200000"):
+            alert = await self._save_alert(session, order, "RW-001", {"cash_daily_amount": str(cash_total), "threshold": "200000", "flow_type": "cash"})
             if alert: alerts.append(alert)
         small = [f for f in history if f.occurred_at >= start_7d and f.direction == "out" and f.flow_type == "transfer" and Decimal(str(f.amount)) < Decimal("200000")]
         if current.flow_type == "transfer" and len(small) >= 19 and sum((Decimal(str(f.amount)) for f in small), Decimal("0")) + Decimal(str(current.amount)) >= Decimal("100000"):
@@ -74,6 +77,8 @@ class RiskAlertService:
         start = window_end - timedelta(days=days)
         end = window_end
         flows = await self.uow.money_flows.list_window(session, customer_id, start, end)
+        # 产品申购/购买（wealth_order）是投资行为，不是可疑资金划转，不参与 AML 评估
+        flows = [f for f in flows if getattr(f, "channel", "") != "wealth_order"] if flows else []
         if not flows:
             return []
         inbound = [f for f in flows if f.direction == "in" and f.flow_type == "transfer"]
@@ -84,12 +89,13 @@ class RiskAlertService:
         # RW-001/RW-002 are evaluated in both paths. The real-time order path detects
         # an immediately materializing event; this window scan is a daily reconciliation
         # job and carries an explicit UTC scan window for deterministic replay/deduplication.
-        cash = [f for f in flows if f.flow_type == "cash"]
+        # RW-001: 单日大额现金（按扫描日统计，避免同一笔现金跨窗口重复告警）
+        cash = [f for f in flows if f.flow_type == "cash" and (end - timedelta(days=1)) <= f.occurred_at < end]
         cash_total = total(cash)
-        if cash_total >= Decimal("50000"):
+        if cash_total >= Decimal("200000"):
             alert = await self._save_window_alert(session, customer_id, "RW-001", {
                 "window_start": start.isoformat(), "window_end": end.isoformat(),
-                "cash_daily_amount": str(cash_total), "threshold": "50000", "flow_type": "cash",
+                "cash_daily_amount": str(cash_total), "threshold": "200000", "flow_type": "cash",
             })
             if alert: created.append(alert)
         small_transfers = [f for f in outbound if Decimal(str(f.amount)) < Decimal("200000")]
@@ -158,7 +164,7 @@ class RiskAlertService:
         day_total = total(day_flows)
         if income is not None:
             income = Decimal(str(income))
-            if income > 0 and day_total >= Decimal("100000") and day_total >= income * Decimal("3"):
+            if income > 0 and day_total >= Decimal("300000") and day_total >= income * Decimal("3"):
                 alert = await self._save_window_alert(session, customer_id, "RW-006", {
                     "window_start": start.isoformat(), "window_end": end.isoformat(),
                     "day_start": day_start.isoformat(), "day_end": end.isoformat(),
@@ -199,7 +205,8 @@ class RiskAlertService:
         directly and create idempotent alerts that block approval until risk staff acts.
         """
         amount = Decimal(str(order.amount))
-        if amount < Decimal("50000"):
+        # 产品申购/购买是投资行为；阈值放宽到远高于单笔交易，避免正常买入被 AML 预警拦截
+        if amount < Decimal("2000000"):
             return []
         return [await self._save_alert(session, order, "RW-001", {
             "cash_daily_amount": str(amount),

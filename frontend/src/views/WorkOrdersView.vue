@@ -41,6 +41,7 @@ const statusText: Record<string, string> = { open: '待处理', assigned: '已�
 const statusIcon: Record<string, string> = { open: '○', assigned: '↳', in_progress: '↻', pending_customer: '…', resolved: '✓', closed: '▣', cancelled: '×' }
 const categoryText: Record<string, string> = { customer_service: '客户服务', complaint: '投诉', risk_investigation: '风控调查', business_exception: '业务异常' }
 const priorityText: Record<string, string> = { low: '低', normal: '普通', high: '高', urgent: '紧急' }
+const roleText: Record<string, string> = { customer: '客户', customer_service: '客服', customer_manager: '客户经理', advisor: '理财顾问', product_manager: '产品经理', risk_manager: '风控经理', operations: '运营', auditor: '审计', super_admin: '超级管理员', employee_pending: '待分组员工' }
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 const currentScope = computed(() => isCustomer.value ? 'all' : listScope.value)
 const todoCount = computed(() => summary.value.open + summary.value.assigned + summary.value.in_progress + summary.value.pending_customer)
@@ -214,7 +215,7 @@ onMounted(load)
 <template>
   <section class="workorder-page">
     <div class="workorder-hero">
-      <div><span class="eyebrow">WORK ORDERS</span><h2>{{ isCustomer ? '我的工单' : '工单工作台' }}</h2><p>{{ isCustomer ? '提交服务问题并跟踪处理进度。' : '优先处理我的高优先级和待客户补充工单。' }}</p></div>
+      <div><span class="eyebrow">工单</span><h2>{{ isCustomer ? '我的工单' : '工单工作台' }}</h2><p>{{ isCustomer ? '提交服务问题并跟踪处理进度。' : '优先处理我的高优先级和待客户补充工单。' }}</p></div>
       <span class="workorder-count">{{ total }} 条记录</span>
     </div>
     <p v-if="message" class="success" aria-live="polite">{{ message }}</p>
@@ -236,7 +237,7 @@ onMounted(load)
     </div>
 
     <form v-if="canCreate" class="workorder-create" @submit.prevent="create">
-      <div class="workorder-form-head"><div><span class="eyebrow">NEW TICKET</span><h3>创建工单</h3></div><span>{{ isCustomer ? '仅创建本人服务请求' : '按客户和业务范围创建' }}</span></div>
+      <div class="workorder-form-head"><div><span class="eyebrow">新建工单</span><h3>创建工单</h3></div><span>{{ isCustomer ? '仅创建本人服务请求' : '按客户和业务范围创建' }}</span></div>
       <div class="workorder-form-grid">
         <label v-if="!isCustomer">客户 ID<input v-model="form.customer_id" placeholder="客户用户 ID" required /></label>
         <label>类型<select v-model="form.category"><option value="customer_service">客户服务</option><option value="complaint">投诉</option><option value="risk_investigation">风控调查</option><option value="business_exception">业务异常</option></select></label>
@@ -258,7 +259,7 @@ onMounted(load)
         <div class="workorder-updates"><button type="button" class="workorder-update-toggle" @click.prevent.stop="toggleUpdates(row)">{{ expandedUpdates[row.id] ? '收起补充记录' : '查看补充记录' }}</button><div v-if="expandedUpdates[row.id]" class="workorder-update-list"><p v-if="updateLoading[row.id]" class="workorder-update-empty">正在加载补充记录…</p><p v-else-if="!updates[row.id]?.length" class="workorder-update-empty">暂无补充记录。</p><article v-for="item in updates[row.id] || []" :key="item.id" :class="['workorder-update-item', item.author_role]"><strong>{{ item.author_role === 'customer' ? '客户补充' : '工作人员补充要求' }}</strong><span>{{ item.content }}</span><time>{{ new Date(item.created_at).toLocaleString('zh-CN') }}</time></article></div></div><div v-if="attachments[row.id]?.length" class="workorder-attachments"><strong>附件</strong><button v-for="file in attachments[row.id]" :key="file.id" type="button" class="attachment-download" @click="downloadAttachment(row, file)">{{ file.original_name }} · {{ Math.ceil(file.size_bytes / 1024) }} KB · 下载</button></div>
         <div v-if="isCustomer && row.status==='pending_customer'" class="workorder-supplement"><strong>工作人员正在等待你的补充</strong><small>请先查看上方“补充记录”中的具体要求；提交后工单会自动回到处理中。</small><textarea v-model="supplement[row.id]" rows="3" maxlength="10000" placeholder="请补充工作人员要求的材料、时间、凭证或问题细节"></textarea><label class="attachment-picker">上传凭证（JPG / PNG / PDF）<input type="file" accept="image/jpeg,image/png,application/pdf" @change="onFileChange(row, $event)" /></label><button type="button" class="button" :disabled="saving" @click.prevent.stop="submitSupplement(row)">{{ saving ? '提交中…' : '提交补充内容' }}</button><button type="button" class="ghost-button" :disabled="saving || !selectedFile[row.id]" @click.prevent.stop="uploadAttachment(row)">上传附件</button></div><p v-else-if="isCustomer && row.status==='in_progress'" class="workorder-progress-hint">客户补充已经提交，工单正在由工作人员继续处理。</p>
         <div v-if="!isCustomer && (canAssign || canHandleRow(row)) && !['closed','cancelled'].includes(row.status)" class="workorder-actions">
-          <div v-if="canAssign" class="workorder-action-group"><select v-model="assignee[row.id]"><option value="">选择处理人</option><option v-for="person in assignees" :key="person.id" :value="person.id">{{ person.display_name || person.username }} · {{ person.roles.join('/') }}</option></select><button type="button" class="ghost-button" @click.prevent.stop="assign(row)">分派</button></div>
+          <div v-if="canAssign" class="workorder-action-group"><select v-model="assignee[row.id]"><option value="">选择处理人</option><option v-for="person in assignees" :key="person.id" :value="person.id">{{ person.display_name || person.username }} · {{ person.roles.map(r => roleText[r] || r).join(' / ') }}</option></select><button type="button" class="ghost-button" @click.prevent.stop="assign(row)">分派</button></div>
           <div v-if="canHandleRow(row)" class="workorder-action-group"><select v-model="actionStatus[row.id]" :disabled="row.status==='resolved'"><option value="in_progress">处理中</option><option value="pending_customer">待客户补充</option><option value="resolved">已解决</option></select><input v-if="row.status!=='resolved'" v-model="note[row.id]" :placeholder="(actionStatus[row.id]||'in_progress')==='resolved' ? '解决说明（必填）' : (actionStatus[row.id]||'in_progress')==='pending_customer' ? '需客户补充内容（必填）' : '处理说明（可选）'" /><button v-if="row.status!=='resolved'" type="button" class="button" :disabled="saving" @click.prevent.stop="handle(row)">{{saving?'提交中…':'提交处理'}}</button><button v-if="row.status==='resolved'" type="button" class="ghost-button" :disabled="saving" @click.prevent.stop="close(row)">关闭</button></div>
         </div>
       </article>

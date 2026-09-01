@@ -58,9 +58,9 @@ async def main() -> None:
             for index in range(5):
                 session.add(flow('RW-005', '10000.00', 'transfer', 'out', rw5 - timedelta(days=1, minutes=index), f'rw5-destination-{index}'))
 
-            # RW-006: final-day cash flow above both 100k and 3x declared income.
+            # RW-006: final-day cash flow above both 300k and 3x declared income.
             rw6 = cases['RW-006']
-            session.add(flow('RW-006', '100000.00', 'cash', 'out', rw6 - timedelta(hours=3)))
+            session.add(flow('RW-006', '300000.00', 'cash', 'out', rw6 - timedelta(hours=3)))
             await session.commit()
 
             service = RiskAlertService(create_postgres_unit_of_work())
@@ -90,7 +90,7 @@ async def main() -> None:
             assert evidence['RW-003']['window_hours'] == 24
             assert evidence['RW-004']['source_account_count'] >= 5
             assert evidence['RW-005']['destination_account_count'] >= 5
-            assert evidence['RW-006']['income_multiple'] == '3.33'
+            assert evidence['RW-006']['income_multiple'] == '10.00'
             print(json.dumps({'created_by_case': created_by_case, 'evidence_keys': {code: sorted(evidence[code].keys()) for code in cases}, 'pass': True}, ensure_ascii=False, indent=2))
     finally:
         async with db.engine.begin() as conn:

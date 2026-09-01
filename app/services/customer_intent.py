@@ -61,6 +61,57 @@ def extract_entities(query: str) -> dict[str, str]:
     return entities
 
 
+# 产品指代消解：句中的指代词/代词（排除“这个月/这个季度”等时间误判）
+_PRODUCT_REFERENCE_RE = re.compile(
+    r"(?:这个|那个|它|该|此|这款|这只)(?![月季周天年次些类])(?:理财|产品|基金|方案|保险|计划|组合)?"
+)
+# 时间/周期类查询（如"这个月收益怎么样"），不是产品评估
+_TEMPORAL_RE = re.compile(r"(这个月|本月|上月|上个月|最近|本周|上周|年度|今年|去年|近期|每天|每日|一个月|一季度|本季度|这个季度)")
+
+
+def looks_like_product_assessment(text: str) -> bool:
+    return bool(re.search(r"(靠谱|怎么样|如何|好不好|安全|稳不稳|值得|能买|可买|风险|收益|到底)", text))
+
+
+def is_bare_product_assessment(text: str) -> bool:
+    """是否"裸产品评估句"（如"现金管理保本计划靠谱吗"）：非个人、非指代、非时间、像产品评估。
+
+    供规划器与查询路由共用，避免两处守卫不一致。
+    """
+    norm = re.sub(r"\s+", "", text.strip().lower())
+    return bool(
+        looks_like_product_assessment(norm)
+        and not norm.startswith("我")
+        and not _PRODUCT_REFERENCE_RE.search(norm)
+        and not _TEMPORAL_RE.search(norm)
+    )
+
+
+def extract_preference_statement(query: str) -> tuple[str, str] | None:
+    """从用户明确的自述偏好里抽 (key, canonical_value)；无则 None。
+
+    只认明确的表态（偏/喜欢/倾向/打算…），不猜、不把模糊话术当真。
+    canonical：risk_preference ∈ conservative/balanced/aggressive；
+    product_preference=steady；investment_horizon_preference=long_term。
+    """
+    text = re.sub(r"\s+", "", query.strip().lower())
+    hedge = r"(?:我)?(?:比较|挺|很|就是|偏|偏好|倾向|喜欢|追求|想要)"
+    # 产品偏好（明确提到产品/理财/基金/配置）
+    if re.search(r"(?:喜欢|偏好|偏|倾向|只要|就要|想要).{0,3}(?:稳健|稳|保守|平衡)的?(?:产品|理财|基金|配置)", text):
+        return ("product_preference", "steady")
+    # 风险偏好（必须带偏好动词/程度词，避免把“稳健和激进有什么区别”误判）
+    if re.search(hedge + r"(?:保守|保本|低风险)", text):
+        return ("risk_preference", "conservative")
+    if re.search(hedge + r"(?:稳健|平衡|稳)", text):
+        return ("risk_preference", "balanced")
+    if re.search(hedge + r"(?:激进|高收益|高风险)", text):
+        return ("risk_preference", "aggressive")
+    # 期限偏好
+    if re.search(r"(?:我)?(?:可以|能|打算|习惯|愿意)(?:长期|中长期)持有", text) or re.search(r"(?:我)?(?:打算|可以|能)(?:长期|中长期)投资", text):
+        return ("investment_horizon_preference", "long_term")
+    return None
+
+
 class CustomerIntentPlanner:
     _patterns: list[tuple[str, str, str, float]] = [
         ("human_handoff", "人工", "handoff", .99), ("human_handoff", "客服接入", "handoff", .99),
@@ -76,7 +127,9 @@ class CustomerIntentPlanner:
         ("policy", "政策", "rag_explanation", .80), ("risk_public", "风险", "rag_explanation", .70),
     ]
 
-    def plan(self, query: str) -> IntentPlan:
+    def plan(self, query: str, context: dict | None = None) -> IntentPlan:
+        context = context or {}
+        active_product = str((context.get("active_product") or "").strip())
         normalized = re.sub(r"\s+", "", query.strip().lower())
         if not normalized:
             return IntentPlan(normalized_query="", tasks=[], clarification="请描述您需要查询或办理的事项。")
@@ -92,8 +145,60 @@ class CustomerIntentPlanner:
                     depends=[next(t.task_id for t in tasks if t.intent in {"order_status","workorder_status"})]
                 if intent == "business_operation" and any(t.intent == "product_recommendation" for t in tasks):
                     depends=[next(t.task_id for t in tasks if t.intent == "product_recommendation")]
-                tasks.append(IntentTask(task_id, intent, route, query, confidence=confidence, depends_on=depends, arguments=extract_entities(query), execution_mode=execution_mode_for_intent(intent))); seen.add(intent)
+                task_query = query
+                if intent == "product_recommendation" and any(marker in normalized for marker in ("申购", "购买", "买入", "下单")):
+                    task_query = re.split(r"(?:并且|同时|然后|并|再|后)", query, maxsplit=1)[0]
+                tasks.append(IntentTask(task_id, intent, route, task_query, confidence=confidence, depends_on=depends, arguments=extract_entities(task_query), execution_mode=execution_mode_for_intent(intent))); seen.add(intent)
+        if "推荐" in normalized and any(marker in normalized for marker in ("申购", "购买", "买入", "下单")):
+            recommendation_query = re.split(r"(?:并且|同时|然后|并|再|后)", query, maxsplit=1)[0]
+            tasks = [
+                IntentTask(
+                    "t1", "product_recommendation", "suitability", recommendation_query,
+                    confidence=.96, arguments=extract_entities(recommendation_query),
+                    execution_mode=execution_mode_for_intent("product_recommendation"),
+                ),
+                IntentTask(
+                    "t2", "business_operation", "draft_operation", query,
+                    confidence=.98, depends_on=["t1"], arguments=extract_entities(query),
+                    execution_mode=execution_mode_for_intent("business_operation"),
+                ),
+            ]
+        # 裸产品名句（"X怎么样"）：被 faq 的"怎么"marker 抢占，转回 product_status
+        if len(tasks) == 1 and tasks[0].intent == "faq" and "怎么样" in normalized and looks_like_product_assessment(normalized) \
+                and not normalized.startswith("我") and not _PRODUCT_REFERENCE_RE.search(normalized) and not _TEMPORAL_RE.search(normalized) \
+                and not any(h in normalized for h in ("开通", "办理", "申请", "注册", "操作", "设置", "预约", "解约", "提现", "转账", "取现")):
+            tasks = [IntentTask("t1", "product_status", "business_fact", query, confidence=.85, arguments=extract_entities(query), execution_mode=execution_mode_for_intent("product_status"))]
         if not tasks:
+            # 产品指代消解：当前句无显式意图 marker，但指向上下文中的产品
+            entities = extract_entities(query)
+            reference = _PRODUCT_REFERENCE_RE.search(normalized)
+            product_name = entities.get("product_name")
+            resolved_product = None
+            if active_product and reference:
+                resolved_product = active_product
+            elif product_name and not reference and looks_like_product_assessment(normalized) and len(product_name) >= 2:
+                resolved_product = product_name
+            if resolved_product:
+                # 把解析出的产品名拼进 query，_product_status 按 query 文本匹配产品
+                resolved_query = f"{resolved_product} {query}".strip()
+                return IntentPlan(
+                    normalized_query=normalized,
+                    tasks=[IntentTask(
+                        "t1", "product_status", "business_fact", resolved_query,
+                        confidence=.9, arguments={"product_name": resolved_product},
+                        execution_mode=execution_mode_for_intent("product_status"),
+                    )],
+                )
+            if is_bare_product_assessment(normalized):
+                # 裸产品名句：交给 _product_status 从 query 文本匹配产品名；匹配不到会安全走澄清
+                return IntentPlan(
+                    normalized_query=normalized,
+                    tasks=[IntentTask(
+                        "t1", "product_status", "business_fact", query,
+                        confidence=.85, arguments=entities,
+                        execution_mode=execution_mode_for_intent("product_status"),
+                    )],
+                )
             return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "unknown", "handoff", query, confidence=.20, execution_mode=execution_mode_for_intent("unknown"))], clarification="您想查询哪一类信息，例如订单、工单、资产、风险限制或公司业务？")
         return IntentPlan(normalized_query=normalized, tasks=tasks, requires_handoff=any(t.intent == "human_handoff" for t in tasks))
 

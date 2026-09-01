@@ -1747,3 +1747,47 @@ Added frontend/src/components/AnalysisResultCard.vue. It renders backend-provide
 ## 2026-08-28: P2 frontend analysis card attempt 
  
 Reviewed the workspace and found AnalysisResultCard.vue was not present despite the previous progress note. No runtime integration was applied in this step; existing AgentBubble.vue was preserved pending recovery of the missing component source.
+ 
+## 2026-08-28: P2 frontend analysis card recovery checkpoint 
+ 
+Rechecked the workspace and confirmed the previously described AnalysisResultCard.vue was absent. Removed the incomplete placeholder and did not modify the existing AgentBubble trading/human-service path. 
+No runtime code change. The component file could not be safely written by the current managed shell, so AgentBubble was preserved.
+ 
+## 2026-08-28: P2 single-shell write attempt 
+Single-layer cmd.exe was used as requested. No runtime code was changed because complex Vue source redirection remained unsafe; AgentBubble was preserved.
+- First build attempt hit transient spawn EPERM; immediate retry passed. 
+ 
+## 2026-08-28: P2 frontend analysis card restored 
+Added frontend/src/components/AnalysisResultCard.vue through patch-based editing. Display-only; backend safety boundaries preserved.
+- Status: PARTIAL 
+ 
+## 2026-08-28: P2 AgentBubble analysis card integration 
+ 
+## 2026-08-28: P2 build and E2E environment verification 
+ 
+## 2026-08-28: concurrency test scripts and AgentBubble verification 
+Added scripts/test_concurrent_customer_isolation.py and scripts/test_concurrent_order_drafts.py. Metrics include success rate, p50/p95/max latency, duplicate draft IDs, product/amount mismatches, and conversation isolation failures.
+ 
+## 2026-08-29: recommend-and-purchase response fix 
+Fixed multi-intent Planner splitting and AgentBubble recommendation merge. Confirmation_required remains true and executed remains false.
+ 
+## 2026-08-29: AgentBubble nested recommendation rendering follow-up 
+Added nested recommendation extraction helpers to AgentBubble and verified frontend build. Browser rendering still requires focused runtime inspection.
+- Status: PASS 
+ 
+## 2026-08-29: composite intent routing fix verified 
+ 
+## 2026-08-29: LLM intent routing safety switch contract 
+Added a regression proving Shadow mode cannot enable model-driven execution; fallback remains schema validated, allowlisted, and unable to authorize trades.
+ 
+## 2026-08-29: real Qwen intent evaluation and unknown-context guard 
+Ran live Qwen StructuredIntent evaluation and added a policy guard preventing T0_UNKNOWN from being upgraded to recommendation or transaction workflow solely by model inference. 
+ 
+## 2026-08-29: complex abstract and multi-intent evaluation dataset 
+Added 20 hard natural-language cases and extended evaluation metrics for security flags and model/rule source.
+ 
+## 2026-08-29: multi-task StructuredIntent schema 
+Added StructuredIntentTask and task array validation/normalization; expanded Qwen prompt for multi-intent decomposition and safe trade workflow semantics.
+- Status: PARTIAL 
+ 
+## 2026-08-29: canonical intent normalizer 

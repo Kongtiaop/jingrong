@@ -47,7 +47,10 @@ async def customer_rag_answer(request: Request, payload: CustomerRagRequest, use
     retriever = WealthKnowledgeRetriever(KnowledgeRepository(request.app.state.database))
     provider = QwenProvider(request.app.state.settings)
     try:
-        result = await CustomerRagService(retriever, embedding_provider=provider).answer(query=payload.query, intent=payload.intent, top_k=payload.top_k)
+        # 分层门控：ambiguous 带交给 LLM-judge 判"能否从引用作答"
+        from app.services.customer_rag_answer import build_answerability_judge
+        result = await CustomerRagService(retriever, embedding_provider=provider,
+                                          ambiguous_judge=build_answerability_judge(provider)).answer(query=payload.query, intent=payload.intent, top_k=payload.top_k)
     finally:
         await provider.close()
     answer_provider = QwenProvider(request.app.state.settings)

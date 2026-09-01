@@ -33,7 +33,7 @@ async def main() -> None:
         async with db.session_factory() as session:
             order = Order(
                 id=str(uuid.uuid4()), order_no=f'AMLRT{uuid.uuid4().hex[:16].upper()}', user_id=customer_id,
-                account_id=account_id, product_id=product_id, amount=Decimal('50000.00'),
+                account_id=account_id, product_id=product_id, amount=Decimal('200000.00'),
                 order_source='customer_direct', idempotency_key=f'aml-rt-{uuid.uuid4()}', status='executed', created_at=now,
             )
             session.add(order)
@@ -41,7 +41,7 @@ async def main() -> None:
             order_id = order.id
             flow = MoneyFlow(
                 id=str(uuid.uuid4()), customer_id=customer_id, account_id=account_id, order_id=order.id,
-                amount=Decimal('50000.00'), currency='CNY', flow_type='cash', direction='out',
+                amount=Decimal('200000.00'), currency='CNY', flow_type='cash', direction='out',
                 channel='aml_realtime_test', occurred_at=now,
             )
             session.add(flow)

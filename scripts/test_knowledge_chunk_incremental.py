@@ -27,7 +27,7 @@ class FakeRepository:
     async def get_document(self, document_id: str):
         return self.document if document_id == "doc-1" else None
 
-    async def active_chunk_embeddings_by_hash(self, *, document_id: str):
+    async def active_chunk_embeddings_by_hash(self, *, document_id: str, embedding_model: str | None = None):
         return dict(self.active_vectors)
 
     async def create_version(self, **_kwargs):

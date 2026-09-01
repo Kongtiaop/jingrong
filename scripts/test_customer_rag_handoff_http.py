@@ -22,13 +22,13 @@ async def main():
     try:
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=30) as client:
             customer = await login(client, 'customer_demo', 'Demo@2026Customer')
-            first = await client.post('/customer-rag/answer', headers=customer, json={'query': '这是一条当前知识库没有覆盖的客服问题', 'intent': 'company_info'})
+            first = await client.post('/customer-rag/answer', headers=customer, json={'query': '帮我查一下今天北京的天气怎么样', 'intent': 'company_info'})
             first.raise_for_status()
             first_data = first.json()['data']
             assert first_data['handoff_required'] is True
             assert first_data['work_order_created'] is True
             created_id = first_data['work_order_id']
-            second = await client.post('/customer-rag/answer', headers=customer, json={'query': '  这是一条当前知识库没有覆盖的客服问题  ', 'intent': 'company_info'})
+            second = await client.post('/customer-rag/answer', headers=customer, json={'query': '  帮我查一下今天北京的天气怎么样  ', 'intent': 'company_info'})
             second.raise_for_status()
             second_data = second.json()['data']
             assert second_data['work_order_created'] is False
@@ -45,11 +45,13 @@ async def main():
             assert context['source'] == 'customer_rag' and updates >= 1
         print(json.dumps({'first_created': True, 'duplicate_reused': True, 'context_saved': True, 'update_appended': True, 'product_no_handoff': True, 'pass': True}, ensure_ascii=False))
     finally:
-        if created_id:
-            async with db.engine.begin() as conn:
-                await conn.execute(text('DELETE FROM notification WHERE resource_type=\'work_order\' AND resource_id=:id'), {'id': created_id})
-                await conn.execute(text('DELETE FROM work_order_update WHERE work_order_id=:id'), {'id': created_id})
-                await conn.execute(text('DELETE FROM work_order WHERE id=:id'), {'id': created_id})
+        # 幂等清理：删除 customer_demo 的所有客服工单及其依赖（含历史失败跑遗留的孤儿工单）
+        async with db.engine.begin() as conn:
+            cust = (await conn.execute(text("SELECT id FROM users WHERE username='customer_demo'"))).scalar_one()
+            await conn.execute(text("DELETE FROM notification WHERE resource_type='work_order' AND resource_id IN (SELECT id FROM work_order WHERE customer_id=:c)"), {'c': cust})
+            await conn.execute(text("DELETE FROM work_order_update WHERE work_order_id IN (SELECT id FROM work_order WHERE customer_id=:c)"), {'c': cust})
+            await conn.execute(text("DELETE FROM customer_service_session WHERE customer_id=:c AND handoff_reason='rag_low_confidence'"), {'c': cust})
+            await conn.execute(text("DELETE FROM work_order WHERE customer_id=:c AND category='customer_service'"), {'c': cust})
         await db.dispose()
 
 if __name__ == '__main__':

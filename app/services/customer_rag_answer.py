@@ -12,6 +12,32 @@ class CustomerRagAnswer:
     generation_status: str
 
 
+def build_answerability_judge(provider: QwenProvider):
+    """构造"能否从引用作答"的 LLM-judge（分层门控的 ambiguous 带用）。
+
+    返回 async judge(query, contexts) -> bool：基于引用能否回答用户问题。
+    """
+    async def judge(query: str, contexts: list[str]) -> bool:
+        if provider._client is None:
+            return False
+        evidence = "\n\n".join(f"[引用 {index}] {content}" for index, content in enumerate(contexts, 1))
+        prompt = (
+            "你是财富管理客服助手。基于以下检索引用，判断能否回答用户的问题。\n"
+            "如果引用足以回答，回答 yes；如果引用与问题无关或不足，回答 no。\n\n"
+            f"用户问题：{query}\n\n检索引用：\n{evidence}\n\n只回答 yes 或 no。"
+        )
+        try:
+            response = await provider._client.chat.completions.create(
+                model=provider.settings.qwen_max_model,  # judge 用更强模型（qwen-max），避免自评偏置
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+            )
+            return "yes" in (response.choices[0].message.content or "").strip().lower()
+        except Exception:  # noqa: BLE001 - judge 失败按不可作答处理（保守拒答）
+            return False
+    return judge
+
+
 class CustomerRagAnswerService:
     def __init__(self, provider: QwenProvider) -> None:
         self.provider = provider
@@ -37,5 +63,5 @@ class CustomerRagAnswerService:
             if not text:
                 return CustomerRagAnswer(answer=result.message, generation_status="empty_response")
             return CustomerRagAnswer(answer=text, generation_status="generated")
-        except Exception:
+        except Exception:  # noqa: BLE001
             return CustomerRagAnswer(answer="当前回答服务暂时不可用，已保留检索依据并建议转人工客服。", generation_status="generation_failed")
