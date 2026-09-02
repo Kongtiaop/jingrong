@@ -16,6 +16,8 @@ from app.infrastructure.qwen import QwenProvider
 from app.services.llm_intent_fallback import LLMIntentFallbackService
 from app.services.intent_policy_resolver import IntentPolicyResolver
 from app.services.bad_case_collector import misroute_collecting_enabled
+from app.services.subagent_executor import SubagentExecutor
+from app.schemas.subagent import SubagentMergeResult, SubagentResult, SubagentTask
 from app.schemas.intent import StructuredEntity, StructuredIntent
 import asyncio
 
@@ -181,6 +183,42 @@ class CustomerAgentExecutionService:
         async with self.database.session_factory() as session:
             session.add(AuditLog(id=str(uuid4()), actor_user_id=customer_id, action="customer_agent.intent_shadow_evaluated", resource_type="customer_service_conversation", resource_id=conversation_id, detail=detail))
             await session.commit()
+
+    async def run_parallel_read_only(
+        self,
+        *,
+        customer_id: str,
+        conversation_id: str,
+        subtasks: list[SubagentTask],
+        runner=None,
+        max_concurrent: int = 2,
+    ) -> SubagentMergeResult:
+        """受控只读子代理并行入口：对一组可并行的只读子任务做真实 fan-out → 并行执行 → 确定性融合。
+
+        只读能力白名单、并发信号量、每子代理/全局超时、失败降级都在 SubagentExecutor 内部强制。
+        资金/订单/风控结论/任何写操作绝不进此层（调用方只传只读子任务）。
+        runner：真实路径由接线方提供把 SubagentTask.read_only_capability 映射到只读工具/子代理的
+        处理器；单元测试注入 fake。审计统一写 AuditLog(action="subagent.ran")，不含私有推理链。
+        """
+        async def _audit(task: SubagentTask, result: SubagentResult, dur: float) -> None:
+            try:
+                async with self.database.session_factory() as session:
+                    session.add(AuditLog(
+                        id=str(uuid4()), actor_user_id=customer_id,
+                        action="subagent.ran", resource_type="customer_service_conversation",
+                        resource_id=conversation_id,
+                        detail=json.dumps({
+                            "task_id": task.task_id, "capability": task.read_only_capability,
+                            "status": result.status, "error": result.error,
+                            "duration_ms": round(dur * 1000), "read_only": True,
+                        }, ensure_ascii=False),
+                    ))
+                    await session.commit()
+            except Exception:  # noqa: BLE001 - 审计失败不影响主流程
+                pass
+
+        executor = SubagentExecutor(runner=runner, max_concurrent=max_concurrent, audit=_audit)
+        return await executor.execute(subtasks)
 
     async def execute(self, *, customer_id: str, conversation_id: str, query: str) -> CustomerTaskExecutionResponse:
         planner = CustomerIntentPlanner()
