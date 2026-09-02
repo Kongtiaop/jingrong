@@ -31,7 +31,9 @@ jobs:
           node-version: '20'
 
       - name: Install python deps
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Install frontend deps
         run: cd frontend && npm install

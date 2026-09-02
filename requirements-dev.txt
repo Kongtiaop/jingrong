@@ -1,0 +1,7 @@
+# Wealth Manager development / test dependencies.
+# Installed on top of runtime deps (requirements.txt) for local dev and CI pytest.
+-r requirements.txt
+
+# Test runner. Tests are pure-unit/contract tests backed by fakes (FakeRedis,
+# FakeSettings, database=None) — no live Postgres/Redis required, so CI can run them.
+pytest>=8,<10
