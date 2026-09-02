@@ -65,6 +65,7 @@ class SuitabilityResult(BaseModel):
     suitability_rule: str = ""
     matched: bool
     reasons: list[str]
+    recommendation_reason: str = ""
 
 
 class RecommendationWarning(BaseModel):

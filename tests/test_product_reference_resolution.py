@@ -64,3 +64,10 @@ def test_temporal_and_personal_not_forced_to_product():
 def test_reference_pronoun_not_forced_to_product():
     # 指代句（它安全吗）在无上下文时应走澄清，不硬路由成产品
     assert _intent(planner.plan("它安全吗")) != ["product_status"]
+
+
+def test_buy_eligibility_questions_route_to_recommendation():
+    for q in ("我能购买什么产品", "可以买什么", "有什么我能买的", "有哪些我能买的产品"):
+        assert _intent(planner.plan(q)) == ["product_recommendation"], q
+    # 明确的申购（带金额/产品）仍是购买业务，不走推荐
+    assert _intent(planner.plan("我要申购现金管理保本计划1000元")) == ["business_operation"]

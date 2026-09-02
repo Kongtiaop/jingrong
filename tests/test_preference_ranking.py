@@ -70,3 +70,10 @@ def test_horizon_and_risk_combine():
     assert score(_p("C1", term_days=30)) == (0, 1)
     # 风险不符但期限对齐 → (1,0)
     assert score(_p("C4", term_days=365)) == (1, 0)
+
+
+def test_recommendation_reason_uses_preferences():
+    assert "保守" in SuitabilityService._recommendation_reason("C2", 0, {"risk_preference": "conservative"})
+    assert "长期持有" in SuitabilityService._recommendation_reason("C3", 365, {"investment_horizon_preference": "long_term"})
+    assert "稳健" in SuitabilityService._recommendation_reason("C1", 0, {"product_preference": "steady"})
+    assert "适当性" in SuitabilityService._recommendation_reason("C2", 0, {})

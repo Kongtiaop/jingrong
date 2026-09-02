@@ -33,7 +33,7 @@ class SuitabilityService:
         self.profile_repository = profile_repository
         self.asset_service = asset_service or AssetSummaryService()
 
-    async def recommend(self, session, user_id: str, *, risk_operation=None, preferences: dict | None = None) -> RecommendationResponse:
+    async def recommend(self, session, user_id: str, *, risk_operation=None, preferences: dict | None = None, top_n: int = 5) -> RecommendationResponse:
         profile = await self.profile_repository.get(session, user_id) if self.profile_repository else None
         asset = await self.asset_service.latest_or_derived(session, user_id)
         products = await self.product_repository.list_active(session)
@@ -114,6 +114,7 @@ class SuitabilityService:
                     suitability_rule=rule_text,
                     matched=matched,
                     reasons=reasons,
+                    recommendation_reason=self._recommendation_reason(product.risk_level, int(product.term_days or 0), preferences or {}),
                 )
             )
 
@@ -121,11 +122,20 @@ class SuitabilityService:
         excluded = [item for item in results if not item.matched]
         preference_note = ""
         pref = preferences or {}
+        total_matched = len(matches)
         if matches and pref:
             score_fn = self._preference_score_mapper(pref)
             if score_fn is not None:
                 matches = sorted(matches, key=lambda item: score_fn(item))
-                preference_note = "已根据您近期的风险/产品/期限偏好调整推荐顺序；以下产品仍均通过适当性匹配。"
+        # 精准单点：精选 Top N 并说明，避免一次性拉出全部通过门控的产品
+        top_n = max(1, top_n)
+        if top_n and len(matches) > top_n:
+            note_items = "；".join(f"{m.product_name}（{m.recommendation_reason}）" for m in matches[:top_n])
+            matches = matches[:top_n]
+            preference_note = f"满足适当性的产品共 {total_matched} 个，已按您的风险/偏好精选前 {len(matches)}：{note_items}"
+        elif matches:
+            note_items = "；".join(f"{m.product_name}（{m.recommendation_reason}）" for m in matches)
+            preference_note = f"以下 {len(matches)} 个产品通过适当性匹配：{note_items}"
         return RecommendationResponse(
             user_id=user_id,
             context=CustomerRecommendationContext(
@@ -141,6 +151,24 @@ class SuitabilityService:
             preference_note=preference_note,
             generated_at=datetime.now(timezone.utc),
         )
+
+    @staticmethod
+    def _recommendation_reason(risk_level: str, term_days: int, preferences: dict) -> str:
+        """生成"为什么推荐这条"的理由：优先按偏好对齐，否则用适当性说明。"""
+        risk_pref = (preferences.get("risk_preference") or "").strip().lower()
+        product_pref = (preferences.get("product_preference") or "").strip().lower()
+        horizon_pref = (preferences.get("investment_horizon_preference") or "").strip().lower()
+        parts: list[str] = []
+        if risk_pref in {"conservative", "balanced", "aggressive"}:
+            label = {"conservative": "保守", "balanced": "稳健/平衡", "aggressive": "进取"}[risk_pref]
+            parts.append(f"契合您{label}风险偏好")
+        if product_pref == "steady":
+            parts.append("符合您对稳健产品的偏好")
+        if horizon_pref == "long_term" and term_days >= 180:
+            parts.append(f"期限 {term_days} 天，适合您长期持有")
+        if not parts:
+            parts.append(f"满足 {risk_level} 适当性要求")
+        return "；".join(parts)
 
     @staticmethod
     def _preference_score_mapper(preferences: dict) -> callable | None:

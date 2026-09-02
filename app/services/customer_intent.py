@@ -112,6 +112,10 @@ def extract_preference_statement(query: str) -> tuple[str, str] | None:
     return None
 
 
+# 购买资格/推荐类歧义（"我能买什么/可以买哪些/有什么能买的"）→ 产品推荐，而非"购买"业务
+_BUY_ELIGIBILITY_RE = re.compile(r"(能买什么|可以买什么|能买哪些|可以买哪些|有什么.{0,6}(能|可)买|哪些(我)?(能|可)买|哪些产品(能|可)买|适合(我)?(买|购买|投)什么|推荐(我)?(能|可以)买|买什么产品|能购买什么)")
+
+
 class CustomerIntentPlanner:
     _patterns: list[tuple[str, str, str, float]] = [
         ("human_handoff", "人工", "handoff", .99), ("human_handoff", "客服接入", "handoff", .99),
@@ -135,6 +139,9 @@ class CustomerIntentPlanner:
             return IntentPlan(normalized_query="", tasks=[], clarification="请描述您需要查询或办理的事项。")
         if re.match(r"^(你好|您好|嗨|hello|hi|谢谢|感谢|再见)[!！。？? ]*$", normalized):
             return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "greeting", "direct", query, confidence=.99, arguments=extract_entities(query), execution_mode=execution_mode_for_intent("greeting"))])
+        # 购买资格/推荐歧义："我能买什么产品"是问"推荐我能买的"，不是"我要买"
+        if _BUY_ELIGIBILITY_RE.search(normalized):
+            return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "product_recommendation", "suitability", query, confidence=.9, execution_mode=execution_mode_for_intent("product_recommendation"))])
         if any(x in normalized for x in ("人工", "客服接入", "转人工")):
             return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "human_handoff", "handoff", query, priority="high", confidence=.99, arguments=extract_entities(query), execution_mode=execution_mode_for_intent("human_handoff"))], requires_handoff=True)
         tasks=[]; seen=set()
