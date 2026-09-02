@@ -57,15 +57,15 @@ services:
       QWEN_CHAT_MODEL: ${QWEN_CHAT_MODEL:-qwen-plus}
       QWEN_EMBEDDING_MODEL: ${QWEN_EMBEDDING_MODEL:-text-embedding-v4}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1024}
-      # 意图兜底开关（默认关/异常安全）。运营若要"放宽非交易意图的 LLM 兜底"，在 .env 设
-      #   LLM_INTENT_FALLBACK_ENABLED=true   # 允许对推荐/信息/转人工等非交易模板应用 LLM 修正
-      #   LLM_INTENT_SHADOW_ENABLED=true     # 仅观测影子分歧（不动路由）
-      #   BAD_CASE_COLLECT=1                 # 让 unknown/低置信/misroute 落积累池（配合 bad-case-worker）
+      # 意图兜底开关。默认已启用"非交易 LLM 兜底 + 飞轮采集"（可由 .env 覆盖关闭）：
+      #   LLM_INTENT_FALLBACK_ENABLED=false   # 如需关掉，在 .env 设 false
+      #   LLM_INTENT_SHADOW_ENABLED=true      # 仅观测影子分歧（不动路由）
+      #   BAD_CASE_COLLECT=0                  # 如需停飞轮采集，在 .env 设 0
       # 交易类意图仍由规则路由，LLM 永不创建/提交交易（_apply_structured_intent + safety gates 兜底）。
-      LLM_INTENT_FALLBACK_ENABLED: ${LLM_INTENT_FALLBACK_ENABLED:-false}
+      LLM_INTENT_FALLBACK_ENABLED: ${LLM_INTENT_FALLBACK_ENABLED:-true}
       LLM_INTENT_SHADOW_ENABLED: ${LLM_INTENT_SHADOW_ENABLED:-false}
       LLM_INTENT_FALLBACK_ALLOWLIST: ${LLM_INTENT_FALLBACK_ALLOWLIST:-T1_INFORMATION_QUERY,T2_PRODUCT_RECOMMENDATION,T7_HUMAN_HANDOFF}
-      BAD_CASE_COLLECT: ${BAD_CASE_COLLECT:-0}
+      BAD_CASE_COLLECT: ${BAD_CASE_COLLECT:-1}
       LLM_INTENT_FALLBACK_TIMEOUT_SECONDS: ${LLM_INTENT_FALLBACK_TIMEOUT_SECONDS:-8}
     ports:
       - "${API_PORT:-8010}:8000"
