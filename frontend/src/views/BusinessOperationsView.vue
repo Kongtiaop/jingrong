@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { genId } from '../utils/id'
 import { operationsApi } from '../api/operations'
 import { profileApi } from '../api/profile'
 
@@ -13,7 +14,7 @@ const totalPages=computed(()=>Math.max(1,Math.ceil(total.value/pageSize)))
 const operationLabel=(v:string)=>v==='redeem'?'赎回':v==='transfer'?'转账':v
 const actionLabel=(v:string)=>({submit:'提交',settle:'审核通过',reject:'审核拒绝'} as Record<string,string>)[v]||v
 const statusLabel=(v:string)=>({pending_review:'待审核',settled:'已结算',rejected:'已拒绝'} as Record<string,string>)[v]||v
-function idempotencyKey(prefix:string){return `${prefix}:${crypto.randomUUID()}`}
+function idempotencyKey(prefix:string){return `${prefix}:${genId()}`}
 async function loadCustomers(){try{const r=await profileApi.customers('', '', '', 100, 0);customers.value=r.data.data.items||[]}catch(e:any){staffSubmitMessage.value=e.message||'客户列表加载失败'}}
 async function submitStaffOperation(){
   staffSubmitMessage.value=''

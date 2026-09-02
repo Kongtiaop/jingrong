@@ -1,8 +1,9 @@
 import axios from 'axios'
+import { genId } from '../utils/id'
 
 export const http = axios.create({ baseURL: import.meta.env.VITE_API_BASE_URL || '/api/v1', timeout: 120000, headers: { 'Content-Type': 'application/json' } })
 let refreshing: Promise<string | null> | null = null
-http.interceptors.request.use((config) => { config.headers['X-Trace-Id'] = crypto.randomUUID(); const token=sessionStorage.getItem('access_token'); if(token) config.headers.Authorization=`Bearer ${token}`; return config })
+http.interceptors.request.use((config) => { config.headers['X-Trace-Id'] = genId(); const token=sessionStorage.getItem('access_token'); if(token) config.headers.Authorization=`Bearer ${token}`; return config })
 http.interceptors.response.use((response) => response, async (error) => {
   const original=error.config
   const isRefreshRequest = typeof original?.url === 'string' && original.url.endsWith('/auth/refresh')

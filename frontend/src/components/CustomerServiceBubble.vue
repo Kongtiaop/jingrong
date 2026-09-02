@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { genId } from '../utils/id'
 import { useRoute } from 'vue-router'
 import { customerServiceApi, customerServiceMessageApi, type CustomerRagIntent } from '../api/customer-rag'
 
-const route=useRoute(),open=ref(false),query=ref(''),intent=ref<CustomerRagIntent>('faq'),loading=ref(false),error=ref(''),messages=ref<any[]>([]),conversationId=ref(sessionStorage.getItem('customer_service_conversation_id')||crypto.randomUUID()),humanSessionId=ref(sessionStorage.getItem('customer_service_session_id')||''),poller=ref<number|undefined>(undefined)
+const route=useRoute(),open=ref(false),query=ref(''),intent=ref<CustomerRagIntent>('faq'),loading=ref(false),error=ref(''),messages=ref<any[]>([]),conversationId=ref(sessionStorage.getItem('customer_service_conversation_id')||genId()),humanSessionId=ref(sessionStorage.getItem('customer_service_session_id')||''),poller=ref<number|undefined>(undefined)
 sessionStorage.setItem('customer_service_conversation_id', conversationId.value)
 function startPolling(){ if(poller.value) return; poller.value=window.setInterval(async()=>{ if(!humanSessionId.value)return; try{ const data=(await customerServiceMessageApi.messages(humanSessionId.value)).data.data||[]; messages.value=[...messages.value.filter(x=>x.role==='user'||x.sender_type),...data.map((x:any)=>({role:x.sender_type==='customer'?'user':'assistant',text:x.content,...x}))] }catch{} },2500) }
 function stopPolling(){ if(poller.value)window.clearInterval(poller.value); poller.value=undefined }

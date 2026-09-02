@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { genId } from '../utils/id'
 import { useRoute } from 'vue-router'
 import { customerServiceApi, customerServiceMessageApi } from '../api/customer-rag'
 import { tradingApi } from '../api/trading'
 import { profileApi } from '../api/profile'
 import AnalysisResultCard from './AnalysisResultCard.vue'
 
-const route=useRoute(),open=ref(false),query=ref(''),loading=ref(false),error=ref(''),messages=ref<any[]>([]),conversationId=ref(sessionStorage.getItem('customer_service_conversation_id')||crypto.randomUUID()),humanSessionId=ref(sessionStorage.getItem('customer_service_session_id')||''),poller=ref<number|undefined>(undefined),unread=ref(0),drafting=ref(false),confirmingDraftId=ref(''),acknowledgedDrafts=ref<Record<string,boolean>>({}),recommending=ref(false)
+const route=useRoute(),open=ref(false),query=ref(''),loading=ref(false),error=ref(''),messages=ref<any[]>([]),conversationId=ref(sessionStorage.getItem('customer_service_conversation_id')||genId()),humanSessionId=ref(sessionStorage.getItem('customer_service_session_id')||''),poller=ref<number|undefined>(undefined),unread=ref(0),drafting=ref(false),confirmingDraftId=ref(''),acknowledgedDrafts=ref<Record<string,boolean>>({}),recommending=ref(false)
 sessionStorage.setItem('customer_service_conversation_id', conversationId.value)
 const visible=computed(()=>route.path!=='/login'&&route.path!=='/register')
 function startPolling(){if(poller.value||!humanSessionId.value)return;poller.value=window.setInterval(async()=>{if(!humanSessionId.value)return;try{const data=(await customerServiceMessageApi.messages(humanSessionId.value)).data.data||[];const next=data.map((x:any)=>({role:x.sender_type==='customer'?'user':'assistant',text:x.content,...x}));if(!open.value&&next.length>messages.value.filter((x:any)=>x.id).length)unread.value+=next.length-messages.value.filter((x:any)=>x.id).length;messages.value=[...messages.value.filter((x:any)=>x.role==='user'&&!x.id),...next]}catch{}} ,2500)}

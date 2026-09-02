@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { genId } from '../utils/id'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuth } from '../stores/auth'
 import { tradingApi } from '../api/trading'
@@ -31,7 +32,7 @@ const operationStatusText:Record<string,string>={pending_review:'待审核',sett
 const operationActionText:Record<string,string>={submit:'已提交',settle:'审核通过',reject:'审核拒绝'}
 const operationForm=ref({product_id:'',quantity:'',amount:'',to_account:'',transfer_amount:'',confirmed:false})
 const operationSubmitting=ref('')
-function idempotencyKey(prefix:string){return `${prefix}:${crypto.randomUUID()}`}
+function idempotencyKey(prefix:string){return `${prefix}:${genId()}`}
 async function submitRedeem(){
   operationsMessage.value=''
   const quantity=Number(operationForm.value.quantity), amount=Number(operationForm.value.amount)
