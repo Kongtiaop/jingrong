@@ -9,11 +9,15 @@
 - `LLM_INTENT_SHADOW_ENABLED` 默认 `false`（fallback 开启时本身会落影子审计，无需重复开）。
 - 若要关：在服务器 `/opt/wealth/.env` 写 `LLM_INTENT_FALLBACK_ENABLED=false` 或 `BAD_CASE_COLLECT=0`，再 `docker compose -f docker-compose.p0.yml up -d`。
 
-## 2. 一键跑 E2E 验收脚本（在服务器本机，或能连到 API 的机器）
+## 2. 一键跑 E2E 验收脚本（在服务器上）
+
+服务器宿主无 python 依赖，统一进 **api 容器**执行（脚本已打进镜像，容器内 API 端口是 8000）：
 
 ```bash
 cd /opt/wealth
-E2E_BASE=http://127.0.0.1:8010/api/v1 PYTHONPATH=. python scripts/test_recommendation_precision_e2e.py
+docker compose -f docker-compose.p0.yml exec api \
+  env E2E_BASE=http://127.0.0.1:8000/api/v1 \
+  python scripts/test_recommendation_precision_e2e.py
 ```
 
 脚本验收：
@@ -22,6 +26,7 @@ E2E_BASE=http://127.0.0.1:8010/api/v1 PYTHONPATH=. python scripts/test_recommend
 3. **"我能购买什么产品 / 能买哪些"** 被路由到产品推荐（带 matches），而非误路由进交易草稿。
 4. 用户"我偏稳健、长期持有"后，后续推荐理由能读到偏好、提到"稳健"。
 退出码：0=PASS，1=有字段缺失（会打印出来）。
+> 线上已实测通过：`RECOMMENDATION PRECISION E2E PASS`（在 `LLM_INTENT_FALLBACK_ENABLED=true` 下也无回归）。
 
 ## 3. 飞轮闭环验证（本轮新增 intent_misroute 盲区补漏）
 
@@ -37,6 +42,10 @@ tail -n 20 logs/bad_cases.jsonl          # 应能看到含 "intent_misroute" 的
 人工标注界面（BadCaseAnnotationView）已把 `intent_misroute` 显示为"高置信误判(规则vs影子分歧)"。
 标注 → 导出进黄金评测集 → auto_repair，飞轮即闭环。
 
+> 线上已实测闭环：在 api 容器内强制写一条合成 misroute → `logs/bad_cases.jsonl` 出现
+> `{"reasons":["intent_misroute"],"rule_template":"T4_PURCHASE_DRAFT","llm_template":"T2_PRODUCT_RECOMMENDATION"}`
+> → `bad_case` 表已落库 `('帮我买点稳妥的理财', ['intent_misroute'])`。采集→写文件→worker 落库全通。
+
 ## 4. 手动演示要点（给客户/面试看）
 
 | 步骤 | 输入 | 应看到 |
@@ -51,6 +60,20 @@ tail -n 20 logs/bad_cases.jsonl          # 应能看到含 "intent_misroute" 的
 
 ```bash
 # conda 环境已配好
-conda run -n langchain_env python -m pytest tests/ -q   # 期望全绿（当前 194 passed）
+conda run -n langchain_env python -m pytest tests/ -q   # 期望全绿（当前 196 passed）
 cd frontend && npm run build                              # 前端构建（CI 也会验证）
 ```
+
+## 6. 线上验证"非交易 LLM 兜底"增益（fallback=ON 时）
+
+`LLM_INTENT_FALLBACK_ENABLED=true` 的作用：把**正则规则覆盖不到、但其实是推荐意图**的问句，由高置信 LLM 提升为产品推荐，从而减少手工加规则。
+
+在 api 容器内跑探针（打印每条的真实路由，人工判断是否被提升为推荐）：
+
+```bash
+docker compose -f docker-compose.p0.yml exec api \
+  env E2E_BASE=http://127.0.0.1:8000/api/v1 \
+  python scripts/probe_llm_fallback_gain.py
+```
+
+若多数打印 `✅推荐(被提升)` → 增益生效；若多为 `⚠️非推荐` → 可能模型未识别或仍被规则拦截，回传输出到会话即可分析。
