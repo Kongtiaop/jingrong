@@ -69,4 +69,19 @@ jobs:
             docker compose -f docker-compose.p0.yml build
             docker compose -f docker-compose.p0.yml up -d
             docker image prune -f || true
-            curl -fsS http://127.0.0.1:8010/api/v1/health && echo "HEALTH OK"
+            # 容器刚 up 后 uvicorn 需要几秒才能就绪，避免空响应导致误判部署失败
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8010/api/v1/health >/dev/null 2>&1; then
+                echo "HEALTH OK"
+                ok=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "health check timed out; recent api logs:" >&2
+              docker compose -f docker-compose.p0.yml ps >&2 || true
+              docker logs --tail 80 wealth-p0-api-1 >&2 || true
+              exit 1
+            fi
