@@ -14,27 +14,17 @@ frontend/dist/
 *.log
 *.zip
 
-# Local-only restored documentation
-docs/ARCHITECTURE.md
-docs/ARCHITECTURE_DATABASE_DRAFT.md
-docs/DECISIONS.md
-docs/DEMO_ACCOUNTS.example.txt
-docs/ISSUES.md
-docs/P0-P5_IMPLEMENTATION_PLAN.md
-docs/P0_IMPLEMENTATION.md
-docs/P0_INFRASTRUCTURE.md
-docs/PLAN.md
-docs/TESTS.md
+# Documentation: only key public docs are tracked (API / database / error codes / readme).
+# Everything else under docs/ (personal, company, design notes, drafts, binaries) is kept
+# on disk locally but ignored from the repo.
+docs/*
+!docs/API.md
+!docs/DATABASE_TABLE_REFERENCE.md
+!docs/ERROR_CODES.md
+!docs/README.md
 
 # Local-only credentials
 DEMO_ACCOUNTS.txt
-
-# Team onboarding docs are safe to sync; detailed local-only design docs remain ignored.
-!docs/README.md
-!docs/TEAM_ONBOARDING.md
-!docs/DEVELOPMENT_WORKFLOW.md
-!docs/API.md
-!docs/ERROR_CODES.md
 
 # Business / company knowledge source content & RAG seed docs (kept locally, not synced)
 公司业务/
