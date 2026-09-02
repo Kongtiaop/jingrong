@@ -110,6 +110,7 @@ class SuitabilityService:
                     minimum_amount=float(product.minimum_amount),
                     minimum_investable_asset=required_investable_asset,
                     liquidity=product.liquidity,
+                    term_days=int(product.term_days or 0),
                     suitability_rule=rule_text,
                     matched=matched,
                     reasons=reasons,
@@ -123,8 +124,8 @@ class SuitabilityService:
         if matches and pref:
             score_fn = self._preference_score_mapper(pref)
             if score_fn is not None:
-                matches = sorted(matches, key=lambda item: score_fn(item.product_risk_level))
-                preference_note = "已根据您近期的风险/产品偏好调整推荐顺序；以下产品仍均通过适当性匹配。"
+                matches = sorted(matches, key=lambda item: score_fn(item))
+                preference_note = "已根据您近期的风险/产品/期限偏好调整推荐顺序；以下产品仍均通过适当性匹配。"
         return RecommendationResponse(
             user_id=user_id,
             context=CustomerRecommendationContext(
@@ -143,18 +144,30 @@ class SuitabilityService:
 
     @staticmethod
     def _preference_score_mapper(preferences: dict) -> callable | None:
-        """偏好 → (产品风险等级)->int 的排序打分；无可用偏好则 None。"""
+        """偏好 → (SuitabilityResult)->(risk_score, horizon_score) 排序打分；无可用偏好则 None。
+
+        分数越低越靠前：先按风险/产品偏好对齐，再按期限偏好（长期持有偏好更长期限）。
+        """
         risk_pref = (preferences.get("risk_preference") or "").strip().lower()
         product_pref = (preferences.get("product_preference") or "").strip().lower()
+        horizon_pref = (preferences.get("investment_horizon_preference") or "").strip().lower()
         target: set[str] | None = None
         if risk_pref in {"conservative", "balanced", "aggressive"}:
             target = {"conservative": {"C1", "C2"}, "balanced": {"C2", "C3"}, "aggressive": {"C4", "C5"}}[risk_pref]
         elif product_pref == "steady":
             target = {"C1", "C2"}
-        if not target:
+        horizon_long = horizon_pref == "long_term"
+        if target is None and not horizon_long:
             return None
 
-        def score(level: str) -> int:
-            return 0 if (level or "").upper() in target else 1
+        def score(item) -> tuple[int, int]:
+            risk = 0
+            if target is not None:
+                risk = 0 if (item.product_risk_level or "").upper() in target else 1
+            horizon = 0
+            if horizon_long:
+                term = int(getattr(item, "term_days", 0) or 0)
+                horizon = 0 if term >= 180 else 1  # 长期持有：≥180 天算长期
+            return (risk, horizon)
 
         return score

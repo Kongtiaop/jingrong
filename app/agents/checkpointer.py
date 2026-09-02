@@ -24,15 +24,19 @@ def postgres_checkpointer(conninfo: str, *, loop: Any | None = None) -> Any:
     未装包会给出安装提示；装好后 `await cp.setup()` 建表即可用。
     """
     try:
-        from langgraph.checkpoint.postgres import AsyncPostgresSaver
-        from psycopg_pool import AsyncConnectionPool
-    except ImportError as exc:
-        raise RuntimeError(
-            "AsyncPostgresSaver 需要额外依赖。请先：pip install 'langgraph-checkpoint-postgres' psycopg[binary] psycopg-pool "
-            "（沙箱无法安装，需你在本机执行）。"
-        ) from exc
-    pool = AsyncConnectionPool(conninfo=conninfo, max_size=5, kwargs={"loop": loop})
-    return AsyncPostgresSaver(pool)
+        # v3.x 异步 saver 在 .aio 子模块；旧版在顶层
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver as _Saver
+    except ImportError:
+        try:
+            from langgraph.checkpoint.postgres import AsyncPostgresSaver as _Saver
+        except ImportError as exc:
+            raise RuntimeError(
+                "Postgres Checkpointer 需要额外依赖。请先：pip install 'langgraph-checkpoint-postgres' psycopg[binary] psycopg-pool"
+            ) from exc
+    from psycopg_pool import AsyncConnectionPool
+    # autocommit=True：setup() 里 CREATE INDEX CONCURRENTLY 不能在事务块内执行
+    pool = AsyncConnectionPool(conninfo=conninfo, max_size=5, kwargs={"autocommit": True})
+    return _Saver(pool)
 
 
 def thread_config(thread_id: str) -> dict:

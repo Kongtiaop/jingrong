@@ -35,15 +35,21 @@ class CustomerMemoryService:
         if self.redis is not None:
             await self.redis.delete(self._key(customer_id, conversation_id))
 
-    async def remember(self, *, customer_id: str, key: str, value: str, memory_type: str = "conversation_fact", source: str = "conversation", confidence: float = 1.0, conversation_id: str | None = None) -> CustomerMemory:
+    async def remember(self, *, customer_id: str, key: str, value: str, memory_type: str = "conversation_fact", source: str = "conversation", confidence: float = 1.0, conversation_id: str | None = None, scope: str = "private", agent_type: str = "customer_service") -> CustomerMemory:
         async with self.database.session_factory() as session:
-            row = (await session.execute(select(CustomerMemory).where(CustomerMemory.customer_id == customer_id, CustomerMemory.key == key, CustomerMemory.status == "active"))).scalar_one_or_none()
+            # 去重包含 scope：私有与共享同 key 可各自存在
+            row = (await session.execute(select(CustomerMemory).where(
+                CustomerMemory.customer_id == customer_id, CustomerMemory.key == key,
+                CustomerMemory.scope == scope, CustomerMemory.status == "active"))).scalar_one_or_none()
             now = datetime.now(timezone.utc)
             if row is None:
-                row = CustomerMemory(id=str(uuid4()), customer_id=customer_id, key=key, value=value, memory_type=memory_type, source=source, confidence=confidence, last_confirmed_at=now)
+                row = CustomerMemory(id=str(uuid4()), customer_id=customer_id, key=key, value=value,
+                                     memory_type=memory_type, source=source, confidence=confidence,
+                                     last_confirmed_at=now, scope=scope, agent_type=agent_type)
                 session.add(row); await session.flush()
             else:
                 row.value=value; row.source=source; row.confidence=confidence; row.last_confirmed_at=now
+                row.scope = scope; row.agent_type = agent_type
             session.add(CustomerMemoryEvent(id=str(uuid4()), customer_id=customer_id, conversation_id=conversation_id, memory_id=row.id, event_type="upsert", payload={"key":key,"value":value,"source":source,"confidence":confidence}))
             await session.commit(); await session.refresh(row)
             return row

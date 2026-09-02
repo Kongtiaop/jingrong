@@ -42,16 +42,22 @@ class CustomerRagAnswerService:
     def __init__(self, provider: QwenProvider) -> None:
         self.provider = provider
 
-    async def generate(self, *, query: str, result: CustomerRagResult) -> CustomerRagAnswer:
+    async def generate(self, *, query: str, result: CustomerRagResult, conversation_summary: str = "") -> CustomerRagAnswer:
         if result.handoff_required or not result.citations:
             return CustomerRagAnswer(answer=result.message, generation_status="not_generated")
         if self.provider._client is None:
             return CustomerRagAnswer(answer="已找到相关知识依据，但当前暂未配置回答模型。请联系人工客服。", generation_status="provider_unavailable")
         evidence = "\n\n".join(f"[引用 {index}] {item.content}" for index, item in enumerate(result.citations, 1))
+        history_block = ""
+        if conversation_summary:
+            history_block = (
+                "\n\n[客户近期对话摘要，仅用于理解语境，**不得据此编造事实**，回答仍只能依据引用资料]："
+                f"{conversation_summary[:1200]}"
+            )
         prompt = (
             "你是财富管理平台客服助手。只能根据提供的引用回答，不得编造、承诺收益或执行任何交易。"
             "如果引用不足以回答，必须明确说资料不足并建议转人工。使用清晰、谨慎、客户可理解的中文。\n\n"
-            f"客户问题：{query}\n\n引用资料：\n{evidence}"
+            f"客户问题：{query}\n\n引用资料：\n{evidence}{history_block}"
         )
         try:
             response = await self.provider._client.chat.completions.create(

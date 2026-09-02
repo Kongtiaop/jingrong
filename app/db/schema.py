@@ -87,7 +87,13 @@ async def ensure_schema(engine: AsyncEngine) -> None:
             "ALTER TABLE bad_case ADD COLUMN IF NOT EXISTS labeled_by VARCHAR(36)",
             "ALTER TABLE bad_case ADD COLUMN IF NOT EXISTS labeled_at TIMESTAMPTZ",
             "CREATE INDEX IF NOT EXISTS ix_bad_case_status_labeled ON bad_case (status, labeled_at)",
-
+            "ALTER TABLE customer_memory_event ALTER COLUMN conversation_id TYPE VARCHAR(128)",
+            "ALTER TABLE customer_memory ADD COLUMN IF NOT EXISTS scope VARCHAR(32) NOT NULL DEFAULT 'private'",
+            "ALTER TABLE customer_memory ADD COLUMN IF NOT EXISTS agent_type VARCHAR(32) NOT NULL DEFAULT 'customer_service'",
+            "CREATE INDEX IF NOT EXISTS ix_customer_memory_scope ON customer_memory (scope)",
+            "CREATE INDEX IF NOT EXISTS ix_customer_memory_agent_type ON customer_memory (agent_type)",
+            "DROP INDEX IF EXISTS uq_customer_memory_active_key",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_memory_active_key ON customer_memory (customer_id, key, scope) WHERE status = 'active'",
             "CREATE INDEX IF NOT EXISTS ix_users_status_created_at ON users (status, created_at)",
             "CREATE INDEX IF NOT EXISTS ix_user_roles_role_user ON user_roles (role_id, user_id)",
         )

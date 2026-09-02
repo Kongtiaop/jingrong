@@ -34,6 +34,9 @@ langchain>=1.0,<2
 langchain-core>=1.0,<2
 langchain-community>=0.4,<1
 langgraph>=1.0,<2
+# Postgres Checkpointer（断点续跑持久化）：LangGraph async PostgresSaver + 连接池
+langgraph-checkpoint-postgres>=3,<4
+psycopg-pool>=3.3,<4
 # langchain-openai remains on its compatible 0.x line while LangChain/LangGraph
 # themselves use V1.0 APIs.
 langchain-openai>=0.3,<1

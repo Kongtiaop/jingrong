@@ -61,6 +61,7 @@ class SuitabilityResult(BaseModel):
     minimum_amount: float
     minimum_investable_asset: float
     liquidity: str
+    term_days: int = 0
     suitability_rule: str = ""
     matched: bool
     reasons: list[str]

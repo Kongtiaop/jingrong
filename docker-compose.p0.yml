@@ -234,6 +234,27 @@ services:
     command: ["python", "-m", "workers.bad_case_worker"]
     networks:
       - wealth-p0
+  memory-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-wealth}:${POSTGRES_PASSWORD:-wealth_dev}@postgres:5432/${POSTGRES_DB:-wealth_manager}
+      REDIS_URL: redis://redis:6379/0
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      QWEN_BASE_URL: ${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      QWEN_CHAT_MODEL: ${QWEN_CHAT_MODEL:-qwen-plus}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "workers.memory_worker"]
+    networks:
+      - wealth-p0
 
 volumes:
   wealth_pgdata:

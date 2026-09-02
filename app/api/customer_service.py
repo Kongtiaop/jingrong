@@ -19,7 +19,8 @@ from app.models.auth import Role, User
 from app.models.customer_service import CustomerServiceMessage, CustomerServiceSession
 from app.models.workorder import WorkOrder
 from app.schemas.customer_service import CustomerIntentPlanResponse, IntentTaskResponse, TaskExecutionResultResponse, CustomerTaskExecutionResponse, CustomerServiceActionRequest, UnifiedAgentRequest, CustomerServiceAssignRequest, CustomerServiceMessageCreateRequest, CustomerServiceMessageResponse, CustomerServiceSessionResponse
-from app.services.customer_intent import CustomerIntentPlanner
+from app.services.customer_intent import CustomerIntentPlanner, extract_preference_statement
+from app.services.shared_memory_service import SharedMemoryService
 from app.services.memory_service import CustomerMemoryService
 from app.services.customer_agent_execution import CustomerAgentExecutionService
 from app.services.agent_stream import AgentStreamEvent, display_chunks
@@ -188,6 +189,19 @@ async def intent_plan(request: Request, payload: CustomerServiceActionRequest, u
 @router.post("/agent/execute", response_model=ApiResponse[CustomerTaskExecutionResponse])
 async def execute_unified_agent(request: Request, payload: UnifiedAgentRequest, user: Annotated[User, Depends(current_user)]):
     conversation_id = payload.conversation_id or request.headers.get("X-Conversation-Id") or str(uuid4())
+    # 偏好表态：任何客户 query 都先尝试持久化用户自述偏好，不受 Agent 路由影响（否则被 data_analysis 拦截时不落库）
+    try:
+        pref = extract_preference_statement(payload.content)
+        if pref:
+            await CustomerMemoryService(request.app.state.database, request.app.state.redis.client).remember(
+                customer_id=user.id, key=pref[0], value=pref[1], memory_type="conversation_fact", source="customer_stated", conversation_id=conversation_id)
+            # 共享记忆语义层：客服观察写入 shared 作用域，供投顾/推荐等其它 Agent 复用
+            await SharedMemoryService(request.app.state.database, request.app.state.redis.client).remember(
+                customer_id=user.id, agent_type="customer_service", key=pref[0], value=pref[1],
+                memory_type="observation", scope="shared", source="customer_stated",
+                conversation_id=conversation_id, actor_user_id=user.id)
+    except Exception:  # noqa: BLE001 - 记忆失败不阻塞主流程
+        pass
     registry = AgentCapabilityRegistry()
     available_agents = registry.available_for(user)
     denied_agents = registry.denied_for(user)

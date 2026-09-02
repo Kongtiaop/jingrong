@@ -12,7 +12,7 @@ def test_bounded_react_refines_once_then_returns_evidence(monkeypatch):
     executor = CustomerTaskExecutor(database=None)
     calls = []
 
-    async def fake_generate(*, query, result):
+    async def fake_generate(*, query, result, conversation_summary=""):
         assert result.citations  # 命中引用才生成
         return SimpleNamespace(answer="官方流程说明", generation_status="generated")
 

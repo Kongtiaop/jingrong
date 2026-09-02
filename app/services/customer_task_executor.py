@@ -43,9 +43,10 @@ class CustomerTaskExecutor:
     MAX_REACT_TOOL_CALLS = 20
     REACT_INTENTS = {"company_info", "company_business", "faq", "workflow", "policy", "risk_public"}
 
-    def __init__(self, database, max_parallel_tasks: int = 4, max_iterations: int | None = None, max_tool_calls: int | None = None):
+    def __init__(self, database, max_parallel_tasks: int = 4, max_iterations: int | None = None, max_tool_calls: int | None = None, conversation_summary: str = ""):
         self.database = database
         self.tools = CustomerReadTools(database)
+        self.conversation_summary = conversation_summary or ""
         self.max_parallel_tasks = max_parallel_tasks
         if max_iterations is not None:
             self.MAX_REACT_ITERATIONS = max_iterations
@@ -58,12 +59,23 @@ class CustomerTaskExecutor:
         ]
 
     async def _load_preference_facts(self, customer_id: str) -> dict:
-        """读长时记忆里的偏好事实（软排序用，只取低风险白名单 key）。"""
+        """读偏好事实（软排序用）。先读私有长时记忆，再补客服写入的 shared 观察（跨 Agent 复用）。"""
         from app.services.memory_service import CustomerMemoryService
+        from app.services.shared_memory_service import SharedMemoryService
         whitelist = {"risk_preference", "product_preference", "investment_horizon_preference"}
         memory = CustomerMemoryService(self.database, None)
         rows = await memory.load_long_term(customer_id=customer_id)
-        return {row.key: str(row.value) for row in rows if getattr(row, "key", None) in whitelist and getattr(row, "value", "")}
+        facts = {row.key: str(row.value) for row in rows if getattr(row, "key", None) in whitelist and getattr(row, "value", "")}
+        # 共享记忆语义层：投顾/推荐复用客服写入的 shared observation（私有未命中时）
+        try:
+            shared = await SharedMemoryService(self.database, None).recall(
+                customer_id=customer_id, agent_type="advisor", memory_type="observation")
+            for row in shared:
+                if getattr(row, "key", None) in whitelist and getattr(row, "value", "") and row.key not in facts:
+                    facts[row.key] = str(row.value)
+        except Exception:  # noqa: BLE001 - 记忆异常不阻塞推荐
+            pass
+        return facts
 
     @staticmethod
     def _result_signature(result) -> str:
@@ -129,7 +141,7 @@ class CustomerTaskExecutor:
                         handoff_required=False,
                         message=result.answer,
                     )
-                    generated = await CustomerRagAnswerService(QwenProvider(get_settings())).generate(query=item.query, result=rag_result)
+                    generated = await CustomerRagAnswerService(QwenProvider(get_settings())).generate(query=item.query, result=rag_result, conversation_summary=self.conversation_summary)
                     return TaskExecutionResult(
                         item.task_id,
                         item.intent,
