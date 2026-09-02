@@ -5,8 +5,8 @@ import PaginationBar from '../components/PaginationBar.vue'
 
 const INTENT_LABEL = {order_status:'订单状态',workorder_status:'工单状态',asset_summary:'资产概览',product_status:'产品信息',product_recommendation:'产品推荐',business_operation:'交易操作',risk_public:'风险公开信息',risk_explanation:'风险解释',risk_restriction:'风险限制',policy:'政策咨询',faq:'常见问题',human_handoff:'转人工',unknown:'无法识别',company_info:'公司信息',company_business:'公司业务',workflow:'办理流程'} as Record<string,string>
 const INTENTS = Object.keys(INTENT_LABEL)
-const REASONS = ['intent_unknown','intent_low_confidence','intent_rules_fallback','rag_low_confidence','rag_embedding_degraded','rag_text_fallback','rag_handoff','clarify_stuck']
-const reasonLabel = (r: string) => ({intent_unknown:'意图未知',intent_low_confidence:'意图低置信',intent_rules_fallback:'规则兜底',rag_low_confidence:'证据不足',rag_embedding_degraded:'向量降级',rag_text_fallback:'纯文本兜底',rag_handoff:'转人工',clarify_stuck:'澄清卡住'} as Record<string,string>)[r] || r
+const REASONS = ['intent_unknown','intent_low_confidence','intent_rules_fallback','intent_misroute','rag_low_confidence','rag_embedding_degraded','rag_text_fallback','rag_handoff','clarify_stuck']
+const reasonLabel = (r: string) => ({intent_unknown:'意图未知',intent_low_confidence:'意图低置信',intent_rules_fallback:'规则兜底',intent_misroute:'高置信误判(规则vs影子分歧)',rag_low_confidence:'证据不足',rag_embedding_degraded:'向量降级',rag_text_fallback:'纯文本兜底',rag_handoff:'转人工',clarify_stuck:'澄清卡住'} as Record<string,string>)[r] || r
 const evidenceLabel = (e: string) => ({sufficient:'证据充足',low_confidence:'证据不足',embedding_degraded:'向量降级',text_fallback:'纯文本兜底',handoff_required:'需转人工'} as Record<string,string>)[e] || e
 
 const rows = ref<BadCaseRow[]>([])

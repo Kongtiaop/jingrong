@@ -25,6 +25,21 @@ LOW_CONFIDENCE = 0.5
 CLARIFY_STUCK = 2
 BAD_EVIDENCE = {"low_confidence", "embedding_degraded", "text_fallback"}
 
+# intent_misroute（高置信误判 / 规则与影子分歧）专用阈值与模板"承诺级"。
+RULE_MISROUTE_MIN_CONF = 0.8   # 规则必须够自信才算"confident misroute"
+LLM_MISROUTE_MIN_CONF = 0.55   # 影子 LLM 也要够自信，避免把 LLM 乱猜当分歧
+# 模板按"业务承诺/动作强度"分级：交易草稿最高，推荐/转人工其次，只读最低。
+_TRADE = "trade"; _COMMIT = "commit"; _READ = "read"
+_TEMPLATE_COMMIT = {
+    "T3_RECOMMEND_THEN_PURCHASE_DRAFT": _TRADE, "T4_PURCHASE_DRAFT": _TRADE,
+    "T9_MODIFY_DRAFT": _TRADE, "T10_CANCEL_DRAFT": _TRADE,
+    "T2_PRODUCT_RECOMMENDATION": _COMMIT, "T7_HUMAN_HANDOFF": _COMMIT,
+    "T1_INFORMATION_QUERY": _READ, "T5_ORDER_STATUS": _READ, "T6_RISK_EXPLANATION": _READ,
+    "T8_MULTI_INTENT": _COMMIT, "T0_UNKNOWN": _READ,
+}
+# 线上 misroute 采集开关：与意图 unknown/低置信回流共用 BAD_CASE_COLLECT=1（默认关）。
+_DEBUG_MISROUTE_COLLECT = os.environ.get("BAD_CASE_COLLECT") == "1"
+
 
 @dataclass
 class BadCaseRecord:
@@ -37,6 +52,8 @@ class BadCaseRecord:
     clarifications: int = 0
     ts: str = ""
     query_hash: str = ""
+    rule_template: str = ""
+    llm_template: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -44,6 +61,7 @@ class BadCaseRecord:
             "confidence": self.confidence, "evidence_status": self.evidence_status,
             "handoff": self.handoff, "clarifications": self.clarifications,
             "ts": self.ts, "query_hash": self.query_hash,
+            "rule_template": self.rule_template, "llm_template": self.llm_template,
         }
 
 
@@ -57,6 +75,11 @@ def normalize_query(query: str) -> str:
 
 def query_hash(query: str) -> str:
     return hashlib.md5(normalize_query(query).encode("utf-8")).hexdigest()
+
+
+def misroute_collecting_enabled() -> bool:
+    """线上 misroute 采集是否开启（BAD_CASE_COLLECT=1）。默认关，异常安全。"""
+    return _DEBUG_MISROUTE_COLLECT
 
 
 def detect_bad_case(query: str, *, intent=None, rag=None, clarifications: int = 0) -> BadCaseRecord | None:
@@ -96,6 +119,53 @@ def detect_bad_case(query: str, *, intent=None, rag=None, clarifications: int = 
     )
 
 
+def _commit_level(template: str) -> str:
+    return _TEMPLATE_COMMIT.get(template, _READ)
+
+
+def detect_intent_misroute(query: str, *, rule_intent=None, llm_intent=None) -> BadCaseRecord | None:
+    """检测"高置信误判"（confident misroute）：规则自信地选了一个与影子 LLM 明显分歧的意图。
+
+    现有 detect_bad_case 只在 unknown/低置信/规则兜底等"弱势"信号上触发，抓不到
+    "规则很自信但方向错了"这一类（例如把"我能购买什么产品"这类资格/推荐问句
+    误路由进交易草稿）。这里用规则的确定性结果 与 影子 LLM 的高置信分歧来暴露它。
+
+    触发条件（全中才算候选，供人工标注裁决，非自动执行）：
+    - 规则模板非 unknown 且 confidence >= RULE_MISROUTE_MIN_CONF（规则确实自信）
+    - 影子模板非 unknown 且 confidence >= LLM_MISROUTE_MIN_CONF（分歧可信，非乱猜）
+    - 双方模板不同，且承诺级不同（read/commit/trade 跨级）→ 规则把意图路由错了"档位"
+    """
+    if rule_intent is None or llm_intent is None:
+        return None
+    rule_template = str(getattr(rule_intent, "template", "") or "")
+    llm_template = str(getattr(llm_intent, "template", "") or "")
+    rule_conf = getattr(rule_intent, "confidence", None)
+    llm_conf = getattr(llm_intent, "confidence", None)
+    if not rule_template or rule_template == "T0_UNKNOWN" or not llm_template or llm_template == "T0_UNKNOWN":
+        return None
+    if not isinstance(rule_conf, (int, float)) or not isinstance(llm_conf, (int, float)):
+        return None
+    if rule_conf < RULE_MISROUTE_MIN_CONF or llm_conf < LLM_MISROUTE_MIN_CONF:
+        return None
+    if rule_template == llm_template:
+        return None
+    if _commit_level(rule_template) == _commit_level(llm_template):
+        return None  # 只读内的小分歧（如 order vs faq）无害，不当作 misroute
+    return BadCaseRecord(
+        query=query,
+        reasons=["intent_misroute"],
+        intent=str(getattr(rule_intent, "primary_intent", "") or ""),
+        confidence=rule_conf,
+        evidence_status="",
+        handoff=False,
+        clarifications=0,
+        ts=_now(),
+        query_hash=query_hash(query),
+        rule_template=rule_template,
+        llm_template=llm_template,
+    )
+
+
 class BadCaseStore:
     """JSONL 追加存储 + 按 query_hash 去重（加载现有 hash 集合）。"""
 
@@ -128,6 +198,12 @@ class BadCaseStore:
     def collect(self, query: str, *, intent=None, rag=None, clarifications: int = 0,
                 force: bool = False) -> bool:
         rec = detect_bad_case(query, intent=intent, rag=rag, clarifications=clarifications)
+        if rec is None:
+            return False
+        return self.record(rec, force=force)
+
+    def collect_misroute(self, query: str, *, rule_intent=None, llm_intent=None, force: bool = False) -> bool:
+        rec = detect_intent_misroute(query, rule_intent=rule_intent, llm_intent=llm_intent)
         if rec is None:
             return False
         return self.record(rec, force=force)

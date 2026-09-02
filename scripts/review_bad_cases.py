@@ -21,6 +21,7 @@ REASON_LABEL = {
     "intent_unknown": "意图未识别(unknown)",
     "intent_low_confidence": "意图低置信(<0.5)",
     "intent_rules_fallback": "LLM解析失败→规则兜底",
+    "intent_misroute": "高置信误判(规则vs影子分歧)",
     "rag_low_confidence": "RAG证据不足",
     "rag_embedding_degraded": "RAG向量降级",
     "rag_text_fallback": "RAG纯文本兜底",

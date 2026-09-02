@@ -15,6 +15,7 @@ from app.core.settings import get_settings
 from app.infrastructure.qwen import QwenProvider
 from app.services.llm_intent_fallback import LLMIntentFallbackService
 from app.services.intent_policy_resolver import IntentPolicyResolver
+from app.services.bad_case_collector import misroute_collecting_enabled
 from app.schemas.intent import StructuredEntity, StructuredIntent
 import asyncio
 
@@ -254,6 +255,14 @@ class CustomerAgentExecutionService:
                         decision = "no_safe_mapping"
                 if self.settings.llm_intent_shadow_enabled or self.settings.llm_intent_fallback_enabled:
                     await self._audit_intent_shadow(customer_id=customer_id, conversation_id=conversation_id, query=combined_query, rule_intent=rule_structured, llm_intent=llm_structured, resolved_intent=resolved, error=None, execution_changed=changed, fallback_decision=decision)
+                # 数据飞轮盲区补漏：规则"自信但方向错"的高置信误判（如资格/推荐问句被路由进交易草稿）。
+                # 现有 detect_bad_case 只在 unknown/低置信/规则兜底等弱势信号触发，抓不到这类。
+                if misroute_collecting_enabled():
+                    try:
+                        from app.services.bad_case_collector import BadCaseStore
+                        BadCaseStore().collect_misroute(combined_query, rule_intent=rule_structured, llm_intent=llm_structured)
+                    except Exception:  # noqa: BLE001 - 采集失败不影响主流程
+                        pass
             except Exception as exc:
                 if self.settings.llm_intent_shadow_enabled:
                     await self._audit_intent_shadow(customer_id=customer_id, conversation_id=conversation_id, query=combined_query, rule_intent=self._structured_from_rule_plan(plan), llm_intent=None, resolved_intent=None, error=f"{type(exc).__name__}: {exc}", execution_changed=False, fallback_decision="fallback_error")
