@@ -1,0 +1,70 @@
+# GitHub Actions：推 main → CI(测试+前端构建) → CD(SSH 部署到阿里云 121.43.113.196)
+# 免费额度：私有仓库每月 2000 分钟构建，本项目足够。
+# 依赖仓库 Secrets：
+#   SSH_HOST=121.43.113.196
+#   SSH_USER=<root 或你的用户>
+#   SSH_PRIVATE_KEY=<服务器登录私钥（OpenSSH 格式）>
+#   SSH_PORT=22
+name: CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: Test & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install python deps
+        run: pip install -r requirements.txt
+
+      - name: Install frontend deps
+        run: cd frontend && npm install
+
+      - name: Run pytest
+        run: python -m pytest tests/ -q
+
+      - name: Build frontend
+        run: cd frontend && npm run build
+
+  deploy:
+    name: Deploy to Aliyun
+    needs: ci
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          script: |
+            set -e
+            cd /opt/wealth
+            git fetch origin main
+            git checkout -B main origin/main
+            export COMPOSE_PROJECT_NAME=wealth-p0
+            docker compose -f docker-compose.p0.yml build
+            docker compose -f docker-compose.p0.yml up -d
+            docker image prune -f || true
+            curl -fsS http://127.0.0.1:8010/api/v1/health && echo "HEALTH OK"
