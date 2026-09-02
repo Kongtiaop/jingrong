@@ -35,3 +35,19 @@ DEMO_ACCOUNTS.txt
 !docs/DEVELOPMENT_WORKFLOW.md
 !docs/API.md
 !docs/ERROR_CODES.md
+
+# Business / company knowledge source content & RAG seed docs (kept locally, not synced)
+公司业务/
+公司信息/
+金融政策/
+用户测试数据/
+用户研判规则/
+docs/BUSINESS_KNOWLEDGE_*.md
+
+# Runtime uploads & generated test artifacts (kept locally, not synced)
+uploads/
+*.tmp
+frontend/playwright-report/
+frontend/test-results/
+test-results/
+frontend/frontend/

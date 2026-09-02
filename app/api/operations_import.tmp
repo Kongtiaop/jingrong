@@ -1,1 +1,0 @@
-from app.api.operations import router as operations_router
