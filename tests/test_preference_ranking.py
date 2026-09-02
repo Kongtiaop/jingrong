@@ -77,3 +77,68 @@ def test_recommendation_reason_uses_preferences():
     assert "长期持有" in SuitabilityService._recommendation_reason("C3", 365, {"investment_horizon_preference": "long_term"})
     assert "稳健" in SuitabilityService._recommendation_reason("C1", 0, {"product_preference": "steady"})
     assert "适当性" in SuitabilityService._recommendation_reason("C2", 0, {})
+
+
+def _product(i):
+    return SimpleNamespace(
+        id=f"prod-{i}", name=f"稳健产品{i}", product_type="wealth", risk_level="C1", term_days=90,
+        minimum_amount=100, liquidity="medium", target_customer_type="individual", status="active",
+    )
+
+
+class _EmptyRules:
+    def scalars(self):
+        return _EmptyRules()
+
+    def all(self):
+        return []
+
+
+class _FakeSession:
+    async def execute(self, _stmt):
+        return _EmptyRules()
+
+
+async def _recommend(many: int):
+    risk = SimpleNamespace(risk_level="C1", status="active")
+    profile = SimpleNamespace(customer_type="individual")
+    asset = SimpleNamespace(total_asset=1_000_000, investable_asset=500_000)
+
+    async def _get_active(_session, _user_id):
+        return risk
+
+    async def _latest_or_derived(_session, _user_id):
+        return asset
+
+    async def _get_profile(_session, _user_id):
+        return profile
+
+    async def _list_active(_session):
+        return [_product(i) for i in range(many)]
+
+    service = SuitabilityService(
+        risk_repository=SimpleNamespace(get_active=_get_active),
+        product_repository=SimpleNamespace(list_active=_list_active),
+        profile_repository=SimpleNamespace(get=_get_profile),
+        asset_service=SimpleNamespace(latest_or_derived=_latest_or_derived),
+    )
+    return await service.recommend(_FakeSession(), "u", preferences={"risk_preference": "conservative"}, top_n=5)
+
+
+def test_recommend_top_n_caps_and_annotates_each_match():
+    # 10 个都通过适当性门禁的产品 → 应只精选返回 top_n=5，且每条带逐条推荐理由
+    import asyncio
+    resp = asyncio.run(_recommend(many=10))
+    assert len(resp.matches) == 5
+    for m in resp.matches:
+        assert m.recommendation_reason and m.recommendation_reason.strip()
+    assert resp.preference_note.startswith("满足适当性的产品共 10 个")
+    assert "精选前 5" in resp.preference_note
+
+
+def test_recommend_under_top_n_keeps_all_and_lists_note():
+    import asyncio
+    resp = asyncio.run(_recommend(many=3))
+    assert len(resp.matches) == 3
+    assert all(m.recommendation_reason for m in resp.matches)
+    assert "以下 3 个产品通过适当性匹配" in resp.preference_note
