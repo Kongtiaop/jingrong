@@ -6,7 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# 国内服务器走清华 PyPI 镜像加速依赖下载；本地/海外可用 --build-arg PIP_INDEX_URL=https://pypi.org/simple 覆盖
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip install --no-cache-dir -r requirements.txt -i ${PIP_INDEX_URL}
 COPY app ./app
 COPY workers ./workers
 COPY scripts ./scripts
