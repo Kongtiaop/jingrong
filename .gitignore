@@ -41,3 +41,10 @@ frontend/playwright-report/
 frontend/test-results/
 test-results/
 frontend/frontend/
+
+# Root-level personal / interview scratch notes & generated HTML (kept locally, not synced)
+/*.html
+/开发引导.md
+/新建 文本文档.txt
+/答辩所需文档交付物清单.txt
+/答辩须知.md
