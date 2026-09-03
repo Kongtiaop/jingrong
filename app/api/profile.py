@@ -427,6 +427,47 @@ async def staff_advisors(request: Request, limit: int = 20, offset: int = 0, use
         rows=list((await session.execute(query.offset(max(offset,0)).limit(min(max(limit,1),100)))).scalars().all())
         return ApiResponse(data={"items":[{"id": row.id, "username": row.username, "display_name": row.display_name} for row in rows],"total":total})
 
+@router.get("/staff/customer/{user_id}/memory-facts", response_model=ApiResponse[dict])
+async def staff_customer_memory_facts(request: Request, user_id: str, user: Annotated[User, Depends(current_user)]):
+    """员工/投顾按授权读取某客户的低风险记忆事实（只读）。
+
+    只暴露低风险、非敏感、可归因的偏好事实（risk_preference/product_preference/
+    investment_horizon_preference/active_product）与最近会话摘要，供员工服务客户时作上下文。
+    不绕过任何权限/风控/确认门禁；不写客户记忆。
+    授权：super_admin 可读任意；否则需 customer:read_all 或对该客户存在 active 投顾授权。
+    """
+    from app.services.shared_memory_service import SharedMemoryService
+    whitelist = {"risk_preference", "product_preference", "investment_horizon_preference", "active_product"}
+    async with request.app.state.database.session_factory() as session:
+        target = (await session.execute(select(User).where(User.id == user_id, User.status == "active"))).scalar_one_or_none()
+        if target is None:
+            raise HTTPException(status_code=404, detail={"code": "CUSTOMER_NOT_FOUND", "message": "customer not found"})
+        if not user.is_super_admin:
+            perms = {p.code for role in user.roles for p in role.permissions}
+            has_read_all = "customer:read_all" in perms
+            has_authz = (await _active_advisor_authorization(session, user_id, str(user.id))) is not None
+            if not has_read_all and not has_authz:
+                raise HTTPException(status_code=403, detail={"code": "CUSTOMER_MEMORY_FORBIDDEN", "message": "无权读取该客户记忆"})
+    memory = CustomerMemoryService(request.app.state.database, None)
+    rows = await memory.load_long_term(customer_id=user_id)
+    facts = {r.key: str(r.value) for r in rows if getattr(r, "key", None) in whitelist and getattr(r, "value", "")}
+    try:
+        shared = await SharedMemoryService(request.app.state.database, None).recall(customer_id=user_id, agent_type="advisor", memory_type="observation")
+        for r in shared:
+            if getattr(r, "key", None) in whitelist and getattr(r, "value", "") and r.key not in facts:
+                facts[r.key] = str(r.value)
+    except Exception:  # noqa: BLE001 - 记忆异常不阻塞档案读取
+        pass
+    summary = ""
+    try:
+        rec = await SharedMemoryService(request.app.state.database, None).recall(customer_id=user_id, agent_type="customer_service", key="conversation_summary")
+        if rec:
+            summary = str(rec[0].value or "")
+    except Exception:  # noqa: BLE001 - 记忆异常不阻塞档案读取
+        pass
+    return ApiResponse(data={"customer_id": user_id, "display_name": target.display_name, "username": target.username, "facts": facts, "conversation_summary": summary})
+
+
 @router.post("/staff/recommendations", response_model=ApiResponse[StaffRecommendationResponse])
 async def staff_recommendations(request: Request, payload: StaffRecommendationRequest, user: Annotated[User, Depends(advisor_user)]):
     uow = resolve_profile_uow(request)

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { genId } from '../utils/id'
 import { useRoute } from 'vue-router'
 import { useAuth } from '../stores/auth'
@@ -15,6 +15,9 @@ const isAdvisor = computed(() => auth.me.value?.roles?.includes('advisor') === t
 const customers = ref<any[]>([])
 // 对话中自动识别的“正在服务的目标客户”（信息性：仅用于未点名的后续指令与代客下单；可随时取消）
 const targetId = ref('')
+// 目标客户的共享记忆档案（只读，按授权读取）
+const customerMemory = ref<any>(null)
+const showMemory = ref(false)
 const query = ref('')
 const loading = ref(false)
 const messages = ref<any[]>([])
@@ -31,6 +34,18 @@ function responseError(e: any) { return e?.response?.data?.detail?.message || e?
 function customerById(id: string) { return customers.value.find((c: any) => c.id === id) }
 function customerLabel(c: any) { return c ? (c.display_name || c.username || c.id) : '' }
 function targetLabel() { return customerLabel(customerById(targetId.value)) }
+function factLabel(key: string) {
+  return ({ risk_preference: '风险偏好', product_preference: '产品偏好', investment_horizon_preference: '投资期限偏好', active_product: '近期活跃产品' } as Record<string, string>)[key] || key
+}
+watch(targetId, async (id) => {
+  if (!id) { customerMemory.value = null; showMemory.value = false; return }
+  customerMemory.value = null
+  try {
+    customerMemory.value = (await profileApi.customerMemory(id)).data.data || null
+  } catch {
+    customerMemory.value = null
+  }
+})
 
 function scrollToBottom() { nextTick(() => { if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight }) }
 function pushBubble(msg: any) { messages.value.push(msg); scrollToBottom() }
@@ -317,6 +332,21 @@ onMounted(() => { if (canView.value) loadCustomers() })
       <div class="nl-footer">
         <div v-if="targetId" class="nl-target-line">
           <span class="nl-target-chip">当前目标客户：{{ targetLabel() }} <button title="取消目标客户" @click="clearTarget">✕</button></span>
+          <button v-if="customerMemory" class="nl-memory-toggle" :class="{ open: showMemory }" @click="showMemory = !showMemory">
+            {{ showMemory ? '收起客户记忆' : '查看客户记忆' }}
+          </button>
+        </div>
+        <div v-if="showMemory && customerMemory" class="nl-memory-panel">
+          <div class="nl-memory-head"><strong>客户已知偏好 · {{ customerMemory.display_name || customerMemory.username }}</strong><small>读取客户共享记忆，仅作上下文</small></div>
+          <p v-if="!Object.keys(customerMemory.facts || {}).length && !customerMemory.conversation_summary" class="nl-muted">
+            暂无已记录的偏好或会话摘要。客户自述偏好、完成风险测评或产生会话总结后会出现。
+          </p>
+          <template v-else>
+            <div v-if="Object.keys(customerMemory.facts || {}).length" class="nl-memory-facts">
+              <span v-for="(v, k) in customerMemory.facts" :key="k"><b>{{ factLabel(k) }}</b>：{{ v }}</span>
+            </div>
+            <div v-if="customerMemory.conversation_summary" class="nl-memory-summary"><b>最近会话摘要</b>：{{ customerMemory.conversation_summary }}</div>
+          </template>
         </div>
         <div class="nl-input-row">
           <textarea v-model="query" rows="1" class="nl-input" data-testid="supervisor-console-input"
@@ -390,10 +420,20 @@ onMounted(() => { if (canView.value) loadCustomers() })
 .nl-typing { color: #94a3b8; font-size: 12px; padding: 4px 4px 0; }
 
 .nl-footer { border-top: 1px solid #e2e8f0; background: #fff; padding: 10px 14px 12px; }
-.nl-target-line { margin-bottom: 8px; }
+.nl-target-line { margin-bottom: 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .nl-target-chip { display: inline-flex; align-items: center; gap: 8px; background: #eff6ff; border: 1px solid #bfdbfe; color: #1e3a8a; font-size: 12px; border-radius: 999px; padding: 4px 10px; }
 .nl-target-chip button { border: 0; background: transparent; color: #64748b; cursor: pointer; font-size: 12px; line-height: 1; }
 .nl-target-chip button:hover { color: #dc2626; }
+.nl-memory-toggle { border: 1px solid #cbd5e1; background: #fff; color: #475569; border-radius: 999px; font-size: 12px; padding: 4px 12px; cursor: pointer; }
+.nl-memory-toggle.open { background: #f0f9ff; border-color: #38bdf8; color: #0369a1; }
+.nl-memory-panel { margin-bottom: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; font-size: 12px; color: #334155; }
+.nl-memory-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.nl-memory-head small { color: #94a3b8; }
+.nl-memory-facts { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.nl-memory-facts span b { color: #7c3aed; }
+.nl-memory-summary { margin-top: 6px; border-left: 2px solid #cbd5e1; padding-left: 8px; color: #64748b; line-height: 1.5; }
+.nl-memory-summary b { color: #475569; }
+
 .nl-input-row { display: flex; gap: 10px; align-items: flex-end; }
 .nl-input { flex: 1; border: 1px solid #cbd5e1; border-radius: 12px; padding: 11px 14px; font: inherit; resize: none; line-height: 1.5; max-height: 160px; }
 .nl-input:focus { outline: none; border-color: #1d4ed8; }
