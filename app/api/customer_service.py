@@ -47,6 +47,18 @@ def _is_customer(user: User) -> bool:
     return any(role.code == "customer" for role in user.roles)
 
 
+async def _can_analyze_target(session, user: User, target_customer_id: str | None) -> bool:
+    """staff/advisor/super_admin 是否可把只读分析聚焦到目标客户（customer 一律不可）。"""
+    if not target_customer_id:
+        return False
+    if _is_customer(user):
+        return False  # 客户不能带 target 去读他人
+    if user.is_super_admin:
+        return True  # super_admin 不受限
+    authorized = await SubjectScopeService.authorized_subject_ids(session, user)
+    return target_customer_id in authorized
+
+
 def _permissions(user: User) -> set[str]:
     return {permission.code for role in user.roles for permission in role.permissions}
 
@@ -189,19 +201,27 @@ async def intent_plan(request: Request, payload: CustomerServiceActionRequest, u
 @router.post("/agent/execute", response_model=ApiResponse[CustomerTaskExecutionResponse])
 async def execute_unified_agent(request: Request, payload: UnifiedAgentRequest, user: Annotated[User, Depends(current_user)]):
     conversation_id = payload.conversation_id or request.headers.get("X-Conversation-Id") or str(uuid4())
-    # 偏好表态：任何客户 query 都先尝试持久化用户自述偏好，不受 Agent 路由影响（否则被 data_analysis 拦截时不落库）
-    try:
-        pref = extract_preference_statement(payload.content)
-        if pref:
-            await CustomerMemoryService(request.app.state.database, request.app.state.redis.client).remember(
-                customer_id=user.id, key=pref[0], value=pref[1], memory_type="conversation_fact", source="customer_stated", conversation_id=conversation_id)
-            # 共享记忆语义层：客服观察写入 shared 作用域，供投顾/推荐等其它 Agent 复用
-            await SharedMemoryService(request.app.state.database, request.app.state.redis.client).remember(
-                customer_id=user.id, agent_type="customer_service", key=pref[0], value=pref[1],
-                memory_type="observation", scope="shared", source="customer_stated",
-                conversation_id=conversation_id, actor_user_id=user.id)
-    except Exception:  # noqa: BLE001 - 记忆失败不阻塞主流程
-        pass
+    # staff/advisor 把只读分析聚焦到某目标客户时的授权校验（customer 一律不允许带 target）
+    if payload.target_customer_id:
+        async with request.app.state.database.session_factory() as target_session:
+            allowed = await _can_analyze_target(target_session, user, payload.target_customer_id)
+        if not allowed:
+            raise HTTPException(status_code=403, detail={"code": "TARGET_CUSTOMER_NOT_AUTHORIZED", "message": "无权查询该目标客户"})
+    # 客户专属记忆/偏好只在 customer 本人调用时写入；staff/advisor 分析不得把自己当作客户落记忆
+    if _is_customer(user):
+        # 偏好表态：任何客户 query 都先尝试持久化用户自述偏好，不受 Agent 路由影响（否则被 data_analysis 拦截时不落库）
+        try:
+            pref = extract_preference_statement(payload.content)
+            if pref:
+                await CustomerMemoryService(request.app.state.database, request.app.state.redis.client).remember(
+                    customer_id=user.id, key=pref[0], value=pref[1], memory_type="conversation_fact", source="customer_stated", conversation_id=conversation_id)
+                # 共享记忆语义层：客服观察写入 shared 作用域，供投顾/推荐等其它 Agent 复用
+                await SharedMemoryService(request.app.state.database, request.app.state.redis.client).remember(
+                    customer_id=user.id, agent_type="customer_service", key=pref[0], value=pref[1],
+                    memory_type="observation", scope="shared", source="customer_stated",
+                    conversation_id=conversation_id, actor_user_id=user.id)
+        except Exception:  # noqa: BLE001 - 记忆失败不阻塞主流程
+            pass
     registry = AgentCapabilityRegistry()
     available_agents = registry.available_for(user)
     denied_agents = registry.denied_for(user)

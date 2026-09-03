@@ -28,6 +28,8 @@ class UnifiedAgentRequest(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=128)
     page_context: str = Field(default="", max_length=256)
     resource_id: str | None = Field(default=None, max_length=128)
+    # staff/advisor 把只读分析聚焦到某个目标客户时传入；customer 一律不允许带（防越权读他人）
+    target_customer_id: str | None = Field(default=None, max_length=128)
 
 
 class CustomerServiceAssignRequest(BaseModel):
