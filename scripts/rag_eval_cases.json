@@ -1,24 +1,640 @@
 {
   "description": "RAG 检索质量评测集 v2（query → 期望命中的真实知识内容片段），数据飞轮 · 三分法",
-  "version": "2.0",
+  "version": "3.0",
   "split_note": "train=调优 top_k/rrf_k/min_score；val=筛选参数；test=最终验证。gold_fragments 为真实公开知识文档中应命中的子串。",
   "corpus_note": "仅覆盖公共 scope 实际可检索的内容：企业信息.md(company_info/company_business)、个人投资者适当性管理指南.md(policy/risk_public，需 fix_rag_knowledge_meta 把 general→policy)、客服FAQ。workflow/内部文档(高净值客户服务规范=staff)不进公共评测。",
   "cases": [
-    {"id": "rag_01", "split": "train", "intent": "company_info", "query": "你们公司服务多少客户", "gold_fragments": ["累计服务客户", "客户规模"]},
-    {"id": "rag_02", "split": "train", "intent": "company_info", "query": "客服电话是多少", "gold_fragments": ["客户服务热线", "400"]},
-    {"id": "rag_03", "split": "train", "intent": "company_info", "query": "你们公司有哪些牌照", "gold_fragments": ["基金销售业务资格", "保险经纪业务许可证", "证券投资咨询业务资格"]},
-    {"id": "rag_04", "split": "train", "intent": "company_business", "query": "你们有没有机构金融业务", "gold_fragments": ["机构金融事业部", "企业信贷"]},
-    {"id": "rag_05", "split": "train", "intent": "company_business", "query": "有没有私人银行服务", "gold_fragments": ["私人银行", "高净值"]},
-    {"id": "rag_06", "split": "train", "intent": "policy", "query": "什么是适当性管理", "gold_fragments": ["适当性管理"]},
-    {"id": "rag_07", "split": "train", "intent": "risk_public", "query": "风险测评怎么分级", "gold_fragments": ["风险测评", "风险类型"]},
-    {"id": "rag_08", "split": "train", "intent": "risk_public", "query": "什么算专业投资者", "gold_fragments": ["专业投资者"]},
-    {"id": "rag_09", "split": "train", "intent": "faq", "query": "客服热线是多少", "gold_fragments": ["客户服务热线", "400"]},
-    {"id": "rag_10", "split": "train", "intent": "company_info", "query": "你们公司有什么数字化系统", "gold_fragments": ["智能财富管家", "AI投顾引擎"]},
-    {"id": "rag_11", "split": "val", "intent": "company_info", "query": "公司规模怎么样", "gold_fragments": ["客户规模", "营业网点"]},
-    {"id": "rag_12", "split": "val", "intent": "policy", "query": "投资者适当性是什么意思", "gold_fragments": ["适当性管理"]},
-    {"id": "rag_13", "split": "val", "intent": "risk_public", "query": "测评结果怎么对应风险类型", "gold_fragments": ["风险类型"]},
-    {"id": "rag_14", "split": "test", "intent": "company_info", "query": "你们服务多少客户", "gold_fragments": ["累计服务客户"]},
-    {"id": "rag_15", "split": "test", "intent": "company_business", "query": "有没有机构客户业务", "gold_fragments": ["机构金融"]},
-    {"id": "rag_16", "split": "test", "intent": "policy", "query": "适当性管理包括什么", "gold_fragments": ["适当性管理"]}
-  ]
+    {
+      "id": "rag_01",
+      "split": "train",
+      "intent": "company_info",
+      "query": "你们公司服务多少客户",
+      "gold_fragments": [
+        "累计服务客户",
+        "客户规模"
+      ]
+    },
+    {
+      "id": "rag_02",
+      "split": "train",
+      "intent": "company_info",
+      "query": "客服电话是多少",
+      "gold_fragments": [
+        "客户服务热线",
+        "400"
+      ]
+    },
+    {
+      "id": "rag_03",
+      "split": "train",
+      "intent": "company_info",
+      "query": "你们公司有哪些牌照",
+      "gold_fragments": [
+        "基金销售业务资格",
+        "保险经纪业务许可证",
+        "证券投资咨询业务资格"
+      ]
+    },
+    {
+      "id": "rag_04",
+      "split": "train",
+      "intent": "company_business",
+      "query": "你们有没有机构金融业务",
+      "gold_fragments": [
+        "机构金融事业部",
+        "企业信贷"
+      ]
+    },
+    {
+      "id": "rag_05",
+      "split": "train",
+      "intent": "company_business",
+      "query": "有没有私人银行服务",
+      "gold_fragments": [
+        "私人银行",
+        "高净值"
+      ]
+    },
+    {
+      "id": "rag_06",
+      "split": "train",
+      "intent": "policy",
+      "query": "什么是适当性管理",
+      "gold_fragments": [
+        "适当性管理"
+      ]
+    },
+    {
+      "id": "rag_07",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "风险测评怎么分级",
+      "gold_fragments": [
+        "风险测评",
+        "风险类型"
+      ]
+    },
+    {
+      "id": "rag_08",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "什么算专业投资者",
+      "gold_fragments": [
+        "专业投资者"
+      ]
+    },
+    {
+      "id": "rag_09",
+      "split": "train",
+      "intent": "faq",
+      "query": "客服热线是多少",
+      "gold_fragments": [
+        "客户服务热线",
+        "400"
+      ]
+    },
+    {
+      "id": "rag_10",
+      "split": "train",
+      "intent": "company_info",
+      "query": "你们公司有什么数字化系统",
+      "gold_fragments": [
+        "智能财富管家",
+        "AI投顾引擎"
+      ]
+    },
+    {
+      "id": "rag_11",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司规模怎么样",
+      "gold_fragments": [
+        "客户规模",
+        "营业网点"
+      ]
+    },
+    {
+      "id": "rag_12",
+      "split": "train",
+      "intent": "policy",
+      "query": "投资者适当性是什么意思",
+      "gold_fragments": [
+        "适当性管理"
+      ]
+    },
+    {
+      "id": "rag_13",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "测评结果怎么对应风险类型",
+      "gold_fragments": [
+        "风险类型"
+      ]
+    },
+    {
+      "id": "rag_14",
+      "split": "train",
+      "intent": "company_info",
+      "query": "你们服务多少客户",
+      "gold_fragments": [
+        "累计服务客户"
+      ]
+    },
+    {
+      "id": "rag_15",
+      "split": "train",
+      "intent": "company_business",
+      "query": "有没有机构客户业务",
+      "gold_fragments": [
+        "机构金融"
+      ]
+    },
+    {
+      "id": "rag_16",
+      "split": "train",
+      "intent": "policy",
+      "query": "适当性管理包括什么",
+      "gold_fragments": [
+        "适当性管理"
+      ]
+    },
+    {
+      "id": "rag_17",
+      "split": "train",
+      "intent": "company_info",
+      "query": "你们公司是什么类型的企业",
+      "gold_fragments": [
+        "有限责任公司",
+        "综合金融服务"
+      ]
+    },
+    {
+      "id": "rag_18",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司的中文全称是什么",
+      "gold_fragments": [
+        "XX科技有限公司"
+      ]
+    },
+    {
+      "id": "rag_19",
+      "split": "train",
+      "intent": "company_info",
+      "query": "你们公司注册地址在哪",
+      "gold_fragments": [
+        "注册地址",
+        "XX路"
+      ]
+    },
+    {
+      "id": "rag_20",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司的办公地址是哪里",
+      "gold_fragments": [
+        "办公地址"
+      ]
+    },
+    {
+      "id": "rag_21",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司的法定代表人是谁",
+      "gold_fragments": [
+        "法定代表人",
+        "张某"
+      ]
+    },
+    {
+      "id": "rag_22",
+      "split": "train",
+      "intent": "company_info",
+      "query": "你们注册资本多少",
+      "gold_fragments": [
+        "注册资本",
+        "万元"
+      ]
+    },
+    {
+      "id": "rag_23",
+      "split": "train",
+      "intent": "company_info",
+      "query": "客户服务热线是什么",
+      "gold_fragments": [
+        "客户服务热线",
+        "400"
+      ]
+    },
+    {
+      "id": "rag_24",
+      "split": "train",
+      "intent": "company_info",
+      "query": "你们的官网站点是什么",
+      "gold_fragments": [
+        "www.xxtech.com"
+      ]
+    },
+    {
+      "id": "rag_25",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司有多少员工",
+      "gold_fragments": [
+        "员工人数",
+        "人"
+      ]
+    },
+    {
+      "id": "rag_26",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司总共有多少营业网点",
+      "gold_fragments": [
+        "营业网点",
+        "网点"
+      ]
+    },
+    {
+      "id": "rag_27",
+      "split": "train",
+      "intent": "company_info",
+      "query": "累计服务了多少客户",
+      "gold_fragments": [
+        "累计服务客户"
+      ]
+    },
+    {
+      "id": "rag_28",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司管理多少资产AUM",
+      "gold_fragments": [
+        "AUM",
+        "资产管理规模"
+      ]
+    },
+    {
+      "id": "rag_29",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司有几个核心业务线",
+      "gold_fragments": [
+        "财富管理",
+        "机构金融",
+        "私人银行"
+      ]
+    },
+    {
+      "id": "rag_30",
+      "split": "train",
+      "intent": "company_info",
+      "query": "智能财富管家系统是什么",
+      "gold_fragments": [
+        "智能财富管家",
+        "AI投顾"
+      ]
+    },
+    {
+      "id": "rag_31",
+      "split": "train",
+      "intent": "company_info",
+      "query": "智能风控平台准确率多少",
+      "gold_fragments": [
+        "99.2%",
+        "风控平台"
+      ]
+    },
+    {
+      "id": "rag_32",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司的行业使命是什么",
+      "gold_fragments": [
+        "让财富管理更智能"
+      ]
+    },
+    {
+      "id": "rag_33",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司的企业愿景是什么",
+      "gold_fragments": [
+        "企业愿景",
+        "智能财富管理平台"
+      ]
+    },
+    {
+      "id": "rag_34",
+      "split": "train",
+      "intent": "company_info",
+      "query": "公司的核心价值观包含哪些",
+      "gold_fragments": [
+        "合规经营"
+      ]
+    },
+    {
+      "id": "rag_35",
+      "split": "train",
+      "intent": "company_business",
+      "query": "有没有机构金融业务",
+      "gold_fragments": [
+        "机构金融事业部",
+        "企业信贷"
+      ]
+    },
+    {
+      "id": "rag_36",
+      "split": "train",
+      "intent": "company_business",
+      "query": "提供什么机构金融方案",
+      "gold_fragments": [
+        "综合金融解决方案",
+        "供应链金融"
+      ]
+    },
+    {
+      "id": "rag_37",
+      "split": "train",
+      "intent": "company_business",
+      "query": "私人银行服务对客门槛是多少",
+      "gold_fragments": [
+        "1000万元",
+        "私人银行"
+      ]
+    },
+    {
+      "id": "rag_38",
+      "split": "train",
+      "intent": "company_business",
+      "query": "私人银行提供哪些服务",
+      "gold_fragments": [
+        "资产配置",
+        "全球资产配置",
+        "税务筹划"
+      ]
+    },
+    {
+      "id": "rag_39",
+      "split": "train",
+      "intent": "company_business",
+      "query": "公司财富管理业务提供什么",
+      "gold_fragments": [
+        "财富管理"
+      ]
+    },
+    {
+      "id": "rag_40",
+      "split": "train",
+      "intent": "policy",
+      "query": "适当性管理依据什么法规",
+      "gold_fragments": [
+        "证券期货投资者适当性管理办法"
+      ]
+    },
+    {
+      "id": "rag_41",
+      "split": "train",
+      "intent": "policy",
+      "query": "适当性指南的文件编号是多少",
+      "gold_fragments": [
+        "JR-AST-2024-001"
+      ]
+    },
+    {
+      "id": "rag_42",
+      "split": "train",
+      "intent": "policy",
+      "query": "适当性指南的版本号是多少",
+      "gold_fragments": [
+        "V3.2"
+      ]
+    },
+    {
+      "id": "rag_43",
+      "split": "train",
+      "intent": "policy",
+      "query": "投资者分哪两大类",
+      "gold_fragments": [
+        "专业投资者",
+        "普通投资者"
+      ]
+    },
+    {
+      "id": "rag_44",
+      "split": "train",
+      "intent": "policy",
+      "query": "什么是专业投资者",
+      "gold_fragments": [
+        "专业投资者"
+      ]
+    },
+    {
+      "id": "rag_45",
+      "split": "train",
+      "intent": "policy",
+      "query": "普通投资者分几档",
+      "gold_fragments": [
+        "C1",
+        "C5",
+        "保守型",
+        "激进型"
+      ]
+    },
+    {
+      "id": "rag_46",
+      "split": "train",
+      "intent": "policy",
+      "query": "风险评估问卷多少道题",
+      "gold_fragments": [
+        "16道",
+        "问卷"
+      ]
+    },
+    {
+      "id": "rag_47",
+      "split": "train",
+      "intent": "policy",
+      "query": "风险评估总分多少",
+      "gold_fragments": [
+        "100分"
+      ]
+    },
+    {
+      "id": "rag_48",
+      "split": "train",
+      "intent": "policy",
+      "query": "什么算机构专业投资者",
+      "gold_fragments": [
+        "金融机构",
+        "净资产不低于2000万元"
+      ]
+    },
+    {
+      "id": "rag_49",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "产品风险等级怎么分",
+      "gold_fragments": [
+        "R1",
+        "R5",
+        "低风险",
+        "高风险"
+      ]
+    },
+    {
+      "id": "rag_50",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "C1投资者能买R3产品吗",
+      "gold_fragments": [
+        "C1投资者不得购买R3",
+        "跨级禁止"
+      ]
+    },
+    {
+      "id": "rag_51",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "风险等级怎么对应风险类型",
+      "gold_fragments": [
+        "风险类型",
+        "C1",
+        "激进型"
+      ]
+    },
+    {
+      "id": "rag_52",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "20到35分对应什么风险类型",
+      "gold_fragments": [
+        "保守型",
+        "C1"
+      ]
+    },
+    {
+      "id": "rag_53",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "评分81到100分对应什么",
+      "gold_fragments": [
+        "激进型",
+        "C5"
+      ]
+    },
+    {
+      "id": "rag_54",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "什么是硬匹配规则",
+      "gold_fragments": [
+        "硬匹配",
+        "正向匹配",
+        "跨级禁止"
+      ]
+    },
+    {
+      "id": "rag_55",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "专业投资者需要做适当性匹配吗",
+      "gold_fragments": [
+        "专业投资者豁免",
+        "适当性匹配"
+      ]
+    },
+    {
+      "id": "rag_56",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "C3投资者能买R4产品吗",
+      "gold_fragments": [
+        "C3",
+        "风险揭示书",
+        "20%"
+      ]
+    },
+    {
+      "id": "rag_57",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "哪些情形必须拒绝交易",
+      "gold_fragments": [
+        "拒绝交易",
+        "问卷过期",
+        "虚假信息"
+      ]
+    },
+    {
+      "id": "rag_58",
+      "split": "train",
+      "intent": "risk_public",
+      "query": "风险评估问卷多久要重新评估",
+      "gold_fragments": [
+        "12个月",
+        "重新评估"
+      ]
+    },
+    {
+      "id": "rag_59",
+      "split": "val",
+      "intent": "risk_public",
+      "query": "65岁以上投资者买产品有什么要求",
+      "gold_fragments": [
+        "65周岁",
+        "双录"
+      ]
+    },
+    {
+      "id": "rag_60",
+      "split": "test",
+      "intent": "risk_public",
+      "query": "什么是冷静期",
+      "gold_fragments": [
+        "冷静期",
+        "投资合同"
+      ]
+    },
+    {
+      "id": "rag_61",
+      "split": "val",
+      "intent": "risk_public",
+      "query": "冷静期后退款要多长时间",
+      "gold_fragments": [
+        "3个工作日"
+      ]
+    },
+    {
+      "id": "rag_62",
+      "split": "test",
+      "intent": "risk_public",
+      "query": "私募产品冷静期有什么要求",
+      "gold_fragments": [
+        "冷静期",
+        "回访",
+        "私募"
+      ]
+    },
+    {
+      "id": "rag_63",
+      "split": "val",
+      "intent": "risk_public",
+      "query": "双录要保存多久",
+      "gold_fragments": [
+        "双录",
+        "20年"
+      ]
+    },
+    {
+      "id": "rag_64",
+      "split": "test",
+      "intent": "risk_public",
+      "query": "适当性匹配中C1投资者跨级会怎样",
+      "gold_fragments": [
+        "系统直接拒绝交易"
+      ]
+    }
+  ],
+  "note_added": "added 48 real-doc cases; total 64"
 }
