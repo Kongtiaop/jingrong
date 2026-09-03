@@ -20,6 +20,7 @@ from app.services.subagent_executor import SubagentExecutor
 from app.schemas.subagent import SubagentMergeResult, SubagentResult, SubagentTask
 from app.schemas.intent import StructuredEntity, StructuredIntent
 import asyncio
+import re
 
 
 AGENT_ROUTE_BY_INTENT = {
@@ -104,6 +105,21 @@ def long_term_facts(rows) -> dict:
         if getattr(row, "key", None) in LONG_TERM_READ_KEYS and getattr(row, "value", ""):
             facts[row.key] = str(row.value)
     return facts
+
+
+_PURE_PREF_REQUEST_MARKERS = re.compile(
+    r"(推荐|申购|购买|买入|下单|适合|想要买|给我推|帮我推|推荐什么|有哪些产品|看看产品|筛选|比较|搭配|组合)"
+)
+
+
+def pure_preference_statement(query: str, pref) -> bool:
+    """仅当消息基本只是自述偏好、没有要求推荐/购买/筛选时返回 True。"""
+    if not pref:
+        return False
+    q = (query or "").strip()
+    if _PURE_PREF_REQUEST_MARKERS.search(q):
+        return False
+    return True
 
 
 class CustomerAgentExecutionService:
@@ -258,6 +274,18 @@ class CustomerAgentExecutionService:
                 conversation_context = str(shared[0].value)
         except Exception:  # noqa: BLE001 - 上下文读取失败不阻塞
             conversation_context = ""
+        # 纯偏好自述（未要求推荐/购买/筛选，且不是正在澄清的补答）：只落记忆并先确认，不直接自动推产品清单
+        if not pending.get("tasks") and pure_preference_statement(user_query, pref):
+            await memory.save_short_term(customer_id=customer_id, conversation_id=conversation_id, state={**short_term, "conversation_id": conversation_id, "original_query": user_query, "latest_query": user_query, "task_results": [], "plan_execution_modes": [], "clarification": None, "missing_parameter": False, "clarification_count": 0, "pending_intent_plan": {}, "handoff": None, "active_product": active_product or ""})
+            return CustomerTaskExecutionResponse(
+                conversation_id=conversation_id,
+                overall_status="needs_clarification",
+                answer=f"好的，我已记下您的偏好：{pref[1]}。需要我按这个偏好为您推荐合适的产品吗？",
+                route="customer_recommendation",
+                agents=["CustomerRecommendationCapability"],
+                results=[],
+                clarification=None,
+            )
         plan = planner.plan(combined_query, context={"active_product": active_product})
         should_observe = self.settings.llm_intent_shadow_enabled or self.settings.llm_intent_fallback_enabled
         if should_observe:

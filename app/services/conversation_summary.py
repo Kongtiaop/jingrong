@@ -54,7 +54,7 @@ class ConversationSummaryService:
                 return None
             provider = QwenProvider(settings)
         try:
-            resp = await provider._client.chat.completions.create(
+            resp = await provider.chat_completions(
                 model=provider.settings.qwen_chat_model, temperature=0.2,
                 response_format={"type": "json_object"},
                 messages=[{"role": "system", "content": SYSTEM},

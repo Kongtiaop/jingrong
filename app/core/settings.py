@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     qwen_chat_model: str = "qwen-plus"
     qwen_max_model: str = "qwen-max"   # LLM-as-judge 用更强模型（judge ≠ 生成模型，减少自评偏置）
+    # 交互式 LLM 调用的受控超时：避免 DashScope 偶发抖动时单次请求干挂到 httpx 默认 120s
+    qwen_chat_timeout_seconds: float = 30.0
+    qwen_chat_connect_timeout_seconds: float = 8.0
     # 与 docker 生产一致：真实 DashScope 通义千问 embedding 模型。旧默认 "qwen3.7-text-embedding"
     # 非真实模型名，曾导致入库向量与 API 查询向量模型不一致（向量检索失效）。必须与重嵌入用同一模型。
     qwen_embedding_model: str = "text-embedding-v4"

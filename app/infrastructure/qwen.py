@@ -111,6 +111,23 @@ class QwenProvider:
             return {"status": "skipped", "reason": "DASHSCOPE_API_KEY is not configured"}
         return {"status": "configured", "model": self.settings.qwen_embedding_model}
 
+    async def chat_completions(self, **kwargs):
+        """Chat completions with a bounded interactive timeout.
+
+        Each interactive call is capped by qwen_chat_*_timeout_seconds so a slow/
+        flaky DashScope returns promptly (instead of hanging to the 120s httpx cap)
+        and callers can degrade gracefully. Embedding keeps its own client timeout.
+        """
+        if self._client is None:
+            raise RuntimeError("DASHSCOPE_API_KEY is not configured")
+        timeout = kwargs.pop("timeout", None)
+        if timeout is None:
+            timeout = httpx.Timeout(
+                self.settings.qwen_chat_timeout_seconds,
+                connect=self.settings.qwen_chat_connect_timeout_seconds,
+            )
+        return await self._client.chat.completions.create(timeout=timeout, **kwargs)
+
     async def classify(self, *, query: str, conversation_summary: str = "") -> dict:
         """StructuredIntentProvider-compatible alias for intent fallback."""
         return await self.classify_intent(query=query, conversation_summary=conversation_summary)
@@ -186,7 +203,7 @@ class QwenProvider:
             rule_confidence=rule_signals["rule_confidence"],
             intent_count=rule_signals["intent_count"],
         )
-        response = await self._client.chat.completions.create(
+        response = await self.chat_completions(
             model=model,
             temperature=0,
             max_tokens=2048,
@@ -210,7 +227,7 @@ class QwenProvider:
         if raw:
             try:
                 hardened_user = f"{user}\n【重要】必须只输出一个合法 JSON 对象。逗号、引号、大中小括号必须完整闭合，字符串值用双引号，不要省略、不要缺逗号、不要尾逗号。"
-                response = await self._client.chat.completions.create(
+                response = await self.chat_completions(
                     model=model,
                     temperature=0,
                     max_tokens=2048,
@@ -273,7 +290,7 @@ class QwenProvider:
         if self._client is None:
             raise RuntimeError("DASHSCOPE_API_KEY is not configured")
         model = model or self.settings.qwen_chat_model
-        response = await self._client.chat.completions.create(
+        response = await self.chat_completions(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,

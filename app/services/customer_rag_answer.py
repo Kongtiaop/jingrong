@@ -27,7 +27,7 @@ def build_answerability_judge(provider: QwenProvider):
             f"用户问题：{query}\n\n检索引用：\n{evidence}\n\n只回答 yes 或 no。"
         )
         try:
-            response = await provider._client.chat.completions.create(
+            response = await provider.chat_completions(
                 model=provider.settings.qwen_max_model,  # judge 用更强模型（qwen-max），避免自评偏置
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
@@ -60,7 +60,7 @@ class CustomerRagAnswerService:
             f"客户问题：{query}\n\n引用资料：\n{evidence}{history_block}"
         )
         try:
-            response = await self.provider._client.chat.completions.create(
+            response = await self.provider.chat_completions(
                 model=self.provider.settings.qwen_chat_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
