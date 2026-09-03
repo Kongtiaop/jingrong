@@ -28,6 +28,10 @@ difficulty_weights:
 # 检索参数（RAG / 目录）
 retrieval:
   top_k: 5
+  top_k_by_difficulty: {S: 5, M: 8, L: 10}   # 规则驱动动态 top_k：简单/中等/复杂 query 各召回数
+  top_k_enum: 10                              # 枚举/多实体 query（哪些/几个/牌照/业务线…）用更大 top_k
+  top_k_max: 15                               # 证据不足扩召回的硬上限（C 兜底）
+  top_k_bump: 3                               # 证据不足单次扩召回的增量（C 兜底）
   rrf_k: 60
   min_score: 0.0001
   min_similarity: 0.55   # 无 judge 时的兜底阈值（ambiguous 带）

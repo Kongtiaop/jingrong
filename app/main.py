@@ -24,12 +24,16 @@ from app.services.demo_customer_seed import ensure_demo_customer_profiles
 from app.services.demo_product_seed import ensure_demo_products
 from app.services.trading_service import TradingService
 from app.services.data_catalog_seed import ensure_data_catalog_seed
+from app.services.understanding_config import understanding_config
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
+    # 加载理解层配置（难度路由/检索参数/灰度）。此前仅在测试中 reload；
+    # 若此处不加载，understanding_config 单例 _data 恒为空 → 全部走代码内置默认。
+    understanding_config.reload()
     database = Database(settings)
     redis_client = RedisClient(settings)
     await ensure_schema(database.engine)

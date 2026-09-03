@@ -107,8 +107,8 @@ class CustomerRagService:
             pass
 
     async def answer(self, *, query: str, intent: CustomerKnowledgeIntent, top_k: int | None = None) -> CustomerRagResult:
-        # RAG 检索参数走理解层配置（top_k 可被模型自调）
-        top_k = top_k if top_k is not None else self._config.get_top_k()
+        # RAG 检索参数走理解层配置（top_k 默认按 query 难度动态给定，规则驱动；调用方可覆盖）。
+        top_k = top_k if top_k is not None else self._config.get_top_k_for_query(query)
         greeting = greeting_message(query)
         if greeting is not None:
             return CustomerRagResult(intent=intent, answer_mode="greeting", evidence_status="not_required", citations=[], handoff_required=False, message=greeting)
@@ -126,12 +126,32 @@ class CustomerRagService:
                 query_embedding = (await asyncio.wait_for(self.embedding_provider.embed([query]), timeout=self.embedding_timeout))[0]
             except Exception:
                 evidence_status = "embedding_degraded"
-        try:
-            citations = await self.retriever.search(query=normalized_query, query_embedding=query_embedding, top_k=top_k, scope=scope)
-        except Exception:
-            citations = await self.retriever.search(query=normalized_query, top_k=top_k, scope=scope)
-            evidence_status = "embedding_degraded" if query_embedding is not None else "text_fallback"
+
+        async def _do_search(effective_top_k: int):
+            nonlocal evidence_status
+            try:
+                return await self.retriever.search(query=normalized_query, query_embedding=query_embedding, top_k=effective_top_k, scope=scope)
+            except Exception:
+                # embedding 降级：退纯文本再查一次，并标记降级证据状态
+                evidence_status = "embedding_degraded" if query_embedding is not None else "text_fallback"
+                try:
+                    return await self.retriever.search(query=normalized_query, top_k=effective_top_k, scope=scope)
+                except Exception:
+                    return []
+
+        # 先按当前 top_k 检索
+        top_k_max = int(self._config.get_top_k_max())
+        top_k_bump = int(self._config.get_top_k_bump())
+        citations = await _do_search(top_k)
         useful = [item for item in citations if item.score >= self.min_score]
+        # C 兜底：证据不足(无 ≥min_score 引用) → 扩 top_k 重查，最多到 top_k_max，避免
+        # RRF 在 top_k 太紧时把某一路单独命中的 gold 挤出。
+        if not useful and top_k < top_k_max:
+            effective = min(top_k + top_k_bump, top_k_max)
+            if effective > top_k:
+                top_k = effective
+                citations = await _do_search(top_k)
+                useful = [item for item in citations if item.score >= self.min_score]
         if not useful:
             result = CustomerRagResult(intent=intent, answer_mode="handoff", evidence_status="low_confidence", citations=[], handoff_required=True, message="当前知识库没有足够依据，建议转人工客服或创建工单。")
             self._maybe_collect_bad_case(query, result)

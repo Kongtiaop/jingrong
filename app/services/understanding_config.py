@@ -24,7 +24,7 @@ try:
 except ImportError:  # pragma: no cover
     _load = yaml.load
 
-_CONFIG_DIR = os.path.dirname(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
+_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "config")
 _CONFIG_PATH = os.path.join(_CONFIG_DIR, "understanding.yaml")
 _GRAY_JSON = os.path.join(_CONFIG_DIR, "gray.json")
 
@@ -164,6 +164,51 @@ class UnderstandingConfig:
     # ---- 检索参数（无 query 上下文，保持 live） ----
     def get_top_k(self) -> int:
         return int(self._data.get("retrieval", {}).get("top_k", 5))
+
+    # 枚举/多实体 query 信号：答案需覆盖多个并列项 → 主动给更大 top_k，避免 RRF 在
+    # top_k 太紧时把"某一路单独命中的 gold"挤出（如"有哪些牌照/哪几个业务线/分别是什么"）。
+    _ENUM_MARKERS = (
+        "哪些", "哪几个", "哪些部门", "分别", "有哪些", "哪几类", "哪些业务", "哪些产品",
+        "牌照", "业务线", "事业部", "分类", "包括什么", "包含哪些", "分别是什么", "各是什么",
+        "列举", "有几个", "几类", "列表",
+    )
+
+    def get_top_k_for_query(self, query: str, *, rule_confidence: float | None = None,
+                            intent_count: int | None = None) -> int:
+        """返回 query 的动态 top_k（规则驱动，改 yaml 即调参）。
+
+        优先级：
+          1) 枚举/多实体 query（需覆盖多个并列答案）→ top_k_enum（默认 10）。
+          2) 否则按难度：简单(S)/中等(M)/复杂(L) 取 retrieval.top_k_by_difficulty。
+          3) 缺省回退到 get_top_k()。
+        目的是在"答案分布多处、需要多召回"时降低 RRF top_k 截断把 gold 挤出的概率。
+        """
+        retrieval = self._data.get("retrieval", {}) or {}
+        q = query or ""
+        try:
+            if any(m in q for m in self._ENUM_MARKERS):
+                enum_val = int(retrieval.get("top_k_enum", 0))
+                if enum_val > 0:
+                    return enum_val
+        except Exception:  # noqa: BLE001 - 动态 top_k 失败不阻塞
+            pass
+        by_diff = retrieval.get("top_k_by_difficulty") or {}
+        try:
+            difficulty = self.estimate_difficulty(query, rule_confidence=rule_confidence, intent_count=intent_count)
+            val = int(by_diff.get(difficulty, 0))
+            if val > 0:
+                return val
+        except Exception:  # noqa: BLE001 - 动态 top_k 失败不阻塞，回退默认
+            pass
+        return self.get_top_k()
+
+    def get_top_k_max(self) -> int:
+        """C 兜底扩召回的硬上限（防过度膨胀）。"""
+        return int(self._data.get("retrieval", {}).get("top_k_max", 15))
+
+    def get_top_k_bump(self) -> int:
+        """证据不足时单次扩召回的增量（C 兜底用）。"""
+        return int(self._data.get("retrieval", {}).get("top_k_bump", 3))
 
     def get_rrf_k(self) -> int:
         return int(self._data.get("retrieval", {}).get("rrf_k", 60))
