@@ -17,8 +17,11 @@ export const customerRagApi = {
 }
 
 
+export type UnifiedAgentExecuteOptions = { resourceId?: string; targetCustomerId?: string }
+
 export const customerServiceApi = {
   execute: (content: string, conversationId: string, pageContext = '', resourceId?: string) => http.post('/customer-service/sessions/agent/execute', { content, conversation_id: conversationId, page_context: pageContext, resource_id: resourceId }),
+  executeTargeted: (content: string, conversationId: string, pageContext = '', options: UnifiedAgentExecuteOptions = {}) => http.post('/customer-service/sessions/agent/execute', { content, conversation_id: conversationId, page_context: pageContext, resource_id: options.resourceId, target_customer_id: options.targetCustomerId }),
   executePlan: (query: string, conversationId: string) => http.post('/customer-service/sessions/execute-plan', { note: query }, { headers: { 'X-Conversation-Id': conversationId } }),
 }
 

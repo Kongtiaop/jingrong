@@ -30,6 +30,7 @@ export const profileApi = {
   staffAdvisors: (limit=20, offset=0) => http.get('/profile/staff/advisors', { params: { limit, offset } }),
   staffRecommendations: (customer_id: string) => http.post('/profile/staff/recommendations', { customer_id }),
   createStaffOperationDraft: (payload: any) => http.post('/profile/staff/operation-drafts', payload),
+  advisorNaturalLanguageOperationDraft: (payload: { customer_id: string; query: string }) => http.post('/profile/staff/operation-drafts/natural-language', payload),
 }
 
 

@@ -122,6 +122,45 @@ class AdvisorDraftResponse(BaseModel):
     note: str
     product_name: str = ""
     advisor_name: str = ""
+
+
+class AdvisorNaturalLanguageProductOption(BaseModel):
+    id: str
+    name: str
+    risk_level: str
+    minimum_amount: float = 0
+    matched: bool = False
+
+
+class AdvisorNaturalLanguageDraftRequest(BaseModel):
+    """投顾代客下单的自然语言请求。
+
+    customer_id 是被服务的授权目标客户（投顾/超管可见自已授权客户集内的人）；
+    query 是自然语言，例如 “我要替张三申购稳健增值计划 10 万元”。
+    后端负责客户解析、授权校验、草稿与风控/适当性门禁；绝不因一句话直接成交。
+    """
+    customer_id: str
+    query: str = Field(min_length=1, max_length=2000)
+
+
+class AdvisorNaturalLanguageDraftResponse(BaseModel):
+    """一次自然语言代客下单的结果。
+
+    status:
+      awaiting_customer_confirmation —— 已生成草稿，等客户确认；
+      needs_clarification —— 需补充产品/金额或选择候选产品；
+      precheck_failed —— 受控校验失败（授权/适当性/风控/限额）。
+    """
+    status: str
+    customer_id: str = ""
+    advisor_id: str = ""
+    clarification: str = ""
+    missing_fields: list[str] = Field(default_factory=list)
+    amount: float | None = None
+    product_options: list[AdvisorNaturalLanguageProductOption] = Field(default_factory=list)
+    draft: AdvisorDraftResponse | None = None
+    precheck_reasons: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 class StaffCustomerListItem(BaseModel):
     id: str
     username: str

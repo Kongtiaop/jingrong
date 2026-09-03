@@ -22,6 +22,7 @@ from app.services.holding_valuation_service import HoldingValuationService
 from app.services.trading_service import TradingError
 from app.services.advisor_authorization_service import AdvisorAuthorizationService
 from app.services.memory_service import CustomerMemoryService
+from app.services.natural_language_order_draft import NaturalLanguageOrderDraftService
 
 router=APIRouter(prefix="/profile",tags=["profile"])
 
@@ -378,7 +379,7 @@ async def create_advisor_authorization(request: Request, payload: AdvisorAuthori
         if advisor is None:
             raise HTTPException(status_code=404, detail={"code": "ADVISOR_NOT_FOUND", "message": "advisor not found"})
         mutation = await AdvisorAuthorizationService.grant_or_update(
-            session, customer_id=user.id, advisor_id=payload.advisor_id, values=payload.model_dump()
+            session, customer_id=user.id, advisor_id=payload.advisor_id, values=payload.model_dump(exclude={"advisor_id"})
         )
         authorization = mutation.authorization
         await session.flush()
@@ -448,58 +449,144 @@ async def staff_recommendations(request: Request, payload: StaffRecommendationRe
         )
         return ApiResponse(data=data)
 
+async def _create_advisor_operation_draft(session, uow, *, customer_id: str, advisor_id: str, product_id: str, amount: float, note: str = "") -> AdvisorOperationDraft:
+    """投顾代客申购草稿的受控创建（结构化产品/金额入口）。
+
+    顺序执行：客户档案存在 → 产品在售 → 投顾对该客户存在有效授权 →
+    授权动作含 buy → 产品在授权范围 → 单笔限额 → 当日累计限额 →
+    产品风险 ≤ 授权风险上限 → 适当性命中。全部通过才落 AdvisorOperationDraft
+    （status=pending_customer_confirmation，绝不直接成交，等客户确认后另行 submit-order）。
+    被调用方负责 commit。
+    """
+    profile = await uow.profiles.get(session, customer_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail={"code": "CUSTOMER_NOT_FOUND", "message": "customer not found"})
+    product = await uow.products.get_active(session, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail={"code": "PRODUCT_NOT_FOUND", "message": "product not found"})
+    now = datetime.now(timezone.utc)
+    authorization = await _active_advisor_authorization(session, customer_id, advisor_id, now)
+    if authorization is None:
+        raise HTTPException(status_code=403, detail={"code": "ADVISOR_AUTHORIZATION_REQUIRED", "message": "active advisor authorization required"})
+    allowed_actions = {item.strip() for item in authorization.allowed_actions.split(",") if item.strip()}
+    if "buy" not in allowed_actions:
+        raise HTTPException(status_code=403, detail={"code": "AUTHORIZATION_ACTION_NOT_ALLOWED", "message": "buy action is not authorized"})
+    if authorization.product_scope != "*" and product_id not in {item.strip() for item in authorization.product_scope.split(",") if item.strip()}:
+        raise HTTPException(status_code=403, detail={"code": "AUTHORIZATION_PRODUCT_NOT_ALLOWED", "message": "product is outside authorization scope"})
+    if amount > authorization.max_single_amount:
+        raise HTTPException(status_code=409, detail={"code": "AUTHORIZATION_SINGLE_LIMIT_EXCEEDED", "message": "single operation amount exceeds authorization limit"})
+    daily_total = (await session.execute(select(func.coalesce(func.sum(AdvisorOperationDraft.amount), 0)).where(
+        AdvisorOperationDraft.customer_id == customer_id,
+        AdvisorOperationDraft.advisor_id == advisor_id,
+        AdvisorOperationDraft.status.in_(["pending_customer_confirmation", "customer_confirmed"]),
+        AdvisorOperationDraft.created_at >= func.date_trunc("day", now),
+    ))).scalar_one()
+    if float(daily_total) + amount > authorization.max_daily_amount:
+        raise HTTPException(status_code=409, detail={"code": "AUTHORIZATION_DAILY_LIMIT_EXCEEDED", "message": "daily operation amount exceeds authorization limit"})
+    risk_order = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}
+    if risk_order.get(product.risk_level, 99) > risk_order.get(authorization.risk_level_ceiling, 0):
+        raise HTTPException(status_code=403, detail={"code": "AUTHORIZATION_RISK_LIMIT_EXCEEDED", "message": "product risk exceeds authorization ceiling"})
+    suitability = await SuitabilityService(
+        risk_repository=uow.risks, product_repository=uow.products, profile_repository=uow.profiles,
+        asset_service=AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets),
+    ).recommend(session, customer_id)
+    match = next((item for item in suitability.matches if item.product_id == product_id), None)
+    if match is None:
+        raise HTTPException(status_code=409, detail={"code": "ADVISOR_DRAFT_SUITABILITY_FAILED", "message": "selected product is not currently suitable for customer"})
+    asset = await AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets).latest_or_derived(session, customer_id)
+    active_risk = await uow.risks.get_active(session, customer_id) if hasattr(uow, "risks") else None
+    snapshot = {
+        "generated_at": now.isoformat(), "customer_id": customer_id,
+        "customer_profile": {"risk_level": active_risk.risk_level if active_risk else "C1", "customer_tier": profile.customer_tier},
+        "asset": {"total_asset": str(asset.total_asset) if asset else "0", "investable_asset": str(asset.investable_asset) if asset else "0"},
+        "product": {"id": product.id, "name": product.name, "risk_level": product.risk_level, "minimum_amount": str(product.minimum_amount), "status": product.status},
+        "authorization": {"id": authorization.id, "effective_to": authorization.effective_to.isoformat() if authorization.effective_to else None, "risk_level_ceiling": authorization.risk_level_ceiling, "max_single_amount": str(authorization.max_single_amount)},
+        "suitability": {"matched": True, "reasons": match.reasons},
+    }
+    draft = AdvisorOperationDraft(id=str(uuid4()), customer_id=customer_id, advisor_id=advisor_id, product_id=product_id, side="buy", amount=amount, note=note, status="pending_customer_confirmation", recommendation_snapshot_json=json.dumps(snapshot, ensure_ascii=False), evidence_status="unavailable", rag_citations_json="[]")
+    session.add(draft)
+    return draft
+
+
 @router.post("/staff/operation-drafts", response_model=ApiResponse[AdvisorDraftResponse], status_code=201)
 async def create_staff_operation_draft(request: Request, payload: AdvisorDraftRequest, user: Annotated[User, Depends(advisor_user)]):
     uow = resolve_profile_uow(request)
     async with request.app.state.database.session_factory() as session:
-        profile = await uow.profiles.get(session, payload.customer_id)
-        if profile is None:
-            raise HTTPException(status_code=404, detail={"code": "CUSTOMER_NOT_FOUND", "message": "customer not found"})
-        product = await uow.products.get_active(session, payload.product_id)
-        if product is None:
-            raise HTTPException(status_code=404, detail={"code": "PRODUCT_NOT_FOUND", "message": "product not found"})
-        now = datetime.now(timezone.utc)
-        advisor_id = str(user.id)
-        authorization = await _active_advisor_authorization(session, payload.customer_id, advisor_id, now)
-        if authorization is None:
-            raise HTTPException(status_code=403, detail={"code": "ADVISOR_AUTHORIZATION_REQUIRED", "message": "active advisor authorization required"})
-        allowed_actions = {item.strip() for item in authorization.allowed_actions.split(",") if item.strip()}
-        if "buy" not in allowed_actions:
-            raise HTTPException(status_code=403, detail={"code": "AUTHORIZATION_ACTION_NOT_ALLOWED", "message": "buy action is not authorized"})
-        if authorization.product_scope != "*" and payload.product_id not in {item.strip() for item in authorization.product_scope.split(",") if item.strip()}:
-            raise HTTPException(status_code=403, detail={"code": "AUTHORIZATION_PRODUCT_NOT_ALLOWED", "message": "product is outside authorization scope"})
-        if payload.amount > authorization.max_single_amount:
-            raise HTTPException(status_code=409, detail={"code": "AUTHORIZATION_SINGLE_LIMIT_EXCEEDED", "message": "single operation amount exceeds authorization limit"})
-        daily_total = (await session.execute(select(func.coalesce(func.sum(AdvisorOperationDraft.amount), 0)).where(
-            AdvisorOperationDraft.customer_id == payload.customer_id,
-            AdvisorOperationDraft.advisor_id == advisor_id,
-            AdvisorOperationDraft.status.in_(["pending_customer_confirmation", "customer_confirmed"]),
-            AdvisorOperationDraft.created_at >= func.date_trunc("day", now),
-        ))).scalar_one()
-        if float(daily_total) + payload.amount > authorization.max_daily_amount:
-            raise HTTPException(status_code=409, detail={"code": "AUTHORIZATION_DAILY_LIMIT_EXCEEDED", "message": "daily operation amount exceeds authorization limit"})
-        risk_order = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}
-        if risk_order.get(product.risk_level, 99) > risk_order.get(authorization.risk_level_ceiling, 0):
-            raise HTTPException(status_code=403, detail={"code": "AUTHORIZATION_RISK_LIMIT_EXCEEDED", "message": "product risk exceeds authorization ceiling"})
-        suitability = await SuitabilityService(
-            risk_repository=uow.risks, product_repository=uow.products, profile_repository=uow.profiles,
-            asset_service=AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets),
-        ).recommend(session, payload.customer_id)
-        match = next((item for item in suitability.matches if item.product_id == payload.product_id), None)
-        if match is None:
-            raise HTTPException(status_code=409, detail={"code": "ADVISOR_DRAFT_SUITABILITY_FAILED", "message": "selected product is not currently suitable for customer"})
-        asset = await AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets).latest_or_derived(session, payload.customer_id)
-        snapshot = {
-            "generated_at": now.isoformat(), "customer_id": payload.customer_id,
-            "customer_profile": {"risk_level": profile.risk_level, "customer_tier": profile.customer_tier},
-            "asset": {"total_asset": str(asset.total_asset) if asset else "0", "investable_asset": str(asset.investable_asset) if asset else "0"},
-            "product": {"id": product.id, "name": product.name, "risk_level": product.risk_level, "minimum_amount": str(product.minimum_amount), "status": product.status},
-            "authorization": {"id": authorization.id, "effective_to": authorization.effective_to.isoformat() if authorization.effective_to else None, "risk_level_ceiling": authorization.risk_level_ceiling, "max_single_amount": str(authorization.max_single_amount)},
-            "suitability": {"matched": True, "reasons": match.reasons},
-        }
-        draft = AdvisorOperationDraft(id=str(uuid4()), customer_id=payload.customer_id, advisor_id=user.id, product_id=payload.product_id, side="buy", amount=payload.amount, note=payload.note, status="pending_customer_confirmation", recommendation_snapshot_json=json.dumps(snapshot, ensure_ascii=False), evidence_status="unavailable", rag_citations_json="[]")
-        session.add(draft); await session.commit(); await session.refresh(draft)
+        draft = await _create_advisor_operation_draft(session, uow, customer_id=payload.customer_id, advisor_id=str(user.id), product_id=payload.product_id, amount=payload.amount, note=payload.note)
+        await session.commit(); await session.refresh(draft)
         return ApiResponse(data=_advisor_draft_response(draft))
+
+
+@router.post("/staff/operation-drafts/natural-language", response_model=ApiResponse[AdvisorNaturalLanguageDraftResponse])
+async def create_staff_operation_draft_natural_language(request: Request, payload: AdvisorNaturalLanguageDraftRequest, user: Annotated[User, Depends(advisor_user)]):
+    """投顾代客下单（自然语言）。
+
+    客户必须是当前投顾已授权的目标客户（authorized scope）；授权校验在受控创建内部完成，
+    只解析‘申购哪个产品、金额多少’，随后走与结构化入口完全相同的草稿+授权+适当性+风控门禁。
+    返回 awaiting_customer_confirmation（含草稿）或 needs_clarification（含候选产品）/precheck_failed。
+    """
+    uow = resolve_profile_uow(request)
+    advisor_id = str(user.id)
+    parsed = NaturalLanguageOrderDraftService.parse_purchase_intent(payload.query)
+    missing: list[str] = []
+    if not parsed.product_name:
+        missing.append("product_name")
+    if parsed.amount is None:
+        missing.append("amount")
+
+    if missing:
+        options: list[AdvisorNaturalLanguageProductOption] = []
+        if parsed.product_name and "product_name" in missing:
+            async with request.app.state.database.session_factory() as session:
+                products = await uow.products.list_active(session)
+            needle = parsed.product_name.replace(" ", "")
+            partial = [p for p in products if needle in p.name.replace(" ", "") or p.name.replace(" ", "") in needle]
+            options = [AdvisorNaturalLanguageProductOption(id=p.id, name=p.name, risk_level=p.risk_level, minimum_amount=float(p.minimum_amount)) for p in partial[:8]]
+        return ApiResponse(data=AdvisorNaturalLanguageDraftResponse(
+            status="needs_clarification", customer_id=payload.customer_id, advisor_id=advisor_id,
+            clarification="请补充" + ("产品名称" if "product_name" in missing else "") + ("和" if len(missing) == 2 else "") + ("申购金额" if "amount" in missing else "") + "，例如：代客户申购“稳健增值计划”10万元。",
+            missing_fields=missing, amount=float(parsed.amount) if parsed.amount is not None else None,
+            product_options=options,
+        ))
+
+    async with request.app.state.database.session_factory() as session:
+        products = await uow.products.list_active(session)
+    needle = parsed.product_name.replace(" ", "")
+    matches = [p for p in products if needle == p.name.replace(" ", "")]
+    if not matches:
+        partial = [p for p in products if needle in p.name.replace(" ", "") or p.name.replace(" ", "") in needle]
+        options = [AdvisorNaturalLanguageProductOption(id=p.id, name=p.name, risk_level=p.risk_level, minimum_amount=float(p.minimum_amount)) for p in partial[:8]]
+        return ApiResponse(data=AdvisorNaturalLanguageDraftResponse(
+            status="needs_clarification", customer_id=payload.customer_id, advisor_id=advisor_id,
+            clarification="未找到唯一匹配的在售产品，请从候选产品中选择或补充完整产品名称。",
+            missing_fields=["product_name"], amount=float(parsed.amount) if parsed.amount is not None else None, product_options=options,
+        ))
+    if len(matches) > 1:
+        options = [AdvisorNaturalLanguageProductOption(id=p.id, name=p.name, risk_level=p.risk_level, minimum_amount=float(p.minimum_amount)) for p in matches[:8]]
+        return ApiResponse(data=AdvisorNaturalLanguageDraftResponse(
+            status="needs_clarification", customer_id=payload.customer_id, advisor_id=advisor_id,
+            clarification="匹配到多个在售产品，请选择具体产品。", missing_fields=["product_name"],
+            amount=float(parsed.amount) if parsed.amount is not None else None, product_options=options,
+        ))
+
+    product = matches[0]
+    async with request.app.state.database.session_factory() as session:
+        try:
+            draft = await _create_advisor_operation_draft(session, uow, customer_id=payload.customer_id, advisor_id=advisor_id, product_id=product.id, amount=float(parsed.amount), note=f"投顾自然语言代客下单：{payload.query}")
+            await session.commit(); await session.refresh(draft)
+            return ApiResponse(data=AdvisorNaturalLanguageDraftResponse(
+                status="awaiting_customer_confirmation", customer_id=payload.customer_id, advisor_id=advisor_id,
+                clarification=f"已为授权客户生成代客申购草稿，等待客户确认。产品：{product.name}；金额：{float(parsed.amount):,.2f} 元。",
+                amount=float(parsed.amount), draft=_advisor_draft_response(draft, product_name=product.name),
+            ))
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"code": "DRAFT_FAILED", "message": str(exc.detail)}
+            return ApiResponse(data=AdvisorNaturalLanguageDraftResponse(
+                status="precheck_failed", customer_id=payload.customer_id, advisor_id=advisor_id,
+                clarification=f"{detail.get('message', '受控校验未通过。')}（{detail.get('code', '')}）",
+                amount=float(parsed.amount) if parsed.amount is not None else None,
+                precheck_reasons=[str(detail.get('message', detail))],
+            ))
 
 @router.get("/me/operation-drafts", response_model=ApiResponse[dict])
 async def list_my_operation_drafts(request: Request, limit: int = 20, offset: int = 0, user: Annotated[User, Depends(current_user)] = None):
