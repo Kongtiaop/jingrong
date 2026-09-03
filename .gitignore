@@ -48,3 +48,7 @@ frontend/frontend/
 /新建 文本文档.txt
 /答辩所需文档交付物清单.txt
 /答辩须知.md
+
+# Local DB volume backups (large; never sync)
+/pgdata_*.tar.gz
+/wealth_pgdata_*.tar.gz

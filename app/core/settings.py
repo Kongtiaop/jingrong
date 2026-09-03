@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     vector_store_backend: str = "pgvector"
     database_read_backend: str = "postgresql"
     database_write_backend: str = "postgresql"
+    # RAG 关键词检索后端：tsvector（Postgres 内置全文，现状默认）/ pg_search（ParadeDB BM25）。
+    # 切换 pg_search 前必须在目标 Postgres 安装 pg_search 扩展并按其版本执行建索引 SQL（见 scripts/enable_pg_search_bm25.sql）。
+    fulltext_backend: str = "tsvector"
     migration_shadow_read: bool = False
     agent_backend: str = "local"
     milvus_uri: str = "http://127.0.0.1:19530"
@@ -77,6 +80,8 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_BACKEND must be postgresql or mysql")
         if self.vector_store_backend.lower() not in {"pgvector", "milvus"}:
             raise ValueError("VECTOR_STORE_BACKEND must be pgvector or milvus")
+        if self.fulltext_backend.lower() not in {"tsvector", "pg_search"}:
+            raise ValueError("FULLTEXT_BACKEND must be tsvector or pg_search")
         if self.database_write_backend.lower() != "postgresql" and not self.mysql_validation_writes:
             raise ValueError("database writes remain PostgreSQL until migration gate is explicitly completed")
         if self.mysql_validation_writes and self.app_env in {"production", "prod"}:
