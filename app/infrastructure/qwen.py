@@ -265,6 +265,22 @@ class QwenProvider:
             raise ValueError(f"embedding dimension must be {self.settings.embedding_dimension}")
         return vectors
 
+    async def complete(self, *, system: str, user: str, model: str | None = None, temperature: float = 0.3, max_tokens: int = 1600) -> str:
+        """通用受控文本生成（供只读投顾回复等场景）。
+
+        调用方负责越权/合规/护栏；这里只做一次聊天补全并返回纯文本。
+        """
+        if self._client is None:
+            raise RuntimeError("DASHSCOPE_API_KEY is not configured")
+        model = model or self.settings.qwen_chat_model
+        response = await self._client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
+        return (response.choices[0].message.content or "").strip()
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()

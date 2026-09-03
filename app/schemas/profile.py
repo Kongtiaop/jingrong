@@ -247,6 +247,11 @@ class AdvisorAuthorizationResponse(BaseModel):
     requires_customer_confirmation: bool
 
 
+class AdvisorAskRequest(BaseModel):
+    customer_id: str
+    query: str
+
+
 class RiskAlertResponse(BaseModel):
     id: str
     customer_id: str

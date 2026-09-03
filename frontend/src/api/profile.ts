@@ -16,6 +16,7 @@ export const profileApi = {
   advisorCustomers: (q = '', tier = '', customer_type = '', limit = 20, offset = 0) => http.get('/profile/staff/advisor-customers', { params: { q, tier, customer_type, limit, offset } }),
   customer: (id: string) => http.get(`/profile/staff/customer/${id}`),
   customerMemory: (id: string) => http.get(`/profile/staff/customer/${id}/memory-facts`),
+  advisorAsk: (payload: { customer_id: string; query: string }) => http.post('/profile/staff/supervisor/advisor-ask', payload),
   managedCustomer: (id: string) => http.get(`/profile/staff/customers/${id}`),
   enterpriseVerification: () => http.get('/profile/me/enterprise-verification'),
   riskAssessment: () => http.get('/profile/me/risk-assessment'),

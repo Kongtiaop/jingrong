@@ -88,6 +88,12 @@ function isPersonalRead(text: string) {
   if (/(申购|购买|买入|下单|赎回)/.test(text)) return false
   return true
 }
+// 开放投顾问句（记忆注入的 LLM 回复）：非分析/非个人只读/非代客，且含适合/配置/建议等咨询口吻
+function isAdvisorAsk(text: string) {
+  if (isAnalysisPhrase(text)) return false
+  if (isProxyIntent(text) || isPersonalRead(text)) return false
+  return /(适合|适不适合|合适|不合适|配置|组合建议|建议|该不该|能不能买|该不该买|要不要|值不值得|怎么配|偏好吗|帮他|帮她|适合他|适合她)/.test(text)
+}
 
 function hasAmountInTail() {
   const last = messages.value[messages.value.length - 1]
@@ -127,6 +133,18 @@ async function runCustomerRead(text: string, customerId: string) {
     const total = asset ? Number(asset.total_asset) : 0
     const cash = asset ? Number(asset.cash_balance) : 0
     pushBubble({ role: 'assistant', answer: '', customer_facts: { name, total, cash, holdings } })
+  } catch (e: any) {
+    pushBubble({ role: 'assistant', kind: 'error', text: responseError(e) })
+  } finally {
+    loading.value = false
+  }
+}
+
+async function runAdvisorAsk(text: string, customerId: string) {
+  loading.value = true
+  try {
+    const data = (await profileApi.advisorAsk({ customer_id: customerId, query: text })).data.data
+    pushBubble({ role: 'assistant', advisor_reply: true, answer: data.answer || '暂无可用回复。' })
   } catch (e: any) {
     pushBubble({ role: 'assistant', kind: 'error', text: responseError(e) })
   } finally {
@@ -195,7 +213,18 @@ async function send(textOverride?: string) {
     // 没聚焦到客户：仍退回数据分析路径，由系统给出提示
   }
 
-  // ④ 数据分析 / 一般自然语言
+  // ④ 开放投顾问句（记忆注入的 LLM 回复）——需聚焦客户
+  if (isAdvisorAsk(text)) {
+    const pickedAdvisor = customerInText(text)
+    const customerId = (pickedAdvisor && pickedAdvisor.id) || targetId.value || ''
+    if (customerId) {
+      targetId.value = customerId
+      await runAdvisorAsk(text, customerId)
+      return
+    }
+  }
+
+  // ⑤ 数据分析 / 一般自然语言
   pendingProxy = ''
   const picked = customerInText(text)
   if (picked) targetId.value = picked.id

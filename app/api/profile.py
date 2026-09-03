@@ -468,6 +468,93 @@ async def staff_customer_memory_facts(request: Request, user_id: str, user: Anno
     return ApiResponse(data={"customer_id": user_id, "display_name": target.display_name, "username": target.username, "facts": facts, "conversation_summary": summary})
 
 
+@router.post("/staff/supervisor/advisor-ask", response_model=ApiResponse[dict])
+async def staff_supervisor_advisor_ask(request: Request, payload: AdvisorAskRequest, user: Annotated[User, Depends(current_user)]):
+    """员工侧投顾智能回复：把被服务客户的共享记忆 + 风险 + 资产作为上下文，调 Qwen 生成只读说明。
+
+    只读、不触发任何交易、不修改权限/授权；越权与合规由授权校验 + 系统提示双重约束。
+    授权同 memory-facts：super_admin 任意；否则需 customer:read_all 或对该客户 active 投顾授权。
+    """
+    from app.core.settings import get_settings
+    from app.infrastructure.qwen import QwenProvider
+    from app.services.shared_memory_service import SharedMemoryService
+    whitelist = {"risk_preference", "product_preference", "investment_horizon_preference", "active_product"}
+    customer_id = payload.customer_id
+    query = (payload.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=422, detail={"code": "ADVISOR_ASK_EMPTY", "message": "query is required"})
+    uow = resolve_profile_uow(request)
+    display_name = customer_id
+    risk_level = ""
+    total_asset = 0.0
+    cash_balance = 0.0
+    async with request.app.state.database.session_factory() as session:
+        target = (await session.execute(select(User).where(User.id == customer_id, User.status == "active"))).scalar_one_or_none()
+        if target is None:
+            raise HTTPException(status_code=404, detail={"code": "CUSTOMER_NOT_FOUND", "message": "customer not found"})
+        display_name = target.display_name or customer_id
+        if not user.is_super_admin:
+            perms = {p.code for role in user.roles for p in role.permissions}
+            has_read_all = "customer:read_all" in perms
+            has_authz = (await _active_advisor_authorization(session, customer_id, str(user.id))) is not None
+            if not has_read_all and not has_authz:
+                raise HTTPException(status_code=403, detail={"code": "ADVISOR_ASK_FORBIDDEN", "message": "无权为该客户提供投顾分析"})
+        try:
+            active_risk = await uow.risks.get_active(session, customer_id) if hasattr(uow, "risks") else None
+            risk_level = active_risk.risk_level if active_risk else ""
+        except Exception:  # noqa: BLE001
+            risk_level = ""
+        try:
+            asset_service = AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets)
+            asset = await asset_service.latest_or_derived(session, customer_id)
+            if asset is not None:
+                total_asset = float(getattr(asset, "total_asset", 0) or 0)
+                cash_balance = float(getattr(asset, "cash_balance", 0) or 0)
+        except Exception:  # noqa: BLE001
+            pass
+    memory = CustomerMemoryService(request.app.state.database, None)
+    rows = await memory.load_long_term(customer_id=customer_id)
+    facts = {r.key: str(r.value) for r in rows if getattr(r, "key", None) in whitelist and getattr(r, "value", "")}
+    try:
+        shared = await SharedMemoryService(request.app.state.database, None).recall(customer_id=customer_id, agent_type="advisor", memory_type="observation")
+        for r in shared:
+            if getattr(r, "key", None) in whitelist and getattr(r, "value", "") and r.key not in facts:
+                facts[r.key] = str(r.value)
+    except Exception:  # noqa: BLE001
+        pass
+    summary = ""
+    try:
+        rec = await SharedMemoryService(request.app.state.database, None).recall(customer_id=customer_id, agent_type="customer_service", key="conversation_summary")
+        if rec:
+            summary = str(rec[0].value or "")
+    except Exception:  # noqa: BLE001
+        pass
+    lines = [f"客户：{display_name}"]
+    if risk_level:
+        lines.append(f"风险测评等级：{risk_level}")
+    if total_asset or cash_balance:
+        lines.append(f"总资产：¥{total_asset:,.0f}；现金余额：¥{cash_balance:,.0f}")
+    if facts:
+        lines.append("客户已知偏好（可能来自客户自述/记忆）：" + "；".join(f"{k}={facts[k]}" for k in facts))
+    if summary:
+        lines.append("最近会话摘要：" + summary[:800])
+    system = (
+        "你是财富管理平台的资深投顾助手，服务于内部员工（投顾/管理员）。"
+        "请仅依据下面提供的客户事实，给出保守、合规、只读的分析与配置建议。"
+        "不得声称已执行交易、不得替客户下单或修改授权、不得编造客户未提供的数字或事实；"
+        "若客户偏好/风险信息不足，明确说明缺少什么；结尾附一句风险提示（不构成投资建议）。"
+    )
+    provider = QwenProvider(get_settings())
+    try:
+        answer = await provider.complete(
+            system=system,
+            user="客户上下文：\n" + "\n".join(lines) + "\n\n员工问题：" + query,
+        )
+    finally:
+        await provider.close()
+    return ApiResponse(data={"customer_id": customer_id, "query": query, "answer": answer, "context": {"risk_level": risk_level, "facts": facts, "conversation_summary": summary}})
+
+
 @router.post("/staff/recommendations", response_model=ApiResponse[StaffRecommendationResponse])
 async def staff_recommendations(request: Request, payload: StaffRecommendationRequest, user: Annotated[User, Depends(advisor_user)]):
     uow = resolve_profile_uow(request)
