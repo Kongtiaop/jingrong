@@ -287,6 +287,10 @@ async def execute_unified_agent(request: Request, payload: UnifiedAgentRequest, 
                 ))).scalars().all()) if catalog_tables else []
                 if template is not None:
                     authorized_subject_ids = await SubjectScopeService.authorized_subject_ids(analysis_session, user)
+                    if payload.target_customer_id:
+                        # 聚焦到指定目标客户时，把单客户模板的 subject(user_id) 解析收敛到该客户，
+                        # 避免对超管回退成“管理员自己的 id”导致查空后误入客服兜底。
+                        authorized_subject_ids = {payload.target_customer_id}
                     template_attempt = await analyzer.analyze_template_attempt(
                         analysis_session,
                         user=user,
@@ -367,7 +371,20 @@ async def execute_unified_agent(request: Request, payload: UnifiedAgentRequest, 
                 )],
             )
         else:
-            result = await CustomerAgentExecutionService(request.app.state.database, request.app.state.redis.client, settings=request.app.state.settings).execute(customer_id=user.id, conversation_id=conversation_id, query=payload.content)
+            if not _is_customer(user):
+                # 员工向（Supervisor Agent）：数据分析未命中时不落入客户客服兜底（知识库/转人工/工单），
+                # 也不把员工当作客户执行/写记忆；返回明确的“不支持”指引。
+                result = CustomerTaskExecutionResponse(
+                    conversation_id=conversation_id,
+                    overall_status="unsupported",
+                    answer="当前后台 Agent 暂不支持这种问法。员工侧可：数据分析（NL2SQL）、代客申购草稿、查询客户资产/持仓。请换一种说法，或到对应界面操作。",
+                    route="data_analysis",
+                    agents=["DataAnalysisAgent"],
+                    results=[],
+                    clarification=None,
+                )
+            else:
+                result = await CustomerAgentExecutionService(request.app.state.database, request.app.state.redis.client, settings=request.app.state.settings).execute(customer_id=user.id, conversation_id=conversation_id, query=payload.content)
     selected = [agent for agent in result.agents if agent in available_agents]
     if not selected:
         if "CustomerServiceAgent" in available_agents:
