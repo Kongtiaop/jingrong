@@ -66,6 +66,13 @@ function isProxyIntent(text: string) {
 function customerInText(text: string) {
   return customers.value.find((c: any) => ((c.display_name && text.includes(c.display_name)) || (c.username && text.includes(c.username)))) || null
 }
+// 个人持仓/资产/余额类只读问句（聚焦到某客户时走员工客户查询接口，而非客服知识库）
+function isPersonalRead(text: string) {
+  if (!/(持仓|持有|资产|余额|净资产|账户)/.test(text)) return false
+  if (/(占比|分布|排名|排行|走势|趋势|对比|统计|汇总|平均|各风险|各产品)/.test(text)) return false
+  if (/(申购|购买|买入|下单|赎回)/.test(text)) return false
+  return true
+}
 
 function hasAmountInTail() {
   const last = messages.value[messages.value.length - 1]
@@ -84,6 +91,27 @@ async function runAnalysis(text: string, focusedId?: string) {
       clarification: data.clarification || '',
       overall_status: data.overall_status || '',
     })
+  } catch (e: any) {
+    pushBubble({ role: 'assistant', kind: 'error', text: responseError(e) })
+  } finally {
+    loading.value = false
+  }
+}
+
+async function runCustomerRead(text: string, customerId: string) {
+  loading.value = true
+  try {
+    // 管理员走 customer:read_all 的客户详情；advisor 走带授权校验的投顾视角客户接口
+    const data = isAdmin.value
+      ? (await profileApi.managedCustomer(customerId)).data.data
+      : (await profileApi.customer(customerId)).data.data
+    const asset = data?.latest_asset
+    const holdings = data?.holdings || []
+    const c = customerById(customerId)
+    const name = (c && customerLabel(c)) || data?.user?.display_name || (data?.profile?.user_id || customerId)
+    const total = asset ? Number(asset.total_asset) : 0
+    const cash = asset ? Number(asset.cash_balance) : 0
+    pushBubble({ role: 'assistant', answer: '', customer_facts: { name, total, cash, holdings } })
   } catch (e: any) {
     pushBubble({ role: 'assistant', kind: 'error', text: responseError(e) })
   } finally {
@@ -140,7 +168,19 @@ async function send(textOverride?: string) {
     return
   }
 
-  // ③ 数据分析 / 一般自然语言
+  // ③ 个人只读（持仓/资产/余额）——需落到某客户
+  if (isPersonalRead(text)) {
+    const picked = customerInText(text)
+    const customerId = (picked && picked.id) || targetId.value || ''
+    if (customerId) {
+      targetId.value = customerId
+      await runCustomerRead(text, customerId)
+      return
+    }
+    // 没聚焦到客户：仍退回数据分析路径，由系统给出提示
+  }
+
+  // ④ 数据分析 / 一般自然语言
   pendingProxy = ''
   const picked = customerInText(text)
   if (picked) targetId.value = picked.id
@@ -195,6 +235,7 @@ onMounted(() => { if (canView.value) loadCustomers() })
         <p v-if="!messages.length" class="nl-welcome">
           我是后台 Agent 助手。请直接输入想做的事，例如：<br />
           · 分析：<span>各风险等级客户数量占比</span> / <span>分析张三的资产分布</span><br />
+          · 查询客户资产/持仓：<span>张三的持仓和资产</span><br />
           · 代客申购：<span>代张三申购“稳健增值计划”10万元</span>
         </p>
 
@@ -207,6 +248,24 @@ onMounted(() => { if (canView.value) loadCustomers() })
 
           <template v-else>
             <p v-if="message.text || message.answer" class="nl-text">{{ message.text || message.answer }}</p>
+
+            <div v-if="message.customer_facts" class="nl-facts">
+              <div class="nl-facts-head">
+                <strong>客户资产 · {{ message.customer_facts.name }}</strong>
+                <span class="nl-facts-asset">总资产 ¥{{ formatMoney(message.customer_facts.total) }}</span>
+              </div>
+              <p class="nl-facts-cash">现金余额 ¥{{ formatMoney(message.customer_facts.cash) }}</p>
+              <p v-if="!message.customer_facts.holdings?.length" class="nl-muted">当前无有效持仓。</p>
+              <div v-else class="nl-holding-list">
+                <div v-for="h in message.customer_facts.holdings" :key="h.id || h.product_id" class="nl-holding-row">
+                  <span class="nl-holding-name">{{ h.product_name || h.product_id }}</span>
+                  <span class="nl-holding-value">市值 ¥{{ formatMoney(h.market_value) }}</span>
+                  <span :class="['nl-holding-pnl', Number(h.profit_loss) >= 0 ? 'gain' : 'loss']">
+                    {{ Number(h.profit_loss) >= 0 ? '+' : '' }}{{ formatMoney(h.profit_loss) }}
+                  </span>
+                </div>
+              </div>
+            </div>
 
             <div v-if="message.askCustomer" class="nl-clarify nl-customer-pick">
               <strong>目标客户</strong>
@@ -293,6 +352,17 @@ onMounted(() => { if (canView.value) loadCustomers() })
 .nl-clarify { margin-top: 4px; padding: 10px 12px; border-left: 3px solid #f59e0b; background: #fffbeb; color: #92400e; border-radius: 8px; max-width: 100%; font-size: 13px; }
 .nl-clarify strong { display: block; margin-bottom: 4px; }
 .nl-clarify p { margin: 0; line-height: 1.6; }
+.nl-facts { margin-top: 6px; background: #fff; border: 1px solid #dbeafe; border-left: 3px solid #2563eb; border-radius: 10px; padding: 10px 12px; color: #1e3a8a; }
+.nl-facts-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.nl-facts-asset { color: #0f766e; font-weight: 600; }
+.nl-facts-cash { margin: 4px 0 8px; font-size: 13px; color: #334155; }
+.nl-holding-list { border-top: 1px dashed #bfdbfe; padding-top: 6px; display: grid; gap: 6px; }
+.nl-holding-row { display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+.nl-holding-name { flex: 1; min-width: 0; color: #1e3a8a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nl-holding-value { color: #334155; }
+.nl-holding-pnl { font-variant-numeric: tabular-nums; }
+.nl-holding-pnl.gain { color: #15803d; }
+.nl-holding-pnl.loss { color: #b91c1c; }
 .nl-customer-pick, .nl-proxy { background: #fff; border: 1px solid #e2e8f0; border-left: 3px solid #1d4ed8; border-radius: 10px; }
 .nl-customer-pick { margin-top: 4px; padding: 10px 12px; }
 .nl-chip-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
