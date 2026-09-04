@@ -1,30 +1,28 @@
 # -*- coding: utf-8 -*-
-"""advisor-ask 有界工具调用 agent（范围仅投顾段）。
+"""advisor-ask 库内真实接地（范围仅投顾段，确定性一次 DB，不做多轮模型决定）。
 
-把"库里真实在售产品/适当性"喂回给模型，替换纯单次非工具的生成：
-1) 先做 context（客户画像）;
-2) 有界 ≤3 轮：非流式 tool 轮，让模型决定是否调 find_products / product_suitability；
-   命中即用 AdvisorReadTools(只读)执行，把库内真实 facts 以文本附加进 user 上下文；
-3) 到无工具请求时，用 stream_text 以最终 user 上下文流式生成回答。
+把“库里真实在售产品/适当性”喂回给模型，替换对具体产品凭空编 risk/收益：
+- 命中产品词的题面 → 确定性两步：find_products(召回库内产品) → product_suitability(该产品, 客户)，
+  一次 DB 完成并 attach 到 user；然后由调用方单次流式。
+- 不命中（纯画像/开放句）→ 不进工具，直接返回原上下文（快）。
+不做“让 LLM 在多轮里自选工具”的 2~3 次非流式 request_tool_call，从而避免点名产品句白等 ~seconds。
 
 护栏：
-- 只读白名单（ADVISOR_TOOL_ALLOWLIST）
-- 轮数上限：ToolRoundLimit=3，超限直接进生成
-- 工具名+参数落 AuditLog(action="advisor_agent.tool_call")，只含结构化元数据
-- 降级：工具/LLM 异常 → 用已知客户事实(纯上下文)回答，不抛崩主流程
+- 只读（AdvisorReadTools 只读）
+- 工具命中落 AuditLog(action="advisor_agent.tool_call")
+- 异常/无匹配 → 降级为纯客户上下文回答
 """
 from __future__ import annotations
 
-from uuid import uuid4
 import json
+from uuid import uuid4
 
-from app.services.advisor_tools import AdvisorReadTools, ADVISOR_TOOL_ALLOWLIST, ADVISOR_TOOL_SCHEMAS
+from app.services.advisor_tools import AdvisorReadTools, product_facts_to_text, suitability_facts_to_text
 
 
 class AdvisorBoundedLoop:
-    ToolRoundLimit = 3
-
     def __init__(self, provider, tools: AdvisorReadTools, database) -> None:
+        # provider 在本确定性方案中不再用于工具选择轮；保留字段以兼容测试/未来工具轮。
         self.provider = provider
         self.tools = tools
         self.database = database
@@ -43,37 +41,27 @@ class AdvisorBoundedLoop:
         except Exception:  # noqa: BLE001 - 审计失败不影响主流程
             pass
 
-    async def run_to_text_user(self, *, conversation_id: str, actor_user_id: str, customer_id: str, context_user: str, system: str):
-        """执行工具轮，返回 (最终 user 上下文, 是否有工具命中)。"""
+    async def run_to_text_user(self, *, conversation_id: str, actor_user_id: str, customer_id: str, query: str, context_user: str, system: str):
+        """库内确定性 single-shot 接地。
+
+        题面能召回真实在售产品 → find_products + product_suitability 一次完成 → attach 库内真实结果。
+        query 为原始员工问题（不含工具追加）; 返回 (最终 user 上下文, 是否发生过接地)。
+        """
         user = context_user
-        had_tool = False
-        rounds = 0
-        while rounds < self.ToolRoundLimit:
-            decision = await self.provider.request_tool_call(
-                system=system,
-                user=user,
-                tools=ADVISOR_TOOL_SCHEMAS,
-            )
-            if decision is None:
-                break
-            name = decision.get("name") or ""
-            arguments = decision.get("arguments") or {}
-            if name not in ADVISOR_TOOL_ALLOWLIST:
-                # 不认识的工具：停掉工具轮，避免无限
-                break
-            rounds += 1
-            result = "（无结果）"
-            ok = False
-            try:
-                async with self.database.session_factory() as session:
-                    _, text = await self.tools.execute_tool(session, name=name, arguments=arguments, customer_id=customer_id)
-                    if text:
-                        result = text
-                        ok = True
-            except Exception:  # noqa: BLE001 - 工具执行异常仅记录并降级
-                result = "（工具执行失败）"
-            await self._audit_tool(conversation_id, actor_user_id, name, arguments, ok)
-            if ok:
-                had_tool = True
-                user = user + f"\n\n##### 工具[{name}]返回（库内真实，以下为权威）：\n{result}"
-        return user, had_tool
+        try:
+            async with self.database.session_factory() as session:
+                cands = await self.tools.find_products(session, query=query or "", top_k=3)
+            if not cands:
+                return user, False
+            pid = cands[0].id
+            suits = None
+            async with self.database.session_factory() as session:
+                suits = await self.tools.product_suitability(session, customer_id=customer_id, product_id=pid) or []
+            await self._audit_tool(conversation_id, actor_user_id, "find_products+product_suitability", {"product_id": pid}, True)
+            parts = [product_facts_to_text(cands)]
+            if suits:
+                parts.append(suitability_facts_to_text(suits))
+            user = user + "\n\n##### 库内真实（find_products + product_suitability，为权威依据，勿臆测）：\n" + "\n".join(parts)
+            return user, True
+        except Exception:  # noqa: BLE001 - 工具异常降级为纯上下文
+            return user, False

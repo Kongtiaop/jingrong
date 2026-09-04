@@ -1,20 +1,13 @@
-"""AdvisorBoundedLoop 有界工具环：≤3 轮、白名单、审计、降级（fake provider/tools/db）。"""
+"""AdvisorBoundedLoop 确定性单次接地：命中产品则 find_products+product_suitability 一次 attach，
+未命中则直接透传（fake tools/db，不碰 LLM/DB）。"""
 import asyncio
-from types import SimpleNamespace
 
 from app.services.advisor_ask_agent import AdvisorBoundedLoop
 
 
-class _FakeDb:
-    def session_factory(self):
-        return _FakeSession()
-
-
 class _FakeSession:
-    def __init__(self):
-        self.added = []
     def add(self, obj):
-        self.added.append(obj)
+        pass
     async def commit(self):
         pass
     async def __aenter__(self):
@@ -23,67 +16,90 @@ class _FakeSession:
         return False
 
 
+class _FakeDb:
+    def session_factory(self):
+        return _FakeSession()
+
+
 class _FakeProvider:
-    def __init__(self, decisions):
-        self.decisions = list(decisions)
+    def __init__(self):
+        self.requested = 0
     async def request_tool_call(self, **kwargs):
-        if not self.decisions:
-            return None
-        return self.decisions.pop(0)
+        return None  # 新实现不再用于工具选择轮
+
+
+class _Product:
+    def __init__(self, id, name, risk_level, minimum_amount, product_type="fund", term_days=0, description=""):
+        self.id = id
+        self.name = name
+        self.risk_level = risk_level
+        self.minimum_amount = minimum_amount
+        self.product_type = product_type
+        self.term_days = term_days
+        self.description = description
+        self.liquidity = "medium"
+
+
+class _SuitFact:
+    def __init__(self, product_id, product_name, product_risk_level, matched, reasons=None):
+        self.product_id = product_id
+        self.product_name = product_name
+        self.product_risk_level = product_risk_level
+        self.minimum_amount = 10000
+        self.matched = matched
+        self.reasons = reasons or []
 
 
 class _FakeTools:
-    def __init__(self, results):
-        self.results = results
-    async def execute_tool(self, session, *, name, arguments, customer_id):
-        # returns (facts, text)
-        return [name], self.results.get(name, "（结果）")
+    def __init__(self, products, suits=None):
+        self._products = products or []
+        self._suits = suits or {}
+    async def find_products(self, session, *, query, top_k=6):
+        # 简单匹配：query 非空就返回首个（若库里存在）
+        return self._products[:top_k] if query.strip() else []
+    async def product_suitability(self, session, *, customer_id, product_id=None):
+        return self._suits.get(product_id, [])
 
 
-def _verify_audit(tool_result_calls, allowlist_ok=True):
-    pass
+def _loop_with(tools, audits):
+    loop = AdvisorBoundedLoop(_FakeProvider(), tools, _FakeDb())
 
+    class Patch:
+        @staticmethod
+        async def fake_audit(self, conversation_id, actor_user_id, name, arguments, had_result):
+            audits.append((name, arguments, had_result))
 
-def test_loop_runs_up_to_tool_and_annotates():
     import app.services.advisor_ask_agent as aaa
     orig = aaa.AdvisorBoundedLoop._audit_tool
+    aaa.AdvisorBoundedLoop._audit_tool = Patch.fake_audit.__get__(loop, AdvisorBoundedLoop)
+    return loop, lambda: setattr(aaa.AdvisorBoundedLoop, "_audit_tool", orig)
+
+
+def test_grounds_when_product_hit():
     audits = []
-
-    async def fake_audit(self, conversation_id, actor_user_id, name, arguments, had_result):
-        audits.append((name, arguments, had_result))
-
-    aaa.AdvisorBoundedLoop._audit_tool = fake_audit
-    tools = _FakeTools({"find_products": "在售产品（真实）：- 中短债增利计划 | C2\n"})
-    prov = _FakeProvider([
-        {"name": "find_products", "arguments": {"query": "中短债"}},
-        None,
-    ])
-    loop = AdvisorBoundedLoop(prov, tools, _FakeDb())
+    p = _Product("p1", "中短债增利计划", "C2", 10000)
+    suit = _SuitFact("p1", "中短债增利计划", "C2", True, ["C5 满足 C2"])
+    tools = _FakeTools([p], suits={"p1": [suit]})
+    loop, restore = _loop_with(tools, audits)
+    ctx = "客户画像：C5\n员工问题：中短债增利计划适不适合这位客户"
     final, had = asyncio.run(loop.run_to_text_user(
-        conversation_id="conv1", actor_user_id="user1", customer_id="cust1",
-        context_user="客户：张三\n", system="你是投顾。"))
-    aaa.AdvisorBoundedLoop._audit_tool = orig
-    assert had is True
-    assert len(audits) == 1
-    assert audits[0][0] == "find_products"
-    assert "中短债增利计划" in final
-
-
-def test_loop_bounds_rounds():
-    import app.services.advisor_ask_agent as aaa
-    audits = []
-    orig = aaa.AdvisorBoundedLoop._audit_tool
-
-    async def fake_audit(self, conversation_id, actor_user_id, name, arguments, had_result):
-        audits.append(name)
-
-    aaa.AdvisorBoundedLoop._audit_tool = fake_audit
-    # 模型一直请求工具，但白名单工具只有两个；超过上限则停止
-    prov = _FakeProvider([{"name": "find_products", "arguments": {}}] * 10)
-    tools = _FakeTools({"find_products": "结果"})
-    loop = AdvisorBoundedLoop(prov, tools, _FakeDb())
-    asyncio.run(loop.run_to_text_user(
         conversation_id="c", actor_user_id="u", customer_id="cc",
-        context_user="x", system="s"))
-    aaa.AdvisorBoundedLoop._audit_tool = orig
-    assert len(audits) == AdvisorBoundedLoop.ToolRoundLimit
+        query="中短债增利计划适不适合这位客户", context_user=ctx, system="s"))
+    restore()
+    assert had is True
+    assert "中短债增利计划" in final
+    assert "C2" in final
+    assert "命中" in final
+    assert audits  # 落了 audit
+
+
+def test_passthrough_when_no_product():
+    audits = []
+    loop, restore = _loop_with(_FakeTools([]), audits)
+    ctx = "客户画像：C5\n员工问题：适合配置激进型产品吗"
+    final, had = asyncio.run(loop.run_to_text_user(
+        conversation_id="c", actor_user_id="u", customer_id="cc",
+        query="适合配置激进型产品吗", context_user=ctx, system="s"))
+    restore()
+    assert had is False
+    assert final == ctx  # 纯透传，不改
