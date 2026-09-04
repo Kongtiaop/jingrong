@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 import httpx
 from openai import AsyncOpenAI
@@ -112,11 +113,14 @@ class QwenProvider:
         return {"status": "configured", "model": self.settings.qwen_embedding_model}
 
     async def chat_completions(self, **kwargs):
-        """Chat completions with a bounded interactive timeout.
+        """Chat completions with a bounded interactive timeout + usage/latency telemetry.
 
         Each interactive call is capped by qwen_chat_*_timeout_seconds so a slow/
         flaky DashScope returns promptly (instead of hanging to the 120s httpx cap)
         and callers can degrade gracefully. Embedding keeps its own client timeout.
+
+        After each call we log token usage (prompt/completion/total) and duration so
+        cost/latency can be attributed per request via the ambient trace_id.
         """
         if self._client is None:
             raise RuntimeError("DASHSCOPE_API_KEY is not configured")
@@ -126,7 +130,28 @@ class QwenProvider:
                 self.settings.qwen_chat_timeout_seconds,
                 connect=self.settings.qwen_chat_connect_timeout_seconds,
             )
-        return await self._client.chat.completions.create(timeout=timeout, **kwargs)
+        model = kwargs.get("model") or self.settings.qwen_chat_model
+        t0 = time.monotonic()
+        try:
+            resp = await self._client.chat.completions.create(timeout=timeout, **kwargs)
+        except Exception:
+            dur_ms = (time.monotonic() - t0) * 1000
+            logger.warning("llm.usage model=%s status=failed duration_ms=%.0f", model, dur_ms)
+            raise
+        dur_ms = (time.monotonic() - t0) * 1000
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            logger.info(
+                "llm.usage model=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s duration_ms=%.0f",
+                model,
+                getattr(usage, "prompt_tokens", None),
+                getattr(usage, "completion_tokens", None),
+                getattr(usage, "total_tokens", None),
+                dur_ms,
+            )
+        else:
+            logger.info("llm.usage model=%s usage_unavailable duration_ms=%.0f", model, dur_ms)
+        return resp
 
     async def classify(self, *, query: str, conversation_summary: str = "") -> dict:
         """StructuredIntentProvider-compatible alias for intent fallback."""
