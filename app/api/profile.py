@@ -655,11 +655,24 @@ async def staff_supervisor_advisor_ask_stream(request: Request, payload: Advisor
     except Exception:  # noqa: BLE001
         trace_id = str(uuid4())
     uow_tools = resolve_profile_uow(request)
-    loop = AdvisorBoundedLoop(provider, AdvisorReadTools(uow_tools), request.app.state.database)
-    final_user, had_tool = await loop.run_to_text_user(
-        conversation_id=str(trace_id), actor_user_id=str(user.id), customer_id=payload.customer_id,
-        context_user=ctx["user"], system=ctx["system"],
-    )
+    advisor_tools = AdvisorReadTools(uow_tools)
+    # 智能进工具环：仅当题面命中库内真实产品时才跑有界工具环（grounding），
+    # 纯画像/开放类问句跳过工具环直接流式，首字更快。
+    probe_hit = False
+    try:
+        async with request.app.state.database.session_factory() as p_session:
+            probe = await advisor_tools.find_products(p_session, query=payload.query.strip(), top_k=3)
+            probe_hit = bool(probe)
+    except Exception:  # noqa: BLE001 - 探测失败按无产品处理，直接流式
+        probe_hit = False
+    loop = AdvisorBoundedLoop(provider, advisor_tools, request.app.state.database)
+    if probe_hit:
+        final_user, _had_tool = await loop.run_to_text_user(
+            conversation_id=str(trace_id), actor_user_id=str(user.id), customer_id=payload.customer_id,
+            context_user=ctx["user"], system=ctx["system"],
+        )
+    else:
+        final_user = ctx["user"]
 
     async def _gen():
         try:
