@@ -945,6 +945,13 @@ async def submit_risk_assessment(request: Request, payload: RiskAssessmentReques
         item = await RiskAssessmentService(repository=uow.risks).assess(session, user.id, payload.model_dump())
         await uow.audit_logs.save(session, AuditLog(id=str(uuid4()), actor_user_id=user.id, action="submit", resource_type="risk_assessment", resource_id=item.id, detail=f"risk_level={item.risk_level};score={item.score}"))
         await session.commit(); await session.refresh(item)
+        # 失效 /me/recommendations 缓存，避免新风险等级下 20s 内仍展示旧适当性命中。
+        _redis = getattr(getattr(request.app.state, "redis", None), "client", None)
+        if _redis is not None:
+            try:
+                await _redis.delete(f"rec:{str(user.id)}")
+            except Exception:  # noqa: BLE001 - 缓存失效失败不阻塞测评
+                pass
         # 长时记忆：把测评得出的风险等级持久化为"风险偏好"（低风险、可后续供推荐参考）
         if item.risk_level:
             try:
@@ -1006,6 +1013,17 @@ async def customer_tier(request: Request, user: Annotated[User, Depends(current_
 
 @router.get("/me/recommendations", response_model=ApiResponse[RecommendationResponse])
 async def recommendations(request: Request, user: Annotated[User, Depends(current_user)]):
+    # 只读展示端点做短 TTL 缓存（20s）——把每次全量在售适当性重算压住。
+    # 注意：仅此 GET 展示使用缓存；受控下单/风控里走 SuitabilityService.recommend 的实时校验路径不移缓存。
+    redis = getattr(getattr(request.app.state, "redis", None), "client", None)
+    cache_key = f"rec:{str(user.id)}"
+    if redis is not None:
+        try:
+            hit_str = await redis.get(cache_key)
+            if isinstance(hit_str, str) and hit_str:
+                return ApiResponse(data=RecommendationResponse.model_validate_json(hit_str))
+        except Exception:  # noqa: BLE001 - 缓存读失败退实时
+            pass
     uow = resolve_profile_uow(request)
     asset_service = AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets)
     service = SuitabilityService(
@@ -1016,4 +1034,9 @@ async def recommendations(request: Request, user: Annotated[User, Depends(curren
     )
     async with request.app.state.database.session_factory() as session:
         data = await service.recommend(session, str(user.id), risk_operation=await _risk_operation_for_user(session, str(user.id)))
+        if redis is not None:
+            try:
+                await redis.set(cache_key, data.model_dump_json(), ex=20)
+            except Exception:  # noqa: BLE001 - 缓存写失败不阻塞
+                pass
         return ApiResponse(data=data)
