@@ -50,6 +50,41 @@ class ToolCall:
 ADVISOR_TOOL_ALLOWLIST: frozenset[str] = frozenset({"find_products", "product_suitability"})
 
 
+# OpenAI-style function schemas, used for the LLM tool-selection round
+ADVISOR_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "find_products",
+            "description": "按关键词从数据库召回在售产品，返回库内真实 risk_level / 起购金额 / 类型 / 期限，用于回答'有没有某产品、库里它是什么样的'。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "业务词/产品名相关关键词，如‘中短债’‘稳健’"},
+                    "top_k": {"type": "integer", "description": "返回条数，默认 6"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "product_suitability",
+            "description": "给定被服务客户，查对该客户在售产品的真实适当性命中/排除（含系统 reasons 判定依据），用于回答'某产品适不适合这位客户'。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_name": {"type": "string", "description": "要查适配的具体产品名（可选，缺省返回全部命中/排除）"},
+                    "top_k": {"type": "integer"},
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+
 def _clean(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
@@ -147,6 +182,29 @@ class AdvisorReadTools:
             return rec.matches, rec.excluded
         except Exception:  # noqa: BLE001 - 工具失败以空结果返回，不抛崩主流程
             return None
+
+    async def execute_tool(self, session, *, name: str, arguments: dict, customer_id: str) -> tuple[list, str]:
+        """执行单个只读工具，返回 (facts, 可注入 prompt 的文本)。
+
+        fallthrough：工具名不在白名单 → ([], '')。
+        """
+        arguments = arguments or {}
+        if name == "find_products":
+            facts = await self.find_products(session, query=arguments.get("query", ""), top_k=int(arguments.get("top_k") or 6))
+            return facts, product_facts_to_text(facts)
+        if name == "product_suitability":
+            pname = arguments.get("product_name") or ""
+            if pname:
+                cands = await self.find_products(session, query=pname, top_k=1)
+                target_pid = cands[0].id if cands else None
+            else:
+                target_pid = None
+            if target_pid:
+                facts = await self.product_suitability(session, customer_id=customer_id, product_id=target_pid)
+            else:
+                facts = await self.product_suitability(session, customer_id=customer_id, product_id=None)
+            return facts, suitability_facts_to_text(facts)
+        return [], ""
 
 
 def product_facts_to_text(facts: list[ProductFact]) -> str:

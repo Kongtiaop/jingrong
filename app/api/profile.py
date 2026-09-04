@@ -621,29 +621,12 @@ async def _advisor_ask_context(request: Request, payload: AdvisorAskRequest, use
         lines.append("客户已知偏好（可能来自客户自述/记忆）：" + "；".join(f"{k}={facts[k]}" for k in facts))
     if summary:
         lines.append("最近会话摘要：" + summary[:800])
-    # —— 真实业务 grounding：按题面关键字召回在售产品 + 该客户真实适当性命中，防模型凭空编 risk/收益 ——
-    try:
-        from app.services.advisor_tools import AdvisorReadTools, product_facts_to_text, suitability_facts_to_text
-        uow_now = resolve_profile_uow(request)
-        tools = AdvisorReadTools(uow_now)
-        async with request.app.state.database.session_factory() as t_session:
-            prod_facts = await tools.find_products(t_session, query=query.strip(), top_k=6)
-            if prod_facts:
-                # 取全量适当性命中，筛出本轮召回产品的真实结论
-                suit_all = await tools.product_suitability(t_session, customer_id=customer_id, product_id=None)
-                found_ids = {f.id for f in prod_facts}
-                relevant = [s for s in suit_all if s.product_id in found_ids]
-                lines.append("真实在售产品（库内 risk/金额/期限为准）：\n" + product_facts_to_text(prod_facts))
-                if relevant:
-                    lines.append("该客户对上述产品的真实适当性命中/排除（源自数据库规则，reasons 为判定依据）：\n"
-                                 + suitability_facts_to_text(relevant))
-    except Exception:  # noqa: BLE001 - grounding 失败不阻塞主回答，回退到纯客户事实
-        pass
     system = (
         "你是财富管理平台的资深投顾助手，服务于内部员工（投顾/管理员），输出是供员工参考的内部建议。"
-        "请仅依据下面提供的客户事实和库内真实产品/适当性事实作答，保守、合规、只读。"
-        "若给出了'真实在售产品'或'真实适当性命中'，一律以该库内 risk_level / 金额 / 命中结论为准作答，"
-        "不得对具体产品凭空设定风险档位、收益率区间或适配结论；若库内没有、则明确说库里没有该产品的风控信息。"
+        "请仅依据下面提供的客户事实和真实业务作答，保守、合规、只读。"
+        "若员工问题涉及“某产品库里是什么样/值不值/适不适合这位客户”这类，你应先调用库内只读工具"
+        "（find_products 查真实在售产品与其 risk_level/起购/期限；product_suitability 查对该客户的真实适当性命中），"
+        "再基于工具返回的库内真实档位与命中结论作答。不得凭空对具体产品设定档位、收益率区间或适配结论。"
         "禁止援引具体法规/办法的条款号，也不要以“根据《XX办法》”等口吻编造出处；不要假装引用公司制度原文。"
         "不得声称已执行交易、不得替客户下单或修改授权、不得编造客户未提供的数字、风险等级或偏好。"
         "若客户偏好/投资目标/风险信息不足，明确列出缺少什么，并说明据此只能给出方向性参考而非完整配置结论。"
@@ -654,18 +637,33 @@ async def _advisor_ask_context(request: Request, payload: AdvisorAskRequest, use
 
 @router.post("/staff/supervisor/advisor-ask/stream")
 async def staff_supervisor_advisor_ask_stream(request: Request, payload: AdvisorAskRequest, user: Annotated[User, Depends(current_user)]):
-    """员工侧投顾智能回复（SSE 真流式）。
+    """员工侧投顾智能回复（SSE 真流式 + 有界只读工具调用）。
 
-    结构化结果不走这里；仅流式返回 LLM 生成的吐字。首 token/用量/耗时在 stream_text 内记录。
+    结构化结果不走这里；模型可选择调用 find_products / product_suitability 获取库内真实
+    产品与适当性命中后，再以流式把回答吐出来。工具轮非流式，仅最终文本流式。
     """
     from app.core.settings import get_settings
+    from app.common.logging.context import get_log_context
     from app.infrastructure.qwen import QwenProvider
+    from app.services.advisor_ask_agent import AdvisorBoundedLoop
+    from app.services.advisor_tools import AdvisorReadTools
     ctx = await _advisor_ask_context(request, payload, user)
     provider = QwenProvider(get_settings())
+    conversation_id = payload.query
+    try:
+        trace_id = (get_log_context() or {}).get("trace_id") or str(uuid4())
+    except Exception:  # noqa: BLE001
+        trace_id = str(uuid4())
+    uow_tools = resolve_profile_uow(request)
+    loop = AdvisorBoundedLoop(provider, AdvisorReadTools(uow_tools), request.app.state.database)
+    final_user, had_tool = await loop.run_to_text_user(
+        conversation_id=str(trace_id), actor_user_id=str(user.id), customer_id=payload.customer_id,
+        context_user=ctx["user"], system=ctx["system"],
+    )
 
     async def _gen():
         try:
-            async for delta in provider.stream_text(system=ctx["system"], user=ctx["user"]):
+            async for delta in provider.stream_text(system=ctx["system"], user=final_user):
                 yield f"data: {json.dumps({'t': delta}, ensure_ascii=False)}\n\n"
             yield "data: {\"done\":true}\n\n"
         except Exception as exc:  # noqa: BLE001 - 流式异常转 SSE 错误事件，前端据此兜底

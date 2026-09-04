@@ -376,6 +376,39 @@ class QwenProvider:
                 model, ttft_ms or dur, prompt_tokens, completion_tokens, total_tokens, dur,
             )
 
+    async def request_tool_call(self, *, system: str, user: str, tools: list, model: str | None = None, temperature: float = 0.0):
+        """一次非流式补全，请模型决定是否调用某个已声明工具。
+
+        返回 dict 或 None：
+          {"name": str, "arguments": dict}  模型要调的工具
+          None                              模型没有要调工具（将直接给文本）
+        若解析失败/异常亦返回 None，交由上层降级为纯上下文回答。
+        """
+        if self._client is None:
+            return None
+        model = model or self.settings.qwen_chat_model
+        try:
+            resp = await self.chat_completions(
+                model=model,
+                temperature=temperature,
+                max_tokens=1024,
+                tools=tools,
+                tool_choice="auto",
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            )
+            message = resp.choices[0].message
+            if message.tool_calls and message.tool_calls[0].function.arguments:
+                try:
+                    arguments = _parse_intent_json(message.tool_calls[0].function.arguments)
+                except Exception:  # noqa: BLE001 - 参数解析失败按无工具处理
+                    return None
+                return {"name": message.tool_calls[0].function.name, "arguments": arguments or {}}
+            # 没有 tool_call → 直接文本（content 一般也在 message.content）
+            return None
+        except Exception as exc:  # noqa: BLE001 - 工具轮失败降级为无工具
+            logger.warning("llm.tool_round model=%s error=%s", model, type(exc).__name__)
+            return None
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()
