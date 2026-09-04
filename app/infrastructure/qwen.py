@@ -323,6 +323,59 @@ class QwenProvider:
         )
         return (response.choices[0].message.content or "").strip()
 
+    async def stream_text(self, *, system: str, user: str, model: str | None = None, temperature: float = 0.3, max_tokens: int = 1600):
+        """真流式文本生成（async generator，按 delta 产出文本片）。
+
+        用 stream=True 边生成边吐，并在日志里记录首 token(TTFT)/耗时/token 用量。
+        - 抛错（如未配置 key / 网络）时先记失败日志再终止（不 yield，调用方自行兜底）。
+        - 结构化/确定性结果不应走本方法。
+        """
+        if self._client is None:
+            logger.warning("llm.stream model=%s status=failed reason=not_configured", model or self.settings.qwen_chat_model)
+            return
+        model = model or self.settings.qwen_chat_model
+        timeout = httpx.Timeout(
+            self.settings.qwen_chat_timeout_seconds,
+            connect=self.settings.qwen_chat_connect_timeout_seconds,
+        )
+        t0 = time.monotonic()
+        ttft_ms: float | None = None
+        prompt_tokens = completion_tokens = total_tokens = None
+        try:
+            stream = await self._client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+                stream_options={"include_usage": True},
+                timeout=timeout,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            )
+        except Exception as exc:  # noqa: BLE001
+            dur = (time.monotonic() - t0) * 1000
+            logger.warning("llm.stream model=%s status=failed error=%s duration_ms=%.0f", model, type(exc).__name__, dur)
+            return
+        try:
+            async for chunk in stream:
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    prompt_tokens = getattr(usage, "prompt_tokens", None) or prompt_tokens
+                    completion_tokens = getattr(usage, "completion_tokens", None) or completion_tokens
+                    total_tokens = getattr(usage, "total_tokens", None) or total_tokens
+                if ttft_ms is None:
+                    ttft_ms = (time.monotonic() - t0) * 1000
+                if not getattr(chunk, "choices", None):
+                    continue
+                delta = getattr(chunk.choices[0].delta, "content", None)
+                if delta:
+                    yield delta
+        finally:
+            dur = (time.monotonic() - t0) * 1000
+            logger.info(
+                "llm.stream model=%s status=done ttft_ms=%.0f prompt_tokens=%s completion_tokens=%s total_tokens=%s duration_ms=%.0f",
+                model, ttft_ms or dur, prompt_tokens, completion_tokens, total_tokens, dur,
+            )
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()

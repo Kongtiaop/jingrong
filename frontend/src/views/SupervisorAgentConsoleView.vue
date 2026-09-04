@@ -140,16 +140,59 @@ async function runCustomerRead(text: string, customerId: string) {
   }
 }
 
-async function runAdvisorAsk(text: string, customerId: string) {
+async function streamAdvisorAsk(customerId: string, query: string) {
+  const base = (import.meta as any).env?.VITE_API_BASE_URL || '/api/v1'
+  const token = sessionStorage.getItem('access_token') || ''
   loading.value = true
+  // 先推一个空助手气泡，边生成边填字
+  const assistant: any = { role: 'assistant', advisor_reply: true, answer: '' }
+  pushBubble(assistant)
   try {
-    const data = (await profileApi.advisorAsk({ customer_id: customerId, query: text })).data.data
-    pushBubble({ role: 'assistant', advisor_reply: true, answer: data.answer || '暂无可用回复。' })
+    const res = await fetch(`${base}/profile/staff/supervisor/advisor-ask/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ customer_id: customerId, query }),
+    })
+    if (!res.ok || !res.body) {
+      assistant.answer = (await res.text()) || '投顾回复服务暂时不可用。'
+      scrollToBottom()
+      return
+    }
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buf = ''
+    let sawToken = false
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let idx = -1
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const frame = buf.slice(0, idx)
+        buf = buf.slice(idx + 2)
+        const line = (frame.split('\n').find((l) => l.startsWith('data: ')) || '').slice(6).trim()
+        if (!line) continue
+        let payload: any
+        try { payload = JSON.parse(line) } catch { continue }
+        if (typeof payload.t === 'string') { assistant.answer += payload.t; sawToken = true }
+        else if (payload.error) assistant.answer = assistant.answer || `回复生成失败：${payload.error}`
+        scrollToBottom()
+      }
+    }
+    if (!sawToken && !assistant.answer) assistant.answer = '（未收到回复）'
   } catch (e: any) {
-    pushBubble({ role: 'assistant', kind: 'error', text: responseError(e) })
+    assistant.answer = responseError(e)
   } finally {
     loading.value = false
+    scrollToBottom()
   }
+}
+
+async function runAdvisorAsk(text: string, customerId: string) {
+  await streamAdvisorAsk(customerId, text)
 }
 
 async function runProxyDraft(text: string, customerId: string) {

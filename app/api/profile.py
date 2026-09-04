@@ -3,6 +3,7 @@ import json
 from uuid import uuid4
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from app.common.exceptions import ConflictError, ResourceNotFoundError
 from app.schemas.profile import StaffRecommendationRequest, StaffRecommendationResponse, AdvisorDraftRequest, AdvisorDraftResponse, AdvisorAuthorizationRequest, AdvisorAuthorizationResponse
 from app.models.auth import CustomerAdvisorAuthorization
@@ -555,6 +556,108 @@ async def staff_supervisor_advisor_ask(request: Request, payload: AdvisorAskRequ
     finally:
         await provider.close()
     return ApiResponse(data={"customer_id": customer_id, "query": query, "answer": answer, "context": {"risk_level": risk_level, "facts": facts, "conversation_summary": summary}})
+
+
+async def _advisor_ask_context(request: Request, payload: AdvisorAskRequest, user: User) -> dict:
+    """投顾智能回复：授权校验 + 汇总客户共享记忆/风险/资产为上下文。返回 system/user prompt。"""
+    from app.services.shared_memory_service import SharedMemoryService
+    whitelist = {"risk_preference", "product_preference", "investment_horizon_preference", "active_product"}
+    customer_id = payload.customer_id
+    query = (payload.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=422, detail={"code": "ADVISOR_ASK_EMPTY", "message": "query is required"})
+    uow = resolve_profile_uow(request)
+    display_name = customer_id
+    risk_level = ""
+    total_asset = 0.0
+    cash_balance = 0.0
+    async with request.app.state.database.session_factory() as session:
+        target = (await session.execute(select(User).where(User.id == customer_id, User.status == "active"))).scalar_one_or_none()
+        if target is None:
+            raise HTTPException(status_code=404, detail={"code": "CUSTOMER_NOT_FOUND", "message": "customer not found"})
+        display_name = target.display_name or customer_id
+        if not user.is_super_admin:
+            perms = {p.code for role in user.roles for p in role.permissions}
+            has_read_all = "customer:read_all" in perms
+            has_authz = (await _active_advisor_authorization(session, customer_id, str(user.id))) is not None
+            if not has_read_all and not has_authz:
+                raise HTTPException(status_code=403, detail={"code": "ADVISOR_ASK_FORBIDDEN", "message": "无权为该客户提供投顾分析"})
+        try:
+            active_risk = await uow.risks.get_active(session, customer_id) if hasattr(uow, "risks") else None
+            risk_level = active_risk.risk_level if active_risk else ""
+        except Exception:  # noqa: BLE001
+            risk_level = ""
+        try:
+            asset_service = AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets)
+            asset = await asset_service.latest_or_derived(session, customer_id)
+            if asset is not None:
+                total_asset = float(getattr(asset, "total_asset", 0) or 0)
+                cash_balance = float(getattr(asset, "cash_balance", 0) or 0)
+        except Exception:  # noqa: BLE001
+            pass
+    memory = CustomerMemoryService(request.app.state.database, None)
+    rows = await memory.load_long_term(customer_id=customer_id)
+    facts = {r.key: str(r.value) for r in rows if getattr(r, "key", None) in whitelist and getattr(r, "value", "")}
+    try:
+        shared = await SharedMemoryService(request.app.state.database, None).recall(customer_id=customer_id, agent_type="advisor", memory_type="observation")
+        for r in shared:
+            if getattr(r, "key", None) in whitelist and getattr(r, "value", "") and r.key not in facts:
+                facts[r.key] = str(r.value)
+    except Exception:  # noqa: BLE001
+        pass
+    summary = ""
+    try:
+        rec = await SharedMemoryService(request.app.state.database, None).recall(customer_id=customer_id, agent_type="customer_service", key="conversation_summary")
+        if rec:
+            summary = str(rec[0].value or "")
+    except Exception:  # noqa: BLE001
+        pass
+    lines = [f"客户：{display_name}"]
+    if risk_level:
+        lines.append(f"风险测评等级：{risk_level}")
+    if total_asset or cash_balance:
+        lines.append(f"总资产：¥{total_asset:,.0f}；现金余额：¥{cash_balance:,.0f}")
+    if facts:
+        lines.append("客户已知偏好（可能来自客户自述/记忆）：" + "；".join(f"{k}={facts[k]}" for k in facts))
+    if summary:
+        lines.append("最近会话摘要：" + summary[:800])
+    system = (
+        "你是财富管理平台的资深投顾助手，服务于内部员工（投顾/管理员），输出是供员工参考的内部建议。"
+        "请仅依据下面提供的客户事实作答，保守、合规、只读。"
+        "禁止援引具体法规/办法的条款号，也不要以“根据《XX办法》”等口吻编造出处；不要假装引用公司制度原文。"
+        "不得声称已执行交易、不得替客户下单或修改授权、不得编造客户未提供的数字、风险等级或偏好。"
+        "若客户偏好/投资目标/风险信息不足，明确列出缺少什么，并说明据此只能给出方向性参考而非完整配置结论。"
+        "结尾附一句风险提示（不构成投资建议）。"
+    )
+    return {"customer_id": customer_id, "query": query, "system": system, "user": "客户上下文：\n" + "\n".join(lines) + "\n\n员工问题：" + query}
+
+
+@router.post("/staff/supervisor/advisor-ask/stream")
+async def staff_supervisor_advisor_ask_stream(request: Request, payload: AdvisorAskRequest, user: Annotated[User, Depends(current_user)]):
+    """员工侧投顾智能回复（SSE 真流式）。
+
+    结构化结果不走这里；仅流式返回 LLM 生成的吐字。首 token/用量/耗时在 stream_text 内记录。
+    """
+    from app.core.settings import get_settings
+    from app.infrastructure.qwen import QwenProvider
+    ctx = await _advisor_ask_context(request, payload, user)
+    provider = QwenProvider(get_settings())
+
+    async def _gen():
+        try:
+            async for delta in provider.stream_text(system=ctx["system"], user=ctx["user"]):
+                yield f"data: {json.dumps({'t': delta}, ensure_ascii=False)}\n\n"
+            yield "data: {\"done\":true}\n\n"
+        except Exception as exc:  # noqa: BLE001 - 流式异常转 SSE 错误事件，前端据此兜底
+            yield f"data: {json.dumps({'error': f'{type(exc).__name__}: {exc}'}, ensure_ascii=False)}\n\n"
+        finally:
+            await provider.close()
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/staff/recommendations", response_model=ApiResponse[StaffRecommendationResponse])
