@@ -621,9 +621,29 @@ async def _advisor_ask_context(request: Request, payload: AdvisorAskRequest, use
         lines.append("客户已知偏好（可能来自客户自述/记忆）：" + "；".join(f"{k}={facts[k]}" for k in facts))
     if summary:
         lines.append("最近会话摘要：" + summary[:800])
+    # —— 真实业务 grounding：按题面关键字召回在售产品 + 该客户真实适当性命中，防模型凭空编 risk/收益 ——
+    try:
+        from app.services.advisor_tools import AdvisorReadTools, product_facts_to_text, suitability_facts_to_text
+        uow_now = resolve_profile_uow(request)
+        tools = AdvisorReadTools(uow_now)
+        async with request.app.state.database.session_factory() as t_session:
+            prod_facts = await tools.find_products(t_session, query=query.strip(), top_k=6)
+            if prod_facts:
+                # 取全量适当性命中，筛出本轮召回产品的真实结论
+                suit_all = await tools.product_suitability(t_session, customer_id=customer_id, product_id=None)
+                found_ids = {f.id for f in prod_facts}
+                relevant = [s for s in suit_all if s.product_id in found_ids]
+                lines.append("真实在售产品（库内 risk/金额/期限为准）：\n" + product_facts_to_text(prod_facts))
+                if relevant:
+                    lines.append("该客户对上述产品的真实适当性命中/排除（源自数据库规则，reasons 为判定依据）：\n"
+                                 + suitability_facts_to_text(relevant))
+    except Exception:  # noqa: BLE001 - grounding 失败不阻塞主回答，回退到纯客户事实
+        pass
     system = (
         "你是财富管理平台的资深投顾助手，服务于内部员工（投顾/管理员），输出是供员工参考的内部建议。"
-        "请仅依据下面提供的客户事实作答，保守、合规、只读。"
+        "请仅依据下面提供的客户事实和库内真实产品/适当性事实作答，保守、合规、只读。"
+        "若给出了'真实在售产品'或'真实适当性命中'，一律以该库内 risk_level / 金额 / 命中结论为准作答，"
+        "不得对具体产品凭空设定风险档位、收益率区间或适配结论；若库内没有、则明确说库里没有该产品的风控信息。"
         "禁止援引具体法规/办法的条款号，也不要以“根据《XX办法》”等口吻编造出处；不要假装引用公司制度原文。"
         "不得声称已执行交易、不得替客户下单或修改授权、不得编造客户未提供的数字、风险等级或偏好。"
         "若客户偏好/投资目标/风险信息不足，明确列出缺少什么，并说明据此只能给出方向性参考而非完整配置结论。"
