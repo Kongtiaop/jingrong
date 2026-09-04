@@ -54,12 +54,22 @@ class ConversationSummaryService:
                 return None
             provider = QwenProvider(settings)
         try:
-            resp = await provider.chat_completions(
-                model=provider.settings.qwen_chat_model, temperature=0.2,
-                response_format={"type": "json_object"},
-                messages=[{"role": "system", "content": SYSTEM},
-                          {"role": "user", "content": self._build_prompt(context)}],
-            )
+            # 兼容真实 provider（有 chat_completions，带受控超时）与测试 fake（仅有 _client.chat…）
+            caller = getattr(provider, "chat_completions", None)
+            if caller is not None:
+                resp = await caller(
+                    model=provider.settings.qwen_chat_model, temperature=0.2,
+                    response_format={"type": "json_object"},
+                    messages=[{"role": "system", "content": SYSTEM},
+                              {"role": "user", "content": self._build_prompt(context)}],
+                )
+            else:
+                resp = await provider._client.chat.completions.create(
+                    model=provider.settings.qwen_chat_model, temperature=0.2,
+                    response_format={"type": "json_object"},
+                    messages=[{"role": "system", "content": SYSTEM},
+                              {"role": "user", "content": self._build_prompt(context)}],
+                )
             content = (resp.choices[0].message.content or "").strip()
             json.loads(content)  # 校验是合法 JSON，否则不落库
             return content

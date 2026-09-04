@@ -6,6 +6,14 @@ from app.infrastructure.qwen import QwenProvider
 from app.services.customer_rag_service import CustomerRagResult
 
 
+async def _call_chat(provider, **kwargs):
+    """兼容真实 provider（chat_completions，带受控超时）与测试 fake（仅有 _client.chat…）。"""
+    caller = getattr(provider, "chat_completions", None)
+    if caller is not None:
+        return await caller(**kwargs)
+    return await provider._client.chat.completions.create(**kwargs)
+
+
 @dataclass(frozen=True)
 class CustomerRagAnswer:
     answer: str
@@ -27,7 +35,8 @@ def build_answerability_judge(provider: QwenProvider):
             f"用户问题：{query}\n\n检索引用：\n{evidence}\n\n只回答 yes 或 no。"
         )
         try:
-            response = await provider.chat_completions(
+            response = await _call_chat(
+                provider,
                 model=provider.settings.qwen_max_model,  # judge 用更强模型（qwen-max），避免自评偏置
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
@@ -60,7 +69,8 @@ class CustomerRagAnswerService:
             f"客户问题：{query}\n\n引用资料：\n{evidence}{history_block}"
         )
         try:
-            response = await self.provider.chat_completions(
+            response = await _call_chat(
+                self.provider,
                 model=self.provider.settings.qwen_chat_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
