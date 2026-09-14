@@ -55,8 +55,12 @@ class Settings(BaseSettings):
     agent_graph_shadow_enabled: bool = False
     # agent_checkpoint_enabled：把图状态持久化到 Postgres（断点续跑）；thread_id = conversation_id。
     agent_checkpoint_enabled: bool = False
-    agent_graph_max_iterations: int = 4
-    agent_graph_max_tool_calls: int = 8
+    # ReAct 预算：必须与管线 CustomerTaskExecutor.MAX_REACT_ITERATIONS / MAX_REACT_TOOL_CALLS
+    # （均 20）对齐。此前图默认 4/8，导致同一 query 两条路径的检索尝试次数不同
+    # （实测图 t1=4 次、t2=5 次 vs 管线各 2 次），"图 vs 管线"双跑对照本身不公平
+    # （ISSUE-20260914-REACT-BUDGET-AND-PLACEHOLDER-DIVERGENCE）。
+    agent_graph_max_iterations: int = 20
+    agent_graph_max_tool_calls: int = 20
 
     jwt_secret: str = Field(default="change-me-in-development-please-rotate-32", repr=False)
     jwt_algorithm: str = "HS256"

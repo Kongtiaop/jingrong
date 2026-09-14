@@ -181,7 +181,7 @@ class KnowledgeRepository:
                     .join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id)
                     .join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id)
                     .where(*filters, KnowledgeChunk.embedding.is_not(None))
-                    .order_by(vector_distance.asc())
+                    .order_by(vector_distance.asc(), KnowledgeChunk.id.asc())
                     .limit(candidate_k)
                 )
                 vector_rows = [(chunk, float(dist)) for chunk, dist in (await session.execute(vector_statement)).all()]
@@ -200,7 +200,7 @@ class KnowledgeRepository:
                 if chunk_id in vector_rank_by_id:
                     rrf += 1.0 / (rrf_k + vector_rank_by_id[chunk_id])
                 fused.append((chunk, rrf, vector_sim_by_id.get(chunk_id)))
-            fused.sort(key=lambda item: item[1], reverse=True)
+            fused.sort(key=lambda item: (-item[1], str(item[0].id)))
             return fused[:top_k]
 
     async def _rank_text_tsvector(self, session, *, query: str, filters: list, candidate_k: int) -> list:
@@ -214,7 +214,7 @@ class KnowledgeRepository:
             .join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id)
             .join(KnowledgeDocumentVersion, KnowledgeDocumentVersion.id == KnowledgeChunk.version_id)
             .where(*filters)
-            .order_by(text_rank.desc())
+            .order_by(text_rank.desc(), KnowledgeChunk.id.asc())
             .limit(candidate_k)
         )
         rows = list((await session.execute(text_statement)).all())

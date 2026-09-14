@@ -127,6 +127,74 @@ class FakeKnowledgeTool:
                   "citations": [{"chunk_id": f"{intent}-c1", "content": f"{intent} 内容"}]})
 
 
+# ---------- 对照公平性：ReAct 预算与兜底文案必须与管线一致 ----------
+# ISSUE-20260914-REACT-BUDGET-AND-PLACEHOLDER-DIVERGENCE：图默认 4/8 而管线 20/20，
+# 同一 query 检索尝试次数不同 → 双跑对照本身不公平；且图的兜底文案自造，
+# 与管线用的 RAG handoff message 不同源 → answer 字段必然 DIFF（"假差异"）。
+
+
+def test_graph_react_budget_matches_pipeline():
+    """图的 ReAct 预算必须与管线常量一致（否则对照不公平）。"""
+    from app.services.customer_task_executor import CustomerTaskExecutor
+
+    graph = SupervisorGraph()
+    assert graph.max_iterations == CustomerTaskExecutor.MAX_REACT_ITERATIONS
+    assert graph.max_tool_calls == CustomerTaskExecutor.MAX_REACT_TOOL_CALLS
+
+
+def test_react_budget_defaults_track_pipeline_constant():
+    """默认值应**引用**管线常量而非硬编码，防止日后再次漂移。"""
+    from app.services.customer_task_executor import CustomerTaskExecutor
+
+    original_iter = CustomerTaskExecutor.MAX_REACT_ITERATIONS
+    original_calls = CustomerTaskExecutor.MAX_REACT_TOOL_CALLS
+    try:
+        CustomerTaskExecutor.MAX_REACT_ITERATIONS = 7
+        CustomerTaskExecutor.MAX_REACT_TOOL_CALLS = 9
+        graph = SupervisorGraph()
+        assert graph.max_iterations == 7, "默认值未跟随管线常量（疑似硬编码）"
+        assert graph.max_tool_calls == 9
+    finally:
+        CustomerTaskExecutor.MAX_REACT_ITERATIONS = original_iter
+        CustomerTaskExecutor.MAX_REACT_TOOL_CALLS = original_calls
+
+
+def test_fallback_placeholder_reuses_tool_message():
+    """无证据时 answer 必须沿用工具返回的 RAG handoff message，而非自造占位串。"""
+    rag_message = "当前知识库没有足够依据，建议转人工客服或创建工单。"
+
+    class FailingTool:
+        async def execute(self, *, name, customer_id, query, intent, entities):
+            from types import SimpleNamespace
+            return SimpleNamespace(success=False, error="low_confidence",
+                                   data={"evidence_status": "low_confidence"},
+                                   answer=rag_message)
+
+    class PolicyPlanner:
+        def plan(self, query, context=None):
+            return IntentPlan(normalized_query=query, tasks=[IntentTask(
+                "t1", "policy", "rag_explanation", query, confidence=.8)])
+
+    supervisor = SupervisorGraph(planner=PolicyPlanner(), react_tool=FailingTool())
+    final = asyncio.run(supervisor.build().ainvoke(_state(user_message="开户流程是怎样的")))
+    task = final["task_results"][0]
+    assert task["status"] == "needs_clarification"
+    assert task["answer"] == rag_message, "兜底文案未沿用工具的 RAG message（会产生假 DIFF）"
+
+
+def test_fallback_placeholder_constant_matches_pipeline_wording():
+    """工具未返回 message 时的回退常量，必须与管线文案逐字一致。"""
+    from app.agents.graph import _FALLBACK_NO_EVIDENCE, _FALLBACK_CLARIFICATION
+    from app.services.customer_rag_service import CustomerRagService
+    import inspect as _inspect
+
+    src = _inspect.getsource(CustomerRagService)
+    assert _FALLBACK_NO_EVIDENCE in src, "回退文案与 CustomerRagService 的 handoff message 不一致"
+    assert _FALLBACK_CLARIFICATION in _inspect.getsource(
+        __import__("app.services.customer_task_executor", fromlist=["x"])), \
+        "回退 clarification 与管线 _bounded_react_knowledge 的占位串不一致"
+
+
 # ---------- 偏好链路（切流前置项：图此前完全缺失） ----------
 # ISSUE-20260914-GRAPH-MISSING-PREFERENCE-CHAIN：管线有「偏好持久化 + 纯偏好短路」两条链路，
 # 图此前都没有（grep pure_preference/extract_preference_statement in graph.py → 0）。

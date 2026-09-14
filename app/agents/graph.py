@@ -40,6 +40,14 @@ class AnswerGenerator(Protocol):
 
 _REWRITE_POOL = ["请提供官方流程、适用条件和注意事项", "请说明相关制度或流程，并给出依据"]
 
+# 只读知识任务无证据时的兜底文案。取值与管线保持一致：
+# - answer 取自 CustomerRagService 的 handoff message（工具返回的 result.answer 已带此串，优先使用它，
+#   仅在工具未返回 message 时回退到本常量）；
+# - clarification 取自 CustomerTaskExecutor._bounded_react_knowledge 的占位串。
+# 目的：同一语义不再出现两种文案，避免 answer 字段产生"假的"路径差异。
+_FALLBACK_NO_EVIDENCE = "当前知识库没有足够依据，建议转人工客服或创建工单。"
+_FALLBACK_CLARIFICATION = "当前资料不足，可以补充问题或转人工客服。"
+
 # 长时记忆可读白名单（与 customer_agent_execution.LONG_TERM_READ_KEYS 保持一致）
 LONG_TERM_READ_KEYS = {"active_product", "risk_preference", "product_preference", "investment_horizon_preference"}
 
@@ -125,15 +133,19 @@ class SupervisorGraph:
     def __init__(self, *, planner: PlanProvider | None = None, executor: TaskExecutor | None = None,
                  react_tool: ReadOnlyTool | None = None, answer_generator: AnswerGenerator | None = None,
                  database: Any | None = None, redis_client: Any | None = None,
-                 max_iterations: int = 4, max_tool_calls: int = 8) -> None:
+                 max_iterations: int | None = None, max_tool_calls: int | None = None) -> None:
         self.planner = planner or CustomerIntentPlanner()
         self.executor = executor
         self.react_tool = react_tool
         self.answer_generator = answer_generator
         self.database = database
         self.redis_client = redis_client
-        self.max_iterations = max_iterations
-        self.max_tool_calls = max_tool_calls
+        # ReAct 预算默认直接取管线的常量，杜绝两条路径再次漂移
+        # （历史上图默认 4/8 而管线 20/20，导致双跑对照不公平）。
+        self.max_iterations = (max_iterations if max_iterations is not None
+                               else CustomerTaskExecutor.MAX_REACT_ITERATIONS)
+        self.max_tool_calls = (max_tool_calls if max_tool_calls is not None
+                               else CustomerTaskExecutor.MAX_REACT_TOOL_CALLS)
 
     # ---- 记忆辅助（database 未注入时全部安全降级为空操作） ----
     def _memory(self):
@@ -374,13 +386,18 @@ class SupervisorGraph:
         done = repeated or (result.success and citations) or len(attempts) >= self.max_iterations
         if done:
             ok = result.success and bool(citations)
+            # 兜底文案必须沿用工具返回的 message，而不是自造占位串。
+            # 管线直接用 RAG 的 handoff message（"当前知识库没有足够依据，建议转人工客服或创建工单。"），
+            # 图此前硬编码 "当前资料不足。" → 同一语义两种文案，导致 answer 字段必然 DIFF
+            # 且用户体验不一致（ISSUE-20260914-REACT-BUDGET-AND-PLACEHOLDER-DIVERGENCE）。
+            fallback_answer = result.answer or _FALLBACK_NO_EVIDENCE
             finished = {
                 "task_id": task.task_id, "intent": task.intent,
                 "status": "succeeded" if ok else "needs_clarification",
-                "answer": result.answer if ok else "当前资料不足。",
+                "answer": result.answer if ok else fallback_answer,
                 "data": {**(result.data or {}), "execution_mode": "bounded_react", "tool_calls": attempts},
                 "error": None if ok else (result.error or "tool_budget_exhausted"),
-                "clarification": None if ok else "当前资料不足，可以补充问题或转人工客服。",
+                "clarification": None if ok else _FALLBACK_CLARIFICATION,
             }
             accumulated = list(state.react_results) + [finished]
             is_last = index + 1 >= len(plan.tasks)

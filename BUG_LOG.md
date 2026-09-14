@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 187 条真 bug 修复记录。
+- 共 188 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1607,6 +1607,9 @@ min_similarity 阈值 = 0.55
 1. 阈值加滞回/置信带（如 `0.50~0.60` 视为不确定，走 judge 或降级为"部分作答"而非直接拒）；
 2. RAG 判定改为**确定性可复现**（固定 embedding、固定 top_k、记录 `best_sim` 到审计以便事后归因）；
 3. **修正 `needs_handoff` 判定粒度**：单个 task 失败即整体转人工过于激进——已有可用答案时应返回"部分作答 + 提示"，而非同时给答案又转人工（自相矛盾的用户体验）。
+
+> **更新（同日）**：抖动根因已定位为**检索层排序不确定**（三处 `order_by`/`sort` 无 tie-breaker），已修复并单列 ISSUE-20260914-RAG-RETRIEVAL-NONDETERMINISTIC-SORT。上述第 2 条（确定性）已落地；第 1、3 条仍开放。
+> 另注：本条中"阈值余量仅 1.67%"是**脆弱性**，与"排序不确定"是**两个独立因素**——前者是设计余量不足，后者是工程缺陷。修复后者不解决前者。
 **验证**：容器内调用 `CustomerRagService.answer` 对原文/改写文本分别取 `best_sim`（见上）；`ambiguous_judge=None` 与 `thresholds` 亦同轮实测。
 
 ### ISSUE-20260914-SUMMARIZE-DUPLICATE-FILLER
@@ -1656,4 +1659,28 @@ return status, clarification, "\n".join(lines) or "当前没有可返回的结�
 2. 统一兜底占位文案：图复用 RAG 的 handoff message，避免同义不同文；
 3. 优先级最高的仍是 RAG 阈值抖动（见上条 ISSUE）——它让**任何**双跑对照都无法稳定复现，是评估可信度的根因。
 **价值**：本条的探针脚本是排查此类差异的**必要基础设施**——没有 task 级可见性，就会像本次一样凭聚合字段做出错误推断。
+
+### ISSUE-20260914-RAG-RETRIEVAL-NONDETERMINISTIC-SORT
+- 日期：2026-09-14
+- 分类：RAG / 检索层 / 可复现性
+- 严重程度：P1
+**问题**：ISSUE-20260914-RAG-EVIDENCE-THRESHOLD-MARGIN 中"同一 query 两次结论不同"的**根因定位**——不是 embedding、不是 LLM，而是**检索层的排序不确定**。
+**排查过程（逐步排除）**：
+1. **排除 embedding**：同一文本连续 4 次 `QwenProvider.embed()`，SHA256 **完全一致**（逐元素相等）→ embedding 确定性无问题。
+2. **排除 top_k 动态性**：`get_top_k_for_query()` 按 `_ENUM_MARKERS` 与难度分档取值，对同一 query 是**确定性**的。
+3. **定位到排序**：`app/repositories/knowledge.py` 三处排序**均无 tie-breaker**——
+   - `_rank_text_tsvector`：`.order_by(text_rank.desc())`
+   - 向量腿：`.order_by(vector_distance.asc())`
+   - RRF 融合：`fused.sort(key=lambda item: item[1], reverse=True)`
+
+**为什么会导致 best_sim 抖动**：RRF 分数**大量并列**（代码注释自陈"相关/无关都约 0.016"）。并列时顺序取决于 dict 插入顺序 → 来自 DB 返回顺序 → 而 SQL **无第二排序键**时，PostgreSQL 对等值行的返回顺序**不保证稳定**（受执行计划、并行度、页布局影响）。`fused[:top_k]` 截断后进入 `useful` 的 chunk 集合因此可能不同 → `best_sim = max(vector_similarity)` 随之变化 → 在 `min_similarity=0.55` 边缘翻转 `succeeded`/`low_confidence`。实测该 query `best_sim=0.5667`，**距阈值仅 0.0167**，极易翻转。
+**解决**：三处排序补齐确定性 tie-breaker（统一用 `KnowledgeChunk.id` 升序）：
+```python
+.order_by(text_rank.desc(), KnowledgeChunk.id.asc())
+.order_by(vector_distance.asc(), KnowledgeChunk.id.asc())
+fused.sort(key=lambda item: (-item[1], str(item[0].id)))
+```
+**影响面**：这是**两条路径共用的检索层**，故修复后管线与图的判定同时变得可复现——解释了为何此前观察到抖动发生在**管线侧**而非图侧。
+**验证**：`tests 279 passed`；新增 `scripts/check_rag_determinism.py`——对同一 query 连续检索 N 次，比对 `evidence_status`/`best_sim`/命中集合顺序的签名哈希，全一致则判定可复现（退出码 0）。**该脚本需在容器/有 DB 环境执行**，本地无法验证（本次仅完成静态修复 + 单测通过）。
+**残留风险**：tie-breaker 只保证**顺序确定**，不消除 `best_sim` 本身贴近阈值的脆弱性——`0.5667 vs 0.55` 的余量问题仍需通过滞回带或 judge 策略处理（见 ISSUE-20260914-RAG-EVIDENCE-THRESHOLD-MARGIN）。
 
