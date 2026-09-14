@@ -14,7 +14,7 @@ from app.services.customer_intent import (
 )
 from app.services.customer_agent_execution import pure_preference_statement, route_for_plan
 from app.services.customer_rag_service import CustomerRagResult
-from app.services.customer_task_executor import CustomerTaskExecutor, TaskExecutionResult
+from app.services.customer_task_executor import TOOL_BY_INTENT, CustomerTaskExecutor, TaskExecutionResult
 from app.services.knowledge_retrieval import KnowledgeCitation
 
 
@@ -413,11 +413,19 @@ class SupervisorGraph:
 
         task = plan.tasks[index]
         query = state.react_query or task.query
+        # 工具必须按 task 意图选择，不能一律走知识检索。
+        # 此前硬编码 `search_customer_knowledge`，导致**事实类意图**（order_status/asset_summary/
+        # workorder_status/risk_restriction/product_status）也被当作知识查询：
+        # 实测"我的订单 ORD-123456 状态"回退到本节点后，用知识库查订单 → 20 轮全失败
+        # → low_confidence → 误转人工（管线用 get_my_order_status 一次即得 fact_not_found
+        # → needs_clarification，requires_handoff=False）。
+        # 见 ISSUE-20260914-REACT-FALLBACK-IGNORES-INTENT。
+        tool_name = TOOL_BY_INTENT.get(task.intent, "search_customer_knowledge")
         result = await self.react_tool.execute(
-            name="search_customer_knowledge", customer_id=state.customer_id or "",
+            name=tool_name, customer_id=state.customer_id or "",
             query=query, intent=task.intent, entities=task.arguments)
         attempts = state.react_attempts + [{
-            "tool": "search_customer_knowledge", "iteration": len(state.react_attempts) + 1,
+            "tool": tool_name, "iteration": len(state.react_attempts) + 1,
             "task_id": task.task_id, "intent": task.intent,
             "success": result.success, "error": result.error,
             "evidence_status": result.data.get("evidence_status") if result.data else None,
@@ -438,18 +446,28 @@ class SupervisorGraph:
         done = repeated or (result.success and citations) or len(attempts) >= self.max_iterations
         if done:
             ok = result.success and bool(citations)
-            # 兜底文案必须沿用工具返回的 message，而不是自造占位串。
-            # 管线直接用 RAG 的 handoff message（"当前知识库没有足够依据，建议转人工客服或创建工单。"），
-            # 图此前硬编码 "当前资料不足。" → 同一语义两种文案，导致 answer 字段必然 DIFF
-            # 且用户体验不一致（ISSUE-20260914-REACT-BUDGET-AND-PLACEHOLDER-DIVERGENCE）。
-            fallback_answer = result.answer or _FALLBACK_NO_EVIDENCE
+            # 失败文案按**工具类型**区分（与管线 CustomerTaskExecutor._execute_one 对齐）：
+            #   - 事实类工具（订单/资产/工单/风险限制/产品状态）：fact_not_found / ambiguous_product
+            #     → "请补充更明确的查询对象或订单/产品信息"（要用户补充，**不转人工**）
+            #   - 知识检索：沿用 RAG 的 handoff message（"当前知识库没有足够依据…"，会转人工）
+            # 此前一律用知识检索文案，导致"订单查不到"被表述成"知识库没有依据+转人工"。
+            is_fact_tool = result.error in {"fact_not_found", "ambiguous_product"}
+            if ok:
+                answer_text = result.answer
+            elif is_fact_tool:
+                answer_text = result.answer or result.error or ""
+            else:
+                answer_text = result.answer or _FALLBACK_NO_EVIDENCE
+            clarification_text = None if ok else (
+                "请补充更明确的查询对象或订单/产品信息。" if is_fact_tool else _FALLBACK_CLARIFICATION
+            )
             finished = {
                 "task_id": task.task_id, "intent": task.intent,
                 "status": "succeeded" if ok else "needs_clarification",
-                "answer": result.answer if ok else fallback_answer,
+                "answer": answer_text,
                 "data": {**(result.data or {}), "execution_mode": "bounded_react", "tool_calls": attempts},
                 "error": None if ok else (result.error or "tool_budget_exhausted"),
-                "clarification": None if ok else _FALLBACK_CLARIFICATION,
+                "clarification": clarification_text,
             }
             accumulated = list(state.react_results) + [finished]
             is_last = index + 1 >= len(plan.tasks)

@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 204 条真 bug 修复记录。
+- 共 205 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1993,6 +1993,32 @@ round4 search_customer_knowledge  (改写)    -> False
 2. **system prompt 新增第 7 条**：**"工具调用失败时留在同一意图内**：换参数或改写 query 重试；**不要改调与用户问题无关的其他工具**（例如查订单失败后不要改查工单或知识库），反复失败就停止"。
 **验证**：新增 3 个测试——失败回灌含"不要改调/请勿改调"、system prompt 含该规则、`low_confidence` 提示同样不鼓励换工具。**用"退回旧文案"确认前两个测试会失败**。`tests 359 passed`；`我的订单` 的 `requires_handoff` 已与管线一致（False）、clarification 文案一致。
 **教训**：**给模型的失败反馈是"行为指令"，措辞必须同时说明「该做什么」与「不该做什么」**。只给正向建议（"换个更明确的"）会把模型推向未预期的方向——尤其当它面对的是"工具选择"这种开放决策时。
+
+### ISSUE-20260914-REACT-FALLBACK-IGNORES-INTENT
+- 日期：2026-09-14
+- 分类：Agent / 确定性 ReAct / 工具选择
+- 严重程度：P1
+**问题**：`我的订单 ORD-123456 状态` 在模型工具轮超时回退到确定性 ReAct 后，**用知识库查订单跑了 20 轮全失败**：
+```
+llm.tool_round model=qwen-plus error=APITimeoutError     ← 模型轮超时（16.8s > tool timeout 15s）
+[graph] task=t1 intent=order_status
+        tool_calls=20  execution_mode=bounded_react
+        call[1..20] tool=search_customer_knowledge success=False error=low_confidence
+        -> low_confidence -> requires_handoff=True         ← 误转人工
+pipeline: tool=get_my_order_status 一次即得 fact_not_found -> needs_clarification, handoff=False
+```
+**根因**：`react_step_node` **硬编码** `name="search_customer_knowledge"`，**不按 task 意图选工具**：
+```python
+result = await self.react_tool.execute(
+    name="search_customer_knowledge", ...)   # ← 无论 task.intent 是什么都用知识检索
+```
+于是**事实类意图**（`order_status`/`asset_summary`/`workorder_status`/`risk_restriction`/`product_status`）在确定性回退路径上被当作知识查询。而管线有 `TOOL_BY_INTENT` 映射（`customer_task_executor.py:19`），同一意图走 `get_my_order_status` 一次即得 `fact_not_found` → `needs_clarification`、**不转人工**。
+**这是长期存在的问题**，此前被其它失败掩盖（模型工具轮正常时不会走到该节点），本次因 `APITimeoutError` 回退才暴露。**20 轮全失败**说明它还浪费了大量工具调用。
+**解决（两处）**：
+1. **按意图选工具**：`react_step_node` 改用 `TOOL_BY_INTENT.get(task.intent, "search_customer_knowledge")`——事实类意图走对应事实工具，知识类仍走知识检索（与管线 `_execute_one` 的映射同源，从 `customer_task_executor` 导入该常量，避免两处漂移）。
+2. **失败文案按工具类型区分**：`is_fact_tool = result.error in {"fact_not_found","ambiguous_product"}` 时用"请补充更明确的查询对象或订单/产品信息。"，否则用知识检索的 handoff 文案。此前一律用知识检索文案，导致"订单查不到"被表述成"知识库没有依据 + 转人工"。
+**验证**：新增 `tests/test_react_intent_tool_selection.py` 共 12 个测试——9 个参数化验证各意图选对工具（5 个事实类 + 4 个知识类）、事实失败用补充信息文案、知识失败仍用 handoff 文案、事实失败不产生 `low_confidence` 转人工信号。**用"退回硬编码"确认 5 个事实类测试会失败**。`tests 371 passed`。
+**附带发现**：`llm.tool_round ... APITimeoutError`（16.8s）说明资源保护生效（工具轮超时 15s 起效，未拖到 90s），但也说明**模型工具轮单轮 15s 仍可能超时**——Qwen 在 `tool_choice=auto` 下（需生成工具调用 JSON）比普通对话慢。**待观察是否需要放宽工具轮超时或改为更快的模型。**
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 
