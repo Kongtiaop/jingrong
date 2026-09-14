@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 214 条真 bug 修复记录。
+- 共 216 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2215,39 +2215,40 @@ task_intents: pipeline = ['company_info', 'company_business']
 ### ISSUE-20260914-MULTI-KNOWLEDGE-INTENT-NO-INCREMENT
 - 日期：2026-09-14
 - 分类：RAG / 意图规划 / 信息增量
-- 严重程度：P2（不是错误答案，而是**架构冗余**：拆 task 无信息增量）
-**问题**：`你们公司的主营业务是什么` 规划出 company_info + company_business 两个 task，
-两条路径都产出两个 task。但两次答案内容**高度重复**（都在讲"基金销售 + 保险经纪"）。
-于是必须查清：拆 task 到底带来了什么？
-**查证方法**（真实数据，非模拟）：新增 `scripts/diagnose_multi_intent_value.py`，
-按 **service 的真实口径**复现检索（门控/向量排序用**原始 query** 嵌入，
-文本排序用 `normalized_query`），并输出 chunk 级重叠与答案相似度。
-**实测结论**：
+- 严重程度：P3（**结论已更正**：原判"无增量"错误）
+- 状态：**已撤回错误结论**，本条保留作为方法论反面案例
+
+**原始（错误）结论**：基于**单个样本**观察到 company_info 与 company_business
+命中完全相同的 5 个 chunk（Jaccard=1.000、各自独有=0），据此判定
+"拆 task 不带来信息增量，只是把同一份资料复述两遍"。
+
+**更正后的实测结论**（容器内复跑，同一 query 同一库）：
 ```
-intent 只影响两件事：
-  ① normalize_customer_query 的关键词扩展
-     company_info     → 追加 "公司名称 公司介绍 联系方式 客户数量"
-     company_business → 追加 "公司业务 公司服务 服务范围 客户"
-  ② scope —— 但公开知识类意图的 scope **完全相同**
-     KnowledgeScope(categories=('company_info','company_business','faq',
-                                'workflow','policy','risk_public'), ...)  ← 两个 intent 逐字相同
-检索结果：
-  company_info     chunk_ids = [4a40b4c1…, 77a23af6…, 93738fbe…, caf20d8d…, e0f73a21…]
-  company_business chunk_ids = [4a40b4c1…, 77a23af6…, 93738fbe…, caf20d8d…, e0f73a21…]
-  Jaccard 重叠 = 1.000   各自独有 = 0 / 0   共有 = 5
-  similarities 完全相同 = [0.5046, 0.4901, 0.4794, 0.4677, 0.4486]
+chunk 重叠(Jaccard) = 0.667   仅 company_info 独有=1  仅 company_business 独有=1  共有=4
+=> INCREMENTAL：各自检索到独有证据（4 共有 / 1 独有）
 ```
-**结论**：两个意图在**同一套 scope 下、用同一条基础问句**检索，
-只有尾部几个扩展词不同——命中的是**同一批 5 个 chunk**，各自独有 **0** 条。
-即 **company_info / company_business 的拆分不带来任何信息增量**，
-拆 task 只是把同一份资料复述两遍。
-**影响**：
-1. 我们上一轮"补齐 task 数"（`ISSUE-20260914-COVERAGE-BACKSTOP-SKIPPED-ON-BUDGET`）在**正确性**上没错
-   （计划里有两个意图就该都执行），但在**收益**上要重新评估——补上的是一份重复证据。
-2. 规划器把 company_info/company_business 拆成两个 task 的**依据需要复核**：
-   若二者共享同一 scope 且共享同一基础 query，则它们**不是两个可独立检索的意图**。
-**待决**（涉及产品语义，未自行决定）：是合并为一个 task，还是保留拆分但让二者检索**不同 scope/不同扩展词**。
-在决定前不应改动，因为"合并"会改变对外可见的 task 数量与答案结构。
+即**拆分确实带来独有证据**，只是增量较小（4 共有 + 各 1 独有）。
+"拆 task 无增量"的判断**不成立**。
+
+**为什么两次结果不同（这才是真问题）**：
+同一 query、同一知识库，两次检索的 chunk 集合**本身就在变**：
+```
+第一次: 4a40b4c1, 77a23af6, 93738fbe, caf20d8d, e0f73a21
+第二次: 4a40b4c1, 77a23af6, caf20d8d, e0f73a21, f069230e   ← 93738fbe 被 f069230e 取代
+```
+`candidate_k = max(top_k*4, 20)`，第 20 名的 chunk 恰好落在**边界**上，
+向量检索的微小浮点/服务端差异就会导致边界外/内的 chunk 互换。
+于是"重叠率"这种**基于集合的指标本身不稳定**，用单次采样它去判断架构价值，必然得出错误结论。
+
+**方法论教训（本条的核心价值）**：
+1. **集合类指标（重叠率/覆盖率）必须多次采样**，单次结果不能作为架构判断依据——
+   因为检索候选集在边界上抖动，一次采样可能恰好命中"完全重合"或"完全不相交"两个极端。
+2. 这是我在本议题上**第三次**因单样本下错结论（前两次：误判"模型改写更差"、
+   误判"图有合规问题"）。三次的共同形态都是：**用一个样本的差异去推断机制性结论**。
+   正确做法是：先多次采样建立分布，再看分布是否支持结论。
+3. **仍待决**：company_info / company_business 的 scope 逐字相同、
+   基础 query 相同（仅尾部扩展词不同），是否应拆成两个 task 仍需产品判断；
+   但依据**不再是"无增量"**（该依据已失效），而是"增量是否值得多一次检索与生成成本"。
 
 ### ISSUE-20260914-JUDGE-BAND-REJECTS-RELEVANT-EVIDENCE
 - 日期：2026-09-14
@@ -2280,3 +2281,68 @@ intent 只影响两件事：
 本例的门控嵌入与检索嵌入不同源，是这种不一致的结构性来源。
 **验证工具**：`scripts/diagnose_multi_intent_value.py` 已打印
 `min_score / min_similarity / thresholds / best_sim / 门控归属`，可直接定位落在哪个带。
+
+### ISSUE-20260914-INTENT-CATEGORY-FILTER-NEVER-APPLIED
+- 日期：2026-09-14
+- 分类：RAG / 检索 / 意图路由
+- 严重程度：**P0**（意图规划的两个 task 实际检索**同一批文档**，第二个 task 名不副实）
+**现象**：`你们公司的主营业务是什么` 的 `company_business` task，
+检索回来的 **5 条全部是 `company_info` 类目文档**，一条 `company_business` 都没有。
+扩大 `top_k=25` 复验：
+```
+company_business intent, top_k=25 → {'company_info': 21, 'policy': 4}
+第一个 company_business 的排名 = 无（前 25 名里一个都没有）
+前 10 名: 全是 company_info
+```
+而库中实际存在 **39 个 `company_business` chunk**（全部类目：company_business 39 / company_info 28 / policy 24 / faq 2）。
+**根因**：`CustomerRagService` 传给 `WealthKnowledgeRetriever.search()` 的只有 `scope`，
+**从未传 `category`**。而 `KnowledgeRepository.search_hybrid` 的类目过滤是：
+```python
+if category:                                   # ← 需要显式传 category 才生效
+    filters.append(KnowledgeDocument.category == category)
+if scope and scope.categories:
+    filters.append(KnowledgeDocument.category.in_(scope.categories))   # ← 这里放行 6 个类目
+```
+`scope_for_customer_intent()` 对**所有公开知识类意图**返回同一个含 6 类目的 scope
+（company_info / company_business / faq / workflow / policy / risk_public），
+于是**类目过滤等价于不过滤**——intent 到类目的收敛**从未发生**。
+`intent` 对检索的唯一实际影响退化为：`normalize_customer_query` 追加的几个关键词。
+**为什么这是 P0**：
+1. **意图规划形同虚设**：计划出 `company_info + company_business` 两个 task，
+   但两者检索的是同一批文档池，只靠尾部扩展词区分。
+   用户以为"两路证据"，实际是**同一路**。
+2. 它**同时解释了**此前多个困惑：
+   - 为什么两个 intent 的 chunk 集合高度重合（Jaccard 0.667~1.000）——因为本就不分区；
+   - 为什么答案内容重复（"基金销售 + 保险经纪"说两遍）——因为证据同源；
+   - 为什么 `company_business` 这个 task 的答案与 `company_info` 几乎一样。
+3. **修正了此前的错误归因**：我曾判定"拆 task 无信息增量"（已撤回）与
+   "多意图拆分冗余"，真正的原因是**类目没生效**，而不是"拆分本身没价值"。
+   一旦类目生效，两个 intent 会检索**不同文档**，拆分才可能有真实增量。
+**未改动的原因**：让 `category` 生效会**改变检索结果与答案内容**，
+属于检索行为变更，需先确认产品预期（每个 intent 是否应严格限定在自己类目内，
+还是类目只是"优先"而非"过滤"）。且需配批量评测，不能凭单条样本。
+**验证手段**：`scripts/diagnose_multi_intent_value.py` 已打印每个 intent 的
+chunk 集合、相似度与门控归属，可扩展为打印**每条命中的类目**以直观暴露本问题。
+
+### ISSUE-20260914-RETRIEVAL-SET-JITTER-HYPOTHESIS-REFUTED
+- 日期：2026-09-14
+- 分类：RAG / 方法论
+- 严重程度：P3（**假设被证伪**，记录以避免重复走弯路）
+**背景**：观察到同一 query 在**本地**与**容器**两次运行返回不同的 chunk 集合
+（`93738fbe` 被 `f069230e` 取代），据此提出假设：
+"`candidate_k = max(top_k*4, 20)` 使第 20 名落在边界，向量检索微小差异导致集合抖动，
+故集合类指标不稳定、单次采样不可信。"
+**证伪**：新增 `scripts/diagnose_retrieval_stability.py`，对同一 query 重复采样 8 次：
+```
+不同 chunk 集合数 = 1（8/8 完全相同的 ids）
+best_sim: min=0.5045 max=0.5046 极差=0.0001
+落在 judge 带 [0.35,0.65) 的次数 = 8/8
+```
+**检索在本环境内是稳定的**，不存在边界抖动。故"抖动"假设**不成立**，
+本地/容器两次集合不同的原因**另有他因**（且实测两边的 `best_sim` 一致：0.5045 vs 0.5046）。
+**方法论价值**：
+- 提出假设后**先设计证伪实验**，而不是照着假设去改代码——本次避免了
+  一次"为了修复不存在的抖动"而改 `candidate_k` 的无用改动。
+- 但**教训仍在**：上一轮基于单样本判定"拆 task 无增量"确实错了；
+  正确的纠正方式是**多次采样**（本脚本），而不是换成另一个单样本。
+- 结论：集合指标的稳定性**必须实测**，既不能假定它稳定，也不能假定它抖动。

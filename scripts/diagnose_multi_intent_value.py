@@ -104,7 +104,7 @@ async def main() -> int:
         try:
             gate_embedding = (await embedding_provider.embed([args.query]))[0]
         except Exception as exc:  # noqa: BLE001
-            print(f"⚠️ 嵌入失败（{type(exc).__name__}），相似度将不可用：{exc}")
+            print(f"[!] 嵌入失败（{type(exc).__name__}），相似度将不可用：{exc}")
     svc = CustomerRagService(retriever, embedding_provider=embedding_provider)
     print(f"min_score={svc.min_score}  min_similarity={svc.min_similarity}  "
           f"thresholds={svc.thresholds}\n")
@@ -147,6 +147,18 @@ async def main() -> int:
         chunk_ids = {str(h.chunk_id) for h in hits}
         sims = sorted((round(float(h.vector_similarity), 4)
                        for h in hits if h.vector_similarity is not None), reverse=True)
+        # 打印每条命中的**类目**：intent 到类目若不生效，这里会直接暴露
+        # （ISSUE-20260914-INTENT-CATEGORY-FILTER-NEVER-APPLIED：
+        #  company_business intent 曾检索回 5 条 company_info 文档）
+        cats: list[str] = []
+        async with database.session_factory() as session:
+            from sqlalchemy import text as _sql_text
+            for h in hits:
+                row = (await session.execute(
+                    _sql_text("SELECT d.category AS c FROM knowledge_chunk c "
+                              "JOIN knowledge_document d ON d.id = c.document_id "
+                              "WHERE c.id = :cid"), {"cid": h.chunk_id})).fetchone()
+                cats.append(str(row.c) if row else "?")
         # 再走一次 service，拿到**它自己的判定**（证据是否足够）
         rag = await svc.answer(query=args.query, intent=intent)
         best = sims[0] if sims else None
@@ -166,6 +178,12 @@ async def main() -> int:
         print(f"  best_sim = {best}  → 门控: {per_intent[intent]['gate']}")
         print(f"  similarities = {sims}")
         print(f"  chunk_ids    = {sorted(chunk_ids)}")
+        from collections import Counter as _Counter
+        print(f"  命中类目分布 = {dict(_Counter(cats))}")
+        if intent not in cats and cats:
+            # 不用 emoji：Windows 控制台默认 GBK，会 UnicodeEncodeError
+            print(f"  [!] 本 intent 为 {intent!r}，但命中里没有一条属于该类目 -> "
+                  f"意图到类目的收敛未生效（见 ISSUE-20260914-INTENT-CATEGORY-FILTER-NEVER-APPLIED）")
         print(f"  message({len(rag.message or '')} chars) = {(rag.message or '')[:110]!r}")
         # service 自己的 top_k（动态取值，可能与脚本用的不同）——对齐后可排除"参数不同"这一解释
         print(f"  service.top_k_for_query = {svc._config.get_top_k_for_query(args.query)}"
@@ -216,7 +234,7 @@ async def main() -> int:
     if not verdicts:
         print("  只有一个意图，无对比。")
     elif kinds == {"NO_EVIDENCE"}:
-        print("  ⚠️ 全部意图对都缺证据 → **本次无法判断信息增量**。")
+        print("  [!] 全部意图对都缺证据 -> **本次无法判断信息增量**。")
         print("  这是检索/判定失败，不是'拆分无价值'的证据；先查为何无引用（见上）。")
     elif kinds == {"REDUNDANT"}:
         print("  全部意图对均 REDUNDANT → **多知识意图拆分未带来信息增量**，")
