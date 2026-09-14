@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 211 条真 bug 修复记录。
+- 共 212 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2169,3 +2169,45 @@ answer = '您最近的工单 WO… 当前状态为 open。\n当前知识库没�
 在断言某个模型行为倾向之前，先确认该行为的**动机证据是否被保存**；
 若观测通道本身被丢弃，任何"这就是模型天性、改不好"的判断都是**不可证伪的猜测**，
 且极易滑向"加限制"这种掩盖而非解释的处置方式。正确顺序是：**先补观测 → 看真实理由 → 再定约束**。
+
+### ISSUE-20260914-COVERAGE-BACKSTOP-SKIPPED-ON-BUDGET
+- 日期：2026-09-14
+- 分类：Agent 编排 / 多意图覆盖
+- 严重程度：P1（**漏答且静默**：用户少拿一路答案，状态仍报 completed）
+**现象**：`你们公司的主营业务是什么` 图只产出 1 个 task，管线 2 个：
+```
+task_intents: pipeline = ['company_info', 'company_business']
+              graph    = ['company_info']
+```
+两条路径**都从同一个 planner 出发**（图 `graph.py:166 _plan` / 管线 `customer_agent_execution.py:338`），
+实测 `CustomerIntentPlanner.plan()` 对该 query 返回的原始计划就是 **2 个 task**
+（`['company_info','company_business']`）。所以 task 是在**规划之后**丢的。
+**根因**：`_fill_uncovered()`（"别漏"的规则兜底）**只挂在"模型主动停止"分支**（`if not decision`）。
+若模型不主动停、一路调到预算耗尽或触发重复调用闸门，就会走 `budget_exhausted` /
+`duplicate_call_skipped` 出口——而这两个出口**完全不检查** `_uncovered_intents`，兜底被**静默跳过**：
+```
+[graph] task=model-tool-1 intent=company_info  succeeded
+（company_business 从未检索）
+=> 图上只剩 1 个 task，但 overall_status 仍报 completed
+```
+**为什么"只留个标记"不算修好**：原有一处测试断言此场景 `stopped_reason == "intent_uncovered"`——
+即"预算耗尽就放弃，只记下漏了这件事"。但兜底的意义是**别漏**，不是**把漏了记下来**。
+只记原因的版本会让 codebase 里长期存在一条"看起来有兜底、实际不生效"的路径，
+这正是本次现象能长期潜伏的原因。
+**为什么容易漏掉**：兜底被写在"模型主动停止"这个**偶然条件**下。
+模型停不停是概率性的，把它当触发条件，等于让"别漏"变成"看运气"。
+**修复**：把覆盖检查提到**循环外的统一收尾**，对**所有**退出路径生效，
+并排除"越界被拦"这一已明确终止的情形（`tool_out_of_plan_scope` 时不补，
+避免"模型越界 → 兜底又替它查一遍"的语义混乱）。补齐成功则记
+`stopped_reason="rule_backstop_filled"`，使"主循环是被兜底收的尾"在观测上可见。
+**验证**（A/B 对真实 planner，非构造样本）：
+```
+修复前: stopped_reason=duplicate_call_skipped  results=['company_info']                       ← 漏
+修复后: stopped_reason=rule_backstop_filled    results=['company_info','company_business']    ← 补齐
+```
+新增/改写 3 条测试：预算耗尽路径必须补齐、已全覆盖时**不得**多调（省一轮 LLM）、
+未传计划时不得触发。另有 1 条旧测试此前断言的是**错误行为**（`intent_uncovered`），已改写为断言**结果被真的补上**。`tests 396 passed`。
+**方法论教训**：**兜底不能挂在"对方恰好停下"这种偶然条件上。**
+任何"别漏"的保证必须建立在**必然执行**的收尾路径上（循环外统一收尾），
+否则它会以"代码里有、实际不生效"的形态长期潜伏——
+比"没有兜底"更危险，因为它会让人误以为已经安全。

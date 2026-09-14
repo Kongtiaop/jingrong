@@ -623,4 +623,28 @@ class CustomerModelToolLoop:
         else:
             outcome.stopped_reason = "budget_exhausted"
 
+        # ---- 收尾兜底：所有退出路径都必须检查"计划意图是否漏覆盖" ----
+        # ISSUE-20260914-COVERAGE-BACKSTOP-SKIPPED-ON-BUDGET：
+        # `_fill_uncovered` 此前**只挂在"模型主动停止"分支**（`if not decision`）。
+        # 若模型不主动停、一路调到预算耗尽，就会走 `budget_exhausted` 出口，
+        # 而该出口**完全不检查** `_uncovered_intents` —— 兜底被静默跳过。
+        # 实测后果：`你们公司的主营业务是什么` 计划有 company_info + company_business 两个 task，
+        # 模型 4 轮全用 intent=company_info，`company_business` 从未检索，
+        # 图最终只产出 1 个 task（管线 2 个），而 `overall_status` 仍报 `completed`
+        # —— 用户少拿一路答案却看不出异常。
+        # 兜底是"别漏"的**结构性保证**，不能依赖"模型恰好主动停下"这种偶然条件。
+        if not outcome.stopped_reason.startswith("tool_out_of_plan_scope"):
+            remaining = _uncovered_intents(planned_intents, outcome.results)
+            if remaining:
+                filled = await self._fill_uncovered(
+                    pending=remaining, customer_id=customer_id,
+                    conversation_id=conversation_id, query=query,
+                    round_index=self.max_rounds + 1, outcome=outcome,
+                )
+                if filled and not outcome.stopped_reason.startswith("tool_out_of_plan_scope"):
+                    # 兜底确实补了东西 → 覆盖退出原因，让"主循环是被兜底收的尾"可见。
+                    # 不限于 budget_exhausted：重复调用闸门（duplicate_call_skipped）同样属于
+                    # "模型没主动停但循环结束"，那条路径以前也完全跳过兜底。
+                    outcome.stopped_reason = "rule_backstop_filled"
+
         return outcome

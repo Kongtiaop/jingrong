@@ -248,8 +248,15 @@ def test_backstop_respects_allowlist():
         assert tool in _ALLOWED_TOOL_NAMES, f"意图 {intent} 映射到非白名单工具 {tool}"
 
 
-def test_backstop_reports_intent_uncovered_when_budget_runs_out():
-    """预算用尽且仍有未覆盖意图 → stopped_reason=intent_uncovered（便于观测，而非静默）。"""
+def test_backstop_reports_rule_backstop_filled_when_budget_runs_out():
+    """预算用尽且仍有未覆盖意图 → 必须**真的补齐**，并记 stopped_reason=rule_backstop_filled。
+
+    此测试原先断言 `intent_uncovered`——即"预算耗尽就放弃、只留个标记"。
+    那正是 ISSUE-20260914-COVERAGE-BACKSTOP-SKIPPED-ON-BUDGET 的一部分：
+    兜底只挂在"模型主动停止"分支，预算耗尽路径只报个原因、**不补**，
+    导致 `你们公司的主营业务是什么` 少一个 task 却仍报 completed。
+    兜底的意义是"别漏"，不是"把漏了这件事记下来"。故断言改为**结果确实被补上**。
+    """
     tools = FakeReadTools()
     provider = FakeProvider([
         {"name": "get_my_risk_restriction", "arguments": {}},
@@ -258,7 +265,9 @@ def test_backstop_reports_intent_uncovered_when_budget_runs_out():
     loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=2)
     outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q",
                                    planned_intents=["risk_restriction", "risk_public"]))
-    assert outcome.stopped_reason == "intent_uncovered"
+    assert "risk_public" in [r["intent"] for r in outcome.results], \
+        f"预算耗尽后必须补齐 risk_public，实际 {[r['intent'] for r in outcome.results]}"
+    assert outcome.stopped_reason == "rule_backstop_filled"
 
 
 def test_no_backstop_when_all_intents_covered():
@@ -484,6 +493,72 @@ def test_budget_exhausted_when_model_keeps_calling():
     # 但状态必须是失败/待澄清类，绝不能标 succeeded。
     assert all(r["status"] != "succeeded" for r in outcome.results), \
         "失败的工具结果不得标记为 succeeded"
+
+
+# ---------- 收尾兜底必须覆盖所有退出路径 ----------
+# ISSUE-20260914-COVERAGE-BACKSTOP-SKIPPED-ON-BUDGET
+
+def test_backstop_fires_when_budget_exhausted():
+    """模型一路调到预算耗尽 → 兜底**仍必须**补齐漏掉的计划意图。
+
+    修复前 `_fill_uncovered` 只挂在"模型主动停止"分支：`你们公司的主营业务是什么`
+    计划有 company_info + company_business，模型 4 轮全用 intent=company_info，
+    走到 budget_exhausted 出口就**不再检查**未覆盖意图，company_business 永远没查，
+    图只产出 1 个 task（管线 2 个），且 overall_status 仍报 completed。
+    """
+    tools = FakeReadTools()
+    # 模型每轮都调同一个 intent，从不主动停 → 必然预算耗尽
+    decisions = [{"name": "search_customer_knowledge",
+                  "arguments": {"query": "公司主营业务", "intent": "company_info"}}
+                 for _ in range(6)]
+    loop = _loop(decisions, tools=tools, max_rounds=3)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1",
+                                   query="你们公司的主营业务是什么",
+                                   planned_intents=["company_info", "company_business"]))
+
+    intents = [r["intent"] for r in outcome.results]
+    assert "company_business" in intents, \
+        f"预算耗尽路径必须补齐漏掉的意图，实际 results={intents}"
+    # 兜底补了东西 → stopped_reason 应改写为 rule_backstop_filled
+    # （退出原因可能是 budget_exhausted 或 duplicate_call_skipped，两者都属于"非主动停止"）
+    assert outcome.stopped_reason == "rule_backstop_filled", \
+        f"应记录兜底确实补了东西，实际 {outcome.stopped_reason}"
+    # 兜底补齐的调用必须标注来源，便于区分"模型查的"与"规则补的"
+    backstop = [r for r in outcome.rounds if (r.arguments or {}).get("filled_by") == "rule_backstop"]
+    assert backstop, "兜底调用应带 filled_by=rule_backstop 标记"
+
+
+def test_backstop_is_noop_when_model_covered_everything():
+    """模型已覆盖全部计划意图 → 兜底不得再补、不得多调工具。"""
+    tools = FakeReadTools()
+    loop = _loop([
+        {"name": "search_customer_knowledge",
+         "arguments": {"query": "公司简介", "intent": "company_info"}},
+        {"name": "search_customer_knowledge",
+         "arguments": {"query": "主营业务", "intent": "company_business"}},
+        None,
+    ], tools=tools, max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1",
+                                   query="你们公司的主营业务是什么",
+                                   planned_intents=["company_info", "company_business"]))
+    assert outcome.stopped_reason == "no_tool_call", \
+        f"已全覆盖时不应触发兜底，实际 {outcome.stopped_reason}"
+    assert len(outcome.results) == 2
+    assert not [r for r in outcome.rounds
+                if (r.arguments or {}).get("filled_by") == "rule_backstop"], \
+        "已全覆盖时不得产生兜底调用"
+
+
+def test_no_backstop_without_plan():
+    """未传 planned_intents → 无计划即无"漏覆盖"概念，兜底不得触发。"""
+    tools = FakeReadTools()
+    decisions = [{"name": "search_customer_knowledge", "arguments": {"query": f"q{i}"}}
+                 for i in range(6)]
+    loop = _loop(decisions, tools=tools, max_rounds=2)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q"))
+    assert outcome.stopped_reason == "budget_exhausted"
+    assert not [r for r in outcome.rounds
+                if (r.arguments or {}).get("filled_by") == "rule_backstop"]
 
 
 def test_model_unavailable_degrades_without_exception():
