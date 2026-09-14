@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 205 条真 bug 修复记录。
+- 共 206 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2019,6 +2019,43 @@ result = await self.react_tool.execute(
 2. **失败文案按工具类型区分**：`is_fact_tool = result.error in {"fact_not_found","ambiguous_product"}` 时用"请补充更明确的查询对象或订单/产品信息。"，否则用知识检索的 handoff 文案。此前一律用知识检索文案，导致"订单查不到"被表述成"知识库没有依据 + 转人工"。
 **验证**：新增 `tests/test_react_intent_tool_selection.py` 共 12 个测试——9 个参数化验证各意图选对工具（5 个事实类 + 4 个知识类）、事实失败用补充信息文案、知识失败仍用 handoff 文案、事实失败不产生 `low_confidence` 转人工信号。**用"退回硬编码"确认 5 个事实类测试会失败**。`tests 371 passed`。
 **附带发现**：`llm.tool_round ... APITimeoutError`（16.8s）说明资源保护生效（工具轮超时 15s 起效，未拖到 90s），但也说明**模型工具轮单轮 15s 仍可能超时**——Qwen 在 `tool_choice=auto` 下（需生成工具调用 JSON）比普通对话慢。**待观察是否需要放宽工具轮超时或改为更快的模型。**
+
+### ISSUE-20260914-TIER-S-ROUTES-TO-UNAUTHORIZED-MODEL
+- 日期：2026-09-14
+- 分类：配置 / 模型授权 / 静默降级
+- 严重程度：P1
+**问题**：为给工具轮换更快模型，实测各模型可用性时发现 **`qwen-turbo` 在账号下无权限**：
+```
+llm.usage model=qwen-turbo status=failed duration_ms=1320
+llm.tool_round model=qwen-turbo error=PermissionDeniedError
+```
+而 `config/understanding.yaml` 的模型路由把**简单 query（tier S）**指向它：
+```yaml
+- {max: "S", model: "qwen-turbo"}    # ← 无权限
+- {max: "M", model: "qwen-plus"}
+- {max: "L", model: "qwen-max"}
+```
+**实测影响面**（对照用的 8 条 query 中 **6 条**路由到 `qwen-turbo`）：
+```
+你好 / 查一下我的持仓 / 我有没有风险限制 / 我的订单 ORD-123456 状态 /
+推荐适合我的产品 / 开户流程是怎样的        → 全部 tier-S → qwen-turbo（无权限）
+你们公司的主营业务是什么 / 什么是双录       → tier-M → qwen-plus（正常）
+```
+**后果**：
+1. **LLM 意图兜底对简单 query 从未真正生效**——`classify_intent` 调用失败 → 被 `customer_agent_execution` 的 `except` 吞掉 → 静默回退规则规划器。这解释了此前"LLM 兜底开着却观察不到效果"。
+2. **每次白耗一次失败调用**（约 1.3s + 配额）。
+3. **生产风险**：`docker-compose.p0.yml` 默认 `LLM_INTENT_FALLBACK_ENABLED:-true`，**线上很可能一直在静默失败**（本地 `.env` 设为 false 故未触发，掩盖了问题）。
+**模型可用性实测结果**（同轮）：
+| 模型 | 结果 |
+|---|---|
+| `qwen-turbo` | ❌ PermissionDeniedError |
+| `qwen-plus` | ✅ 正常返回工具调用 |
+| `qwen-max` | ✅ |
+| `qwen3-max` | ❌ PermissionDeniedError |
+| `qwen-flash` | ✅ **（新发现可用，轻量快速）** |
+| `qwen2.5-7b-instruct` | ❌ PermissionDeniedError |
+**解决（待实施，需业务确认）**：把 tier-S 路由改为**已开通的模型**（`qwen-flash` 定位为轻量快速，适合简单 query）；并建议增加**启动期/首次调用期的模型可用性自检**，避免"配置指向无权限模型"这类问题继续静默。**若换模型，需先实测其意图识别准确率不低于原预期。**
+**同类模式**：这是本项目第 N 次「配置声明与实现实际脱节」——与 `AMBIGUOUS-JUDGE-NOT-WIRED`（配置 judge_ambiguous=true 但未接线）、`INTENT-FALLBACK-DEFAULT-LAYERING`（文档说默认关、compose 默认开）同族。**共性：配置层没有校验机制，错误只在运行时静默降级。**
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 
