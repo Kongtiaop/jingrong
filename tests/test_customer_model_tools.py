@@ -130,17 +130,56 @@ def test_customer_id_injected_server_side_not_from_model():
 
 # ---------- 模型自主选择 ----------
 
-def test_model_selects_fact_tool_and_stops_after_success():
-    """事实类工具拿到结果即结束（不再多调），stopped_reason=done。"""
+def test_model_selects_fact_tool_and_stops_when_model_stops():
+    """事实类工具拿到结果后仍把结果回灌模型，由模型决定是否继续。
+
+    回归 ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP：此前实现"事实类工具一次成功即 break"，
+    导致多意图 query（"我有没有风险限制"同时命中 risk_restriction + risk_public）
+    模型拿不到第二个工具的机会，graph 只剩 1 个 task 而管线有 2 个。
+    现改为：结果一律回灌，模型不调用才结束（stopped_reason=no_tool_call）。
+    """
     tools = FakeReadTools()
-    provider = FakeProvider([{"name": "get_my_asset_summary", "arguments": {}}])
+    provider = FakeProvider([
+        {"name": "get_my_asset_summary", "arguments": {}},
+        None,   # 模型判断已足够，主动结束
+    ])
     loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
     outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="查我的持仓"))
 
     assert outcome.tool_names == ["get_my_asset_summary"]
-    assert outcome.stopped_reason == "done"
+    assert outcome.stopped_reason == "no_tool_call"
     assert len(outcome.results) == 1
     assert outcome.results[0]["data"]["execution_mode"] == "model_tool_selection"
+    assert len(provider.calls) == 2, "事实结果必须回灌，让模型有机会继续调用"
+
+
+def test_multi_intent_query_can_cover_both_tools():
+    """多意图：模型可连续调用事实类 + 知识类工具，两个 task 都保留。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "get_my_risk_restriction", "arguments": {}},
+        {"name": "search_customer_knowledge", "arguments": {"query": "风险限制制度", "intent": "risk_public"}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1",
+                                   query="我有没有风险限制",
+                                   planned_intents=["risk_restriction", "risk_public"]))
+
+    assert outcome.tool_names == ["get_my_risk_restriction", "search_customer_knowledge"]
+    assert len(outcome.results) == 2, "两个意图的工具结果都应保留"
+    assert {r["intent"] for r in outcome.results} == {"risk_restriction", "risk_public"}
+
+
+def test_planned_intents_are_passed_as_guidance():
+    """planned_intents 应作为提示出现在给模型的输入里（引导覆盖多意图）。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([None])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=2)
+    asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="我有没有风险限制",
+                         planned_intents=["risk_restriction", "risk_public"]))
+    assert "risk_restriction" in provider.calls[0]["user"]
+    assert "risk_public" in provider.calls[0]["user"]
 
 
 def test_model_can_chain_knowledge_then_stop():

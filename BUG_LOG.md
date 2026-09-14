@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 189 条真 bug 修复记录。
+- 共 190 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1707,4 +1707,24 @@ fused.sort(key=lambda item: (-item[1], str(item[0].id)))
 **开关**：`AGENT_MODEL_TOOL_SELECTION_ENABLED`（默认 false → 行为与之前完全一致）、`AGENT_MODEL_TOOL_MAX_ROUNDS`；已透传 `docker-compose.yml` / `docker-compose.p0.yml` / `.env.example`。
 **验证**：新增 `tests/test_customer_model_tools.py` 共 20 个测试，重点覆盖安全边界——写操作被拒、越权参数被忽略、预算用尽、模型不可用降级、每轮审计、schema 只读性与白名单一致性。**用"撤销白名单守卫 + 撤销服务端注入"确认测试会失败**。`tests 299 passed`。
 **已知取舍（需观察）**：`advisor_ask_agent.py:8` 记录了历史教训——多轮 `request_tool_call` 会让点名产品句**白等数百毫秒到数秒**。本方案以 `max_rounds=4` + "事实类工具一次成功即结束"缓解，但**延迟增加是固有代价**，建议开启后实测 P95。
+
+### ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP
+- 日期：2026-09-14
+- 分类：Agent / 模型工具调度 / 多意图
+- 严重程度：P1
+**问题**：模型自主工具调度上线后实测（`inspect_query_dual.py --query "我有没有风险限制"`）发现**图比管线少一个 task**：
+```
+pipeline task: [('risk_restriction','succeeded'), ('risk_public','succeeded')]   ← 2 个
+graph    task: [('risk_restriction','succeeded')]                              ← 1 个
+```
+规则规划器明明产出 2 个 task（`risk_restriction` 事实 + `risk_public` 知识解释），但图只得到事实那一半，**用户拿不到风险制度的解释**。
+**根因（两个叠加的设计缺陷，均为本次新引入）**：
+1. **强制早停**：`CustomerModelToolLoop.run()` 中写了"事实类工具（客户数据）拿到结果即可结束；知识检索允许继续补充"→ `if tool_name != "search_customer_knowledge": break`。模型只调了事实工具就被强制 `break`，**没有机会调第二个工具**。这个"优化"是我为控制延迟加的，但它**剥夺了模型的自主决策权**——恰好违背了本次改造的初衷（把"该不该续调"交给模型）。
+2. **绕过 plan**：`model_tool_node` 把**整个 query** 丢给模型自由选工具，**没有把规则规划出的意图列表作为提示传入**，模型不知道"这个问题还有第二个方面要覆盖"。
+**解决**：
+1. **移除强制早停**：拿到结果后**一律把结果回灌给模型**，由模型自己决定是否继续；只有模型不再调用（`no_tool_call`）或用尽预算才结束。同时把 system prompt 第 5 条改为明确要求"**多意图问题要逐个覆盖**（如'我有没有风险限制'既需事实限制也需制度解释）"。
+2. **传入 planned_intents**：`run()` 新增 `planned_intents` 参数，`model_tool_node` 从 `_rebuild_plan(state.plan)` 取 `[t.intent for t in plan.tasks]` 传入，作为"需覆盖哪些方面"的**提示**（非硬约束，模型仍自主决定调什么）；每轮回灌后再追问"上述方面是否都已覆盖"。
+3. **顺带修意图标注**：知识类工具的结果 `intent` 此前固定取工具名（`search_customer_knowledge`），导致多意图语义丢失；改为优先取模型传入的 `intent` 参数（`company_info`/`policy`/`risk_public`…）。
+**验证**：`tests/test_customer_model_tools.py` 新增/修正 3 个测试——多意图可连续覆盖两类工具且两个 task 都保留、planned_intents 确实作为提示传入、事实结果必须回灌（断言 `len(provider.calls)==2`）。`tests 301 passed`。
+**教训**：为"省延迟"而替模型做的每一步决定，都要问一句"这是不是我该替它决定的？"。本次的 `break` 表面上省了一次 LLM 往返，代价却是**功能性缺失**（用户少拿一半答案），且因为 `overall_status` 仍是 `completed`，**监控完全看不出来**——与 ISSUE-20260914-COMPLETED-STATUS-MASKED-BY-DROPPED-TASK 同族。
 

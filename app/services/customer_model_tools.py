@@ -183,8 +183,10 @@ _TOOL_LOOP_SYSTEM = (
     "2. 一次只调用一个最合适的工具；若信息已足够回答，就不要继续调用。\n"
     "3. 涉及客户个人数据（资产/订单/工单/风险限制）时必须用对应工具取真实数据，不得凭记忆作答。\n"
     "4. 知识类问题（公司业务/流程/政策/FAQ）用 search_customer_knowledge，并把 query 改写为更贴合知识库的表述。\n"
-    "5. 用户问题已被前面的工具结果覆盖时，直接结束（不再调用）。\n"
-    "6. 不要臆造工具名与参数。\n"
+    "5. **多意图问题要逐个覆盖**：例如'我有没有风险限制'既需要查账户的事实限制，也可能需要解释风险制度，"
+    "两类依据都应取得后再结束。\n"
+    "6. 用户问题已被前面的工具结果完整覆盖时，直接结束（不再调用）。\n"
+    "7. 不要臆造工具名与参数。\n"
 )
 
 
@@ -226,15 +228,28 @@ class CustomerModelToolLoop:
         except Exception:  # noqa: BLE001 - 审计失败不阻塞
             pass
 
-    async def run(self, *, customer_id: str, conversation_id: str, query: str) -> ModelToolOutcome:
-        """让模型自主选工具并循环，直到模型不再调用或预算用尽。"""
+    async def run(self, *, customer_id: str, conversation_id: str, query: str,
+                  planned_intents: list[str] | None = None) -> ModelToolOutcome:
+        """让模型自主选工具并循环，直到模型不再调用或预算用尽。
+
+        planned_intents：规则规划器已识别出的意图列表（可选）。作为**提示**告知模型
+        "这个问题需要覆盖哪些方面"，避免多意图 query 只查到一半就被模型判定"够了"。
+        它不是硬约束——模型仍可自主决定调什么、调几次。
+        """
         outcome = ModelToolOutcome()
         context_lines: list[str] = []
+        planned_block = ""
+        if planned_intents:
+            planned_block = (
+                "\n\n该问题经规则分析需要覆盖以下方面（请确保都取得依据后再结束）：\n"
+                + "\n".join(f"- {item}" for item in planned_intents)
+            )
 
         for round_index in range(1, self.max_rounds + 1):
-            user_block = f"用户问题：{query}"
+            user_block = f"用户问题：{query}{planned_block}"
             if context_lines:
                 user_block += "\n\n已获得的工具结果：\n" + "\n".join(context_lines)
+                user_block += "\n\n请判断上述方面是否都已覆盖；若仍有未覆盖的，继续调用相应工具。"
 
             decision = await self.provider.request_tool_call(
                 system=_TOOL_LOOP_SYSTEM, user=user_block,
@@ -287,19 +302,25 @@ class CustomerModelToolLoop:
                               citations=round_record.citations)
 
             if result.success:
+                # 意图标注：知识类工具的真实类别由模型传入的 intent 参数决定（company_info/policy/...），
+                # 若固定用工具名会退化成 "search_customer_knowledge"，丢失多意图语义。
+                intent_label = (
+                    str(intent) if tool_name == "search_customer_knowledge" and intent
+                    else _EXPECTED_ROUTE.get(tool_name, tool_name)
+                )
                 outcome.results.append({
                     "task_id": f"model-tool-{round_index}",
-                    "intent": _EXPECTED_ROUTE.get(tool_name, tool_name),
+                    "intent": intent_label,
                     "status": "succeeded",
                     "answer": result.answer,
                     "data": {**data, "execution_mode": "model_tool_selection", "tool": tool_name},
                     "error": None,
                     "clarification": None,
                 })
-                # 事实类工具（客户数据）拿到结果即可结束；知识检索允许继续补充
-                if tool_name != "search_customer_knowledge":
-                    outcome.stopped_reason = "done"
-                    break
+                # 结果一律回灌给模型，由**模型**决定是否还需要另一个工具。
+                # 此前"事实类工具一次成功即 break"是错误设计：多意图 query（如"我有没有风险限制"
+                # 同时命中 risk_restriction 事实 + risk_public 知识）会让模型拿不到第二个工具的机会，
+                # 导致 task 丢失（实测 graph 只剩 1 个 task，管线有 2 个）。
                 context_lines.append(f"[{tool_name}] {result.answer[:600]}")
             else:
                 context_lines.append(f"[{tool_name}] 未取得结果（{result.error}）")

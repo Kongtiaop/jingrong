@@ -367,10 +367,13 @@ class SupervisorGraph:
             max_rounds = 4
 
         loop = self.model_tool_loop_factory(max_rounds=max_rounds)
+        plan = _rebuild_plan(state.plan)
         outcome = await loop.run(
             customer_id=state.customer_id or "",
             conversation_id=state.conversation_id,
             query=state.combined_query or state.user_message,
+            # 把规则规划出的意图作为提示传给模型，避免多意图 query 只覆盖一半
+            planned_intents=[t.intent for t in plan.tasks],
         )
         patch: dict[str, Any] = {
             "model_tool_rounds": [r.__dict__ for r in outcome.rounds],
