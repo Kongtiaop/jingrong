@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 168 条真 bug 修复记录。
+- 共 174 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1400,4 +1400,66 @@ Schema 缓存 key 如果不绑定权限上下文，用户 A 可能命中用户 B
 **根因**：`frontend/nginx.conf` 的 `location /api/ { proxy_pass http://api:8000; }` 在 nginx 启动时把 `api` 解析成当时容器 IP 并缓存；CI/CD 每次推送重建 api 容器换新 IP，而 frontend 容器未随之重建 → nginx 一直连旧 IP → Connection refused → 502。
 **解决**：`frontend/nginx.conf` 改为运行时解析——`/api/` 内加 `resolver 127.0.0.11 valid=10s ipv6=off;` 并用变量 `set $api_upstream http://api:8000;` + `proxy_pass $api_upstream;`，借助 Docker 内嵌 DNS 每 10s 刷新 `api`，不再缓存旧 IP（commit `f64028d`）；立即恢复命令：`docker compose -f docker-compose.p0.yml up -d --force-recreate frontend`。
 **验证**：`curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/api/v1/health` 由 502 → 200。
+
+### ISSUE-20260914-LANGGRAPH-NOT-WIRED
+- 日期：2026-09-14
+- 分类：Agent / LangGraph / 接线
+**问题**：`app/agents/graph.py` 的 LangGraph Supervisor 图已实现、可编译、有单测，但**没有任何 API 路由或 worker 引用它**（全仓 `from app.agents` 无业务命中，仅 `app/agents/__init__.py` 自引用），生产实际执行的是确定性管线 `CustomerAgentExecutionService.execute`。文档 `docs/系统接线现状与接线后预测.md` 的 N1/N2/N4 条目亦已过期（长期记忆其实已接线、`langgraph-checkpoint-postgres 3.1.2` 其实已安装）。
+**根因**：图与管线**共享同一套业务 handler，但图缺少管线的 4 个持久化副作用**，直接切流会导致功能回归，因此当时只能"图与管线共存"：
+1. `clarification_count` 不落 Redis → 跨轮澄清永远停在 1，第 2 轮转人工**永不触发**；
+2. `handoff_node` 只返回话术，不建 `WorkOrder`/`CustomerServiceSession` → 前端拿不到 `ticket_no`；
+3. 短时记忆不回写；
+4. 情景记忆 `memory.summary_extract` 不入队。
+另有一个隐蔽缺陷：`AgentState` **没有 `clarification` 字段**，而 LangGraph 会**静默丢弃**节点返回的未知键（不报错）→ 澄清话术从未进入 state，`persist_node` 无法判断 `missing_parameter`。同类问题：`react_step_node` 硬取 `plan.tasks[0]`，多意图时后续 task 被丢弃；而若改成"遍历但不置位 `react_result`"则条件边不收敛、**实测挂死**。
+**解决**：三开关渐进式接线（默认全关，行为与接入前一致）：
+- `AGENT_GRAPH_ENABLED`（图作权威）/ `AGENT_GRAPH_SHADOW_ENABLED`（影子双跑对照）/ `AGENT_CHECKPOINT_ENABLED`（Postgres 断点续跑，`thread_id=conversation_id`）；
+- `graph.py` 新增 `persist_node` 补齐上述 4 个副作用，`handoff_node` 接 `CustomerRagHandoffService` 真实建单，`intent_plan_node` 补短/长/共享记忆装载与澄清补答拼接，`execute_node` 补 `conversation_summary` 注入；
+- `AgentState` 补 `clarification` 等字段；`react_step_node` 改为按 `react_results` 长度推进多 task（`AgentState` 新增 `react_results`），`generate_node` 对每个命中 task 各生成一次；
+- 新增 `app/services/graph_agent_runner.py`（state ⇄ 响应映射 + 影子对照，异常全部吞掉不穿透请求）与 `scripts/compare_graph_vs_pipeline.py`（切流前双跑验收）；
+- `docker-compose.yml` 与 `docker-compose.p0.yml` **都**需透传开关（容器 environment 是白名单，只改一个会静默失效）。
+**验证**：`tests 263 passed`（新增 30 条图接线测试）；容器内 `grep -c persist_node app/agents/graph.py` = 6；双跑对照 `FLUSHDB` 后由 7/14 → 11/14（剩余差异见 ISSUE-20260914-CLARIFICATION-COUNT-BLEED 与措辞差异）。注：影子/真图默认关，**生产仍未切流**，需跑完对照再开。
+
+### ISSUE-20260914-CLARIFICATION-COUNT-BLEED
+- 日期：2026-09-14
+- 分类：Agent / 记忆 / 测试工具
+**问题**：图版 vs 管线版双跑对照中，"什么是双录""现金管理保本计划在售吗""这个那个"等**无关**查询在图里被判成 `handoff`（直接转人工），而管线判成 `needs_clarification`，一致率仅 7/14。
+**根因**：`clarification_count` 从 Redis 短时记忆读取（`graph.py` 与管线同逻辑），而对照脚本对两条路径使用**不同 conversation_id**（`-pipe`/`-graph` 后缀）→ 两条路径读到不同的 Redis key、计数状态不同步。更关键的是**同一路径跨 query 复用计数**：前一批查询把计数写脏后，后续任何澄清问句都会因 `clarification_count + 1 >= 2` 直接转人工，**跳过澄清**。属对照工具的设计缺陷，非路由逻辑错误。
+**解决**：定位手段为对照前执行 `redis-cli FLUSHDB` 清空短时记忆。根治方向（未做）：对照脚本应在每条 query 前重置该会话短时记忆，使两条路径处于同一初始状态。
+**验证**：`FLUSHDB` 后同一批 query 一致率 **7/14 → 11/14**，预测的 4 条全部从 `handoff` 翻回 `needs_clarification`，证实为计数污染而非路由错误。
+
+### ISSUE-20260914-INTENT-FALLBACK-FACT-DOWNGRADE
+- 日期：2026-09-14
+- 分类：Agent / 意图识别 / 线上缺陷
+**问题**：线上（`docker-compose.p0.yml` 默认 `LLM_INTENT_FALLBACK_ENABLED=true`）用户问"查一下我的持仓""我的工单进展如何""我的资产有多少"，被降级成 `faq` → 答复"当前知识库没有足够依据，建议转人工客服"并创建工单；而**真实持仓/工单数据就在库里**，正确路径 `asset_summary`/`workorder_status` 从未被执行。双跑对照中图给出正确数据（"总资产 302,361.52 元"）而管线给出转人工，即**图是对的、管线是坏的**。
+**根因**：**不是阈值问题**——`IntentPolicyResolver.resolve` 的高置信保护（`confidence >= 0.9` → 返回 `rule_intent`）**确实生效**（实测 `asset_summary` 0.92、`workorder_status` 0.95、`greeting` 0.99 均返回规则结果）。问题在于保护结果**下一步被丢弃**：`_apply_structured_intent` 只读 `resolved.template`，不看原始意图，用 `primary_intent` 重建 plan；而 `_structured_from_rule_plan` 用映射表把 **16 种意图压成 4 个模板桶**（`asset_summary`/`workorder_status`/`risk_restriction`/`greeting` 全部落 `T1_INFORMATION_QUERY`），信息在映射那一步就丢失，之后无论怎么保护都无法恢复。链路：`asset_summary(0.92)` → `_structured_from_rule_plan` 压成 `T1` → resolver 保护（但 `primary_intent` 仍是 `asset_summary`）→ `_apply_structured_intent` 只看 `T1` → `safe_intent = "faq"` → 覆盖成功。此外该分支 `safe_intent = requested if requested in public_intents else "faq"` 的设计本身允许事实类意图落成 faq。
+**解决**：不靠扩充映射表（16 意图 × N 模板不可持续，规划器每加意图就要同步改），改为**让原始意图穿越整个流程**：
+1. `_structured_from_rule_plan` 保留 `primary_intent` 原始意图并带 `secondary_intents`；
+2. `_apply_structured_intent` 增加 `if intent.source == "rule": return plan`——resolver 判定规则胜出时**原样返回 plan**，绝不用有损模板重建；
+3. 新增业务事实类保护：`T1_INFORMATION_QUERY` 不得覆盖 `business_fact` 路由意图（`BUSINESS_FACT_INTENTS` = asset_summary / workorder_status / order_status / risk_restriction / product_status）。
+三条性质同时满足：高置信事实类不再被降级；规则 `unknown` 时 LLM 兜底**仍生效**（推荐/转人工/信息查询）；`unknown` → 交易草稿仍被双重拦截（安全红线未破）。
+**验证**：新增 10 个回归测试，覆盖"事实类不被降级""兜底仍生效""交易模板永不应用""primary_intent 保真"；撤销两处保护后 5 个测试确认失败（证明测试有效）。`tests 263 passed`。
+
+### ISSUE-20260914-PSYCOPG-NO-LIBPQ-IN-CONTAINER
+- 日期：2026-09-14
+- 分类：依赖 / 容器 / 断点续跑
+**问题**：容器内 `import langgraph.checkpoint.postgres` 抛 `ImportError: no pq wrapper available`（`couldn't import psycopg 'python' implementation: libpq library not found`），`AGENT_CHECKPOINT_ENABLED=true` 一旦开启即失败。
+**根因**：`requirements.txt` 只声明裸 `psycopg>=3.3,<4`，而基础镜像 `python:3.12-slim` **没有 libpq**（`Dockerfile.api` 未 `apt-get install libpq-dev`）。宿主 conda 环境恰好有 libpq，本地 `import` 正常 → 典型"**本地过、容器挂**"，本机测试无法发现。
+**解决**：`requirements.txt` 改为 `psycopg[binary]>=3.3,<4`（`psycopg-binary` 是自带 libpq 的预编译 wheel，无需 gcc/libpq-dev，不增加镜像构建复杂度）。同时把 `app/main.py` 的 checkpointer 初始化失败日志由 `warning` 提升为 **`error`**——开关开着却没生效属"静默降级"，warning 会让运维误以为断点续跑已启用。
+**验证**：容器内 `python -c "import langgraph.checkpoint.postgres, psycopg_binary"` → `checkpoint-postgres OK`。
+
+### ISSUE-20260914-SCRIPT-SYSPATH-IN-CONTAINER
+- 日期：2026-09-14
+- 分类：工具脚本 / 容器
+**问题**：容器内执行 `docker compose exec api python scripts/compare_graph_vs_pipeline.py` 报 `ModuleNotFoundError: No module named 'app'`。
+**根因**：`python scripts/x.py` 只会把 `scripts/` 放进 `sys.path`，仓库根目录不在其中；容器 `WORKDIR=/app` 且未设 `PYTHONPATH`，故 `import app` 失败。宿主靠 `$env:PYTHONPATH="."` 掩盖了该问题——与 ISSUE-20260914-PSYCOPG-NO-LIBPQ-IN-CONTAINER 同属"本地过、容器挂"。仓库既有 225 个脚本中仅 39 个做了 `sys.path` 处理，惯用写法是 `PYTHONPATH=. python scripts/x.py`。
+**解决**：脚本内显式把仓库根目录插入 `sys.path`（`_ROOT = Path(__file__).resolve().parent.parent`），本地与容器内均可直接运行，无需再记 `PYTHONPATH`。
+**验证**：本地 `python scripts/compare_graph_vs_pipeline.py --help` 在未设 `PYTHONPATH` 时 rc=0。
+
+### ISSUE-20260914-COMPOSE-CONTAINER-NAME-VOLUME-CONFLICT
+- 日期：2026-09-14
+- 分类：部署 / Compose / 环境
+**问题**：本地 `docker compose up -d --build` 报 `Conflict. The container name "/wealth-postgres" is already in use`，服务起不来（但镜像已构建成功）。
+**根因**：`docker-compose.yml`（`name: wealth-manager`）与 `docker-compose.p0.yml`（`name: wealth-p0`）**硬编码了相同的 `container_name: wealth-postgres` / `wealth-redis`**，而 `container_name` 是**全局唯一**、不受 project name 隔离 → 两套 compose 互相抢名字。同时两者**卷名不同**（`docker-compose.yml` 用前缀默认卷 `wealth-manager_wealth_pgdata`；`docker-compose.p0.yml` 用 `name: wealth_pgdata` 固定卷名），因此混用时还可能连到**空卷**看到空库。此前本地曾混跑两套 compose，留下 `wealth-p0-*` 与 `wealth-postgres`/`wealth-redis` 残留容器（均已 Exited）。
+**解决**：清掉残留容器后统一用 `docker compose -f docker-compose.p0.yml up -d`（数据在固定卷 `wealth_pgdata`，`docker inspect wealth-postgres` 确认挂载即此卷；删容器不丢数据）。根治方向（未做）：去掉 `docker-compose.p0.yml` 的 `container_name`，改用自动命名（`wealth-p0-postgres-1`，与 CI 已有的 `wealth-p0-api-1` 风格一致），使两套 compose 可并存互不干扰。
+**验证**：`docker compose -f docker-compose.p0.yml ps` 全部 11 个服务 Up，postgres/redis 均 healthy，API 8010 端口 health=ok。
 
