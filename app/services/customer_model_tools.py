@@ -148,6 +148,55 @@ _EXPECTED_ROUTE = {
     "get_product_status": "product_status",
 }
 
+# 意图 → 覆盖它所需的工具名（用于"未覆盖意图"兜底判定）。
+# 知识类意图（company_info/policy/risk_public/...）统一由 search_customer_knowledge 覆盖。
+_INTENT_TO_TOOL = {
+    "workorder_status": "get_my_workorder_status",
+    "order_status": "get_my_order_status",
+    "asset_summary": "get_my_asset_summary",
+    "risk_restriction": "get_my_risk_restriction",
+    "product_status": "get_product_status",
+    "company_info": "search_customer_knowledge",
+    "company_business": "search_customer_knowledge",
+    "faq": "search_customer_knowledge",
+    "workflow": "search_customer_knowledge",
+    "policy": "search_customer_knowledge",
+    "risk_public": "search_customer_knowledge",
+    "risk_explanation": "search_customer_knowledge",
+}
+
+
+def _uncovered_intents(planned_intents: list[str] | None,
+                       results: list[dict]) -> list[str]:
+    """规计划中的意图里，哪些尚未被任何成功结果覆盖。
+
+    用"意图→所需工具"映射 + 已成功结果里的 `intent`/`data.tool` 比对。
+    知识类意图共用 search_customer_knowledge，故只按该工具是否被成功调用过判断。
+    """
+    if not planned_intents:
+        return []
+    covered_tools: set[str] = set()
+    covered_intents: set[str] = set()
+    for item in results:
+        data = item.get("data") or {}
+        if data.get("tool"):
+            covered_tools.add(str(data["tool"]))
+        if item.get("intent"):
+            covered_intents.add(str(item["intent"]))
+
+    pending: list[str] = []
+    for intent in planned_intents:
+        if intent in covered_intents:
+            continue
+        needed = _INTENT_TO_TOOL.get(intent)
+        if needed is None:
+            # 未知意图（如 greeting/human_handoff/business_operation）不由只读工具覆盖，跳过
+            continue
+        if needed in covered_tools:
+            continue
+        pending.append(intent)
+    return pending
+
 
 @dataclass
 class ToolRound:
@@ -256,9 +305,21 @@ class CustomerModelToolLoop:
                 tools=CUSTOMER_READ_TOOL_SCHEMAS, model=self.model,
             )
             if not decision:
+                # 模型主动停止。但若规则规划器识别出的意图**尚未被覆盖**，则不能就此结束——
+                # 实测："我有没有风险限制" 命中 risk_restriction(事实) + risk_public(知识)，
+                # 模型拿到事实后即停止，用户便拿不到制度解释（图比管线少一个 task）。
+                # 提示词层面已要求"多意图逐个覆盖"，但模型仍可能提前收手，故此处加**规则兜底**：
+                # 只要还有未覆盖意图且预算未用尽，就点名要求它补齐，而不是信任模型一次判断。
+                pending = _uncovered_intents(planned_intents, outcome.results)
+                if pending and round_index < self.max_rounds:
+                    context_lines.append(
+                        "【系统提示】以下方面尚未取得依据，请调用相应工具补齐："
+                        + "、".join(pending)
+                    )
+                    continue
                 outcome.stopped_reason = (
                     "model_unavailable" if self.provider is None or self.provider._client is None
-                    else "no_tool_call"
+                    else ("no_tool_call" if not pending else "intent_uncovered")
                 )
                 break
 

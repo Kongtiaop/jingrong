@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 190 条真 bug 修复记录。
+- 共 191 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1727,4 +1727,24 @@ graph    task: [('risk_restriction','succeeded')]                              �
 3. **顺带修意图标注**：知识类工具的结果 `intent` 此前固定取工具名（`search_customer_knowledge`），导致多意图语义丢失；改为优先取模型传入的 `intent` 参数（`company_info`/`policy`/`risk_public`…）。
 **验证**：`tests/test_customer_model_tools.py` 新增/修正 3 个测试——多意图可连续覆盖两类工具且两个 task 都保留、planned_intents 确实作为提示传入、事实结果必须回灌（断言 `len(provider.calls)==2`）。`tests 301 passed`。
 **教训**：为"省延迟"而替模型做的每一步决定，都要问一句"这是不是我该替它决定的？"。本次的 `break` 表面上省了一次 LLM 往返，代价却是**功能性缺失**（用户少拿一半答案），且因为 `overall_status` 仍是 `completed`，**监控完全看不出来**——与 ISSUE-20260914-COMPLETED-STATUS-MASKED-BY-DROPPED-TASK 同族。
+
+### ISSUE-20260914-MODEL-EARLY-STOP-NEEDS-RULE-BACKSTOP
+- 日期：2026-09-14
+- 分类：Agent / 模型工具调度 / 提示词不可靠
+- 严重程度：P1
+**问题**：修复 ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP（移除强制 `break` + 传入 `planned_intents` + 提示词要求"多意图逐个覆盖"）**后重新实测，问题依然存在**：
+```
+pipeline task: [('risk_restriction','succeeded'), ('risk_public','needs_clarification')]  ← 2 个
+graph    task: [('risk_restriction','succeeded')]                                        ← 仍只有 1 个
+graph stopped: 模型拿到事实工具结果后主动返回 None（不是被强制 break）
+```
+即：**不是代码在拦，是模型自己决定收手**。提示词已明确要求覆盖多意图、也把 `planned_intents` 传了进去，模型仍提前停止。
+**根因**：**提示词约束不可靠**。`request_tool_call` 的 `tool_choice="auto"` 意味着"不调工具"始终是模型的合法选项；一旦它认为"已有事实足以回答"，就会结束，无论提示词怎么强调要覆盖多个方面。**"要求模型做某事"≠"保证模型做某事"**——这与本项目一贯的"能用接口/规则保证，就别只靠提示词"原则一致。
+**解决**：把"是否覆盖完整"从**提示词层**上移到**规则层**，新增覆盖兜底：
+- 新增 `_INTENT_TO_TOOL` 映射（意图 → 覆盖它所需的工具）与 `_uncovered_intents(planned, results)`：按已成功结果里的 `intent`/`data.tool` 比对，算出尚未覆盖的计划意图；
+- 模型返回 None 时**先判覆盖**：若仍有未覆盖意图且预算未用尽，则把"【系统提示】以下方面尚未取得依据，请调用相应工具补齐：X、Y"追加进上下文并 `continue`，**强制多给一轮**；
+- 预算用尽仍有缺口时，`stopped_reason="intent_uncovered"`（**显式标记，避免静默**，便于监控发现"模型没收手但也没覆盖全"的情形）。
+- 知识类意图（company_info/company_business/policy/risk_public/...）共用 `search_customer_knowledge`，故按"该工具是否被成功调用过"判定覆盖，**不重复追问**；`greeting`/`human_handoff` 等非只读意图不参与兜底（避免无谓 LLM 轮）。
+**验证**：新增 6 个测试——模型提前收手被兜底追问至覆盖完整、兜底消息确实含未覆盖意图名、预算用尽报 `intent_uncovered`、已覆盖时不额外追问（省一轮调用）、非只读意图不触发兜底、同一工具覆盖多个知识意图不重复追问。**用"撤销兜底条件"确认前两个测试会失败**。`tests 307 passed`。
+**设计取舍**：这是"**模型自主决策 + 规则兜底校验**"的分层——模型仍可自由选工具、自由改写（这是本次改造的目标），但**"计划里的方面是否都拿到了依据"由规则校验并在缺失时强制补齐**。既保住灵活性，又不把完整性寄托在模型自觉上。
 

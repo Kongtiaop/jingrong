@@ -182,6 +182,103 @@ def test_planned_intents_are_passed_as_guidance():
     assert "risk_public" in provider.calls[0]["user"]
 
 
+# ---------- 未覆盖意图的规则兜底（回归：模型提前收手导致丢 task） ----------
+# 实测 "我有没有风险限制" 命中 risk_restriction(事实) + risk_public(知识)，
+# 模型拿到事实后即停止 → 图比管线少一个 task，用户拿不到制度解释。
+# 提示词层面已要求"多意图逐个覆盖"仍不够，故加规则兜底：还有未覆盖意图就点名补齐。
+
+def test_model_stopping_early_is_overridden_until_intents_covered():
+    """模型想停，但计划中仍有未覆盖意图 → 必须继续补齐，不容忍提前收手。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "get_my_risk_restriction", "arguments": {}},   # 只调了事实
+        None,                                                   # 模型想停
+        {"name": "search_customer_knowledge",
+         "arguments": {"query": "风险限制制度", "intent": "risk_public"}},  # 被兜底追问后补齐
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1",
+                                   query="我有没有风险限制",
+                                   planned_intents=["risk_restriction", "risk_public"]))
+
+    assert outcome.tool_names == ["get_my_risk_restriction", "search_customer_knowledge"]
+    assert {r["intent"] for r in outcome.results} == {"risk_restriction", "risk_public"}
+
+
+def test_backstop_prompts_model_about_uncovered_intent():
+    """兜底追问必须把未覆盖的意图名明确告诉模型。
+
+    注意时序：兜底消息在"模型返回 None"之后才 append 到 context_lines，
+    因此它出现在**下一次**调用的 user 输入里（calls[2]），而非当轮（calls[1]）。
+    """
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "get_my_risk_restriction", "arguments": {}},   # calls[0]
+        None,                                                    # calls[1] 模型想停 → 触发兜底
+        None,                                                    # calls[2] 看到兜底提示后仍不调
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=3)
+    asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q",
+                         planned_intents=["risk_restriction", "risk_public"]))
+    assert len(provider.calls) == 3, "应在模型提前收手后追问一轮"
+    assert "尚未取得依据" in provider.calls[2]["user"]
+    assert "risk_public" in provider.calls[2]["user"]
+
+
+def test_backstop_reports_intent_uncovered_when_budget_runs_out():
+    """预算用尽且仍有未覆盖意图 → stopped_reason=intent_uncovered（便于观测，而非静默）。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "get_my_risk_restriction", "arguments": {}},
+        None, None, None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=2)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q",
+                                   planned_intents=["risk_restriction", "risk_public"]))
+    assert outcome.stopped_reason == "intent_uncovered"
+
+
+def test_no_backstop_when_all_intents_covered():
+    """全部覆盖时正常结束，不做无谓追问（省一轮 LLM 调用）。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "get_my_risk_restriction", "arguments": {}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q",
+                                   planned_intents=["risk_restriction"]))
+    assert outcome.stopped_reason == "no_tool_call"
+    assert len(provider.calls) == 2, "已覆盖时不应额外追问"
+
+
+def test_backstop_ignores_intents_outside_readonly_tools():
+    """greeting/human_handoff 等不由只读工具覆盖的意图，不触发兜底追问。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([None])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=3)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="你好",
+                                   planned_intents=["greeting", "human_handoff"]))
+    assert outcome.stopped_reason == "no_tool_call"
+    assert len(provider.calls) == 1, "非只读意图不应触发兜底"
+
+
+def test_knowledge_intents_share_single_tool_coverage():
+    """company_info 与 company_business 同由 search_customer_knowledge 覆盖，只需调一次。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "search_customer_knowledge", "arguments": {"query": "公司业务", "intent": "company_info"}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="公司业务",
+                                   planned_intents=["company_info", "company_business"]))
+    # company_info 已被 intent 覆盖；company_business 由同一工具覆盖（covered_tools 命中）
+    assert outcome.stopped_reason == "no_tool_call"
+    assert len(provider.calls) == 2, "同一工具已覆盖两个知识意图，不应再追问"
+
+
 def test_model_can_chain_knowledge_then_stop():
     """知识类工具可续调补充，模型不再调用时结束。"""
     tools = FakeReadTools()
