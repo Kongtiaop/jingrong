@@ -188,14 +188,16 @@ def test_planned_intents_are_passed_as_guidance():
 # 提示词层面已要求"多意图逐个覆盖"仍不够，故加规则兜底：还有未覆盖意图就点名补齐。
 
 def test_model_stopping_early_is_overridden_until_intents_covered():
-    """模型想停，但计划中仍有未覆盖意图 → 必须继续补齐，不容忍提前收手。"""
+    """模型想停，但计划中仍有未覆盖意图 → 规则层**确定性补齐**，不容忍提前收手。
+
+    注意：不是"再问模型一次"——实测明确追问后模型连续多轮仍返回 None。
+    故由 _fill_uncovered 直接按映射执行缺失工具。
+    """
     tools = FakeReadTools()
     provider = FakeProvider([
-        {"name": "get_my_risk_restriction", "arguments": {}},   # 只调了事实
-        None,                                                   # 模型想停
-        {"name": "search_customer_knowledge",
-         "arguments": {"query": "风险限制制度", "intent": "risk_public"}},  # 被兜底追问后补齐
-        None,
+        {"name": "get_my_risk_restriction", "arguments": {}},   # 模型只调了事实
+        None,                                                   # 模型想停 → 触发规则补齐
+        None,                                                   # 补齐后再问，模型仍不调
     ])
     loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
     outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1",
@@ -204,26 +206,46 @@ def test_model_stopping_early_is_overridden_until_intents_covered():
 
     assert outcome.tool_names == ["get_my_risk_restriction", "search_customer_knowledge"]
     assert {r["intent"] for r in outcome.results} == {"risk_restriction", "risk_public"}
+    # 补齐的那条应标记为 rule_backstop，便于审计区分"模型选的"与"规则补的"
+    backstop = [r for r in outcome.results if r["data"].get("execution_mode") == "rule_backstop"]
+    assert len(backstop) == 1 and backstop[0]["intent"] == "risk_public"
 
 
-def test_backstop_prompts_model_about_uncovered_intent():
-    """兜底追问必须把未覆盖的意图名明确告诉模型。
-
-    注意时序：兜底消息在"模型返回 None"之后才 append 到 context_lines，
-    因此它出现在**下一次**调用的 user 输入里（calls[2]），而非当轮（calls[1]）。
-    """
+def test_backstop_works_even_if_model_never_calls_second_tool():
+    """模型被追问后仍坚持不调 → 规则补齐依然生效（这是本修复的核心）。"""
     tools = FakeReadTools()
     provider = FakeProvider([
-        {"name": "get_my_risk_restriction", "arguments": {}},   # calls[0]
-        None,                                                    # calls[1] 模型想停 → 触发兜底
-        None,                                                    # calls[2] 看到兜底提示后仍不调
+        {"name": "get_my_risk_restriction", "arguments": {}},
+        None, None, None,   # 模型 thereafter 一直返回 None
     ])
-    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=3)
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1",
+                                   query="我有没有风险限制",
+                                   planned_intents=["risk_restriction", "risk_public"]))
+    assert len(outcome.results) == 2, "模型不配合时也必须补齐，否则用户丢答案"
+    assert outcome.stopped_reason in {"no_tool_call", "intent_uncovered"}
+
+
+def test_backstop_fill_is_audited_with_marker():
+    """规则补齐的工具调用同样要审计，并标注 filled_by=rule_backstop。"""
+    tools = FakeReadTools()
+    db = FakeDatabase()
+    provider = FakeProvider([
+        {"name": "get_my_risk_restriction", "arguments": {}},
+        None, None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=db, max_rounds=4)
     asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q",
                          planned_intents=["risk_restriction", "risk_public"]))
-    assert len(provider.calls) == 3, "应在模型提前收手后追问一轮"
-    assert "尚未取得依据" in provider.calls[2]["user"]
-    assert "risk_public" in provider.calls[2]["user"]
+    assert any("rule_backstop" in row.detail for row in db.audits), \
+        "规则补齐应有可区分的审计标记"
+
+
+def test_backstop_respects_allowlist():
+    """规则补齐同样受硬白名单约束（不因是内部路径而绕过）。"""
+    from app.services.customer_model_tools import _INTENT_TO_TOOL, _ALLOWED_TOOL_NAMES
+    for intent, tool in _INTENT_TO_TOOL.items():
+        assert tool in _ALLOWED_TOOL_NAMES, f"意图 {intent} 映射到非白名单工具 {tool}"
 
 
 def test_backstop_reports_intent_uncovered_when_budget_runs_out():

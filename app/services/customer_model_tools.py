@@ -277,6 +277,55 @@ class CustomerModelToolLoop:
         except Exception:  # noqa: BLE001 - 审计失败不阻塞
             pass
 
+    async def _fill_uncovered(self, *, pending: list[str], customer_id: str,
+                              conversation_id: str, query: str, round_index: int,
+                              outcome: ModelToolOutcome) -> bool:
+        """规则层确定性补齐缺失意图的工具调用。
+
+        为什么不让模型再试一次：实测明确告知"以下方面尚未取得依据"后，模型连续 3 轮仍返回 None
+        （见 ISSUE-20260914-MODEL-EARLY-STOP-NEEDS-RULE-BACKSTOP）。**提示词无法强制模型行动**，
+        故这里按映射直接执行——模型负责"主路径怎么查"，规则负责"别漏"。
+        返回是否真的补齐了至少一项（True 表示可以继续循环让模型再判断）。
+        """
+        filled_any = False
+        for intent in pending:
+            tool_name = _INTENT_TO_TOOL.get(intent)
+            if tool_name is None or tool_name not in _ALLOWED_TOOL_NAMES:
+                continue
+            result = await self.tools.execute(
+                name=tool_name, customer_id=customer_id, query=query,
+                intent=intent if tool_name == "search_customer_knowledge" else None,
+            )
+            data = result.data or {}
+            outcome.rounds.append(ToolRound(
+                round_index=round_index, tool=tool_name,
+                arguments={"query": query, "intent": intent, "filled_by": "rule_backstop"},
+                success=result.success, error=result.error,
+                evidence_status=data.get("evidence_status"),
+                citations=len(data.get("citations") or []),
+            ))
+            outcome.tool_names.append(tool_name)
+            await self._audit(
+                customer_id=customer_id, conversation_id=conversation_id,
+                round_index=round_index, tool=tool_name,
+                arguments={"intent": intent, "filled_by": "rule_backstop"},
+                success=result.success, error=result.error,
+                evidence_status=data.get("evidence_status"),
+                citations=len(data.get("citations") or []),
+            )
+            if result.success:
+                outcome.results.append({
+                    "task_id": f"rule-backstop-{intent}",
+                    "intent": intent,
+                    "status": "succeeded",
+                    "answer": result.answer,
+                    "data": {**data, "execution_mode": "rule_backstop", "tool": tool_name},
+                    "error": None,
+                    "clarification": None,
+                })
+                filled_any = True
+        return filled_any
+
     async def run(self, *, customer_id: str, conversation_id: str, query: str,
                   planned_intents: list[str] | None = None) -> ModelToolOutcome:
         """让模型自主选工具并循环，直到模型不再调用或预算用尽。
@@ -308,15 +357,21 @@ class CustomerModelToolLoop:
                 # 模型主动停止。但若规则规划器识别出的意图**尚未被覆盖**，则不能就此结束——
                 # 实测："我有没有风险限制" 命中 risk_restriction(事实) + risk_public(知识)，
                 # 模型拿到事实后即停止，用户便拿不到制度解释（图比管线少一个 task）。
-                # 提示词层面已要求"多意图逐个覆盖"，但模型仍可能提前收手，故此处加**规则兜底**：
-                # 只要还有未覆盖意图且预算未用尽，就点名要求它补齐，而不是信任模型一次判断。
+                #
+                # 关键教训（两次踩坑）：**再次追问模型是无效的**——实测把"以下方面尚未取得依据，
+                # 请调用相应工具补齐"明确告诉模型后，它连续 3 轮仍坚持返回 None。
+                # 提示词无法强制模型行动，故此处改为**规则层确定性补齐**：
+                # 直接按 _INTENT_TO_TOOL 映射执行缺失的工具，不再征求模型同意。
+                # 注意：这只作用于"模型已经停止"的收尾阶段；主路径仍是模型自主选择。
                 pending = _uncovered_intents(planned_intents, outcome.results)
                 if pending and round_index < self.max_rounds:
-                    context_lines.append(
-                        "【系统提示】以下方面尚未取得依据，请调用相应工具补齐："
-                        + "、".join(pending)
+                    filled = await self._fill_uncovered(
+                        pending=pending, customer_id=customer_id,
+                        conversation_id=conversation_id, query=query,
+                        round_index=round_index, outcome=outcome,
                     )
-                    continue
+                    if filled:
+                        continue
                 outcome.stopped_reason = (
                     "model_unavailable" if self.provider is None or self.provider._client is None
                     else ("no_tool_call" if not pending else "intent_uncovered")
