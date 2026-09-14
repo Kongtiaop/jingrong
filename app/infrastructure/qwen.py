@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -95,6 +96,13 @@ def _parse_intent_json(text: str) -> dict:
 
 
 class QwenProvider:
+    # 全局并发闸门：按进程限制**同时在途**的交互式 LLM 调用数。
+    # 为什么需要：模型工具轮把单请求的 LLM 调用从 2~3 次放大到 4~6 次
+    # （见 ISSUE-20260914-MODEL-TOOL-LLM-CALL-AMPLIFICATION），uvicorn --workers 4 下
+    # 并发用户会瞬间打满 DashScope 配额，表现为超时失败并降级为占位文案。
+    # 信号量按 limit 值缓存（与 CustomerAgentExecutionService._fallback_semaphores 同一做法）。
+    _llm_semaphores: dict[int, asyncio.Semaphore] = {}
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._client = (
@@ -102,10 +110,24 @@ class QwenProvider:
                 api_key=settings.dashscope_api_key,
                 base_url=settings.qwen_base_url,
                 http_client=httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(120.0, connect=30.0)),
+                # 显式限制 SDK 自动重试：默认 max_retries=2 意味着 30s 超时实际会重试 3 次
+                # → 最坏 90s+（实测 duration_ms=95760）。这里收紧到可配置值（默认 1）。
+                max_retries=int(getattr(settings, "qwen_max_retries", 1)),
             )
             if settings.dashscope_api_key
             else None
         )
+
+    def _semaphore(self) -> asyncio.Semaphore | None:
+        """返回本进程的 LLM 并发信号量；配置 <=0 表示不限流。"""
+        limit = int(getattr(self.settings, "qwen_max_concurrency", 8))
+        if limit <= 0:
+            return None
+        sem = self._llm_semaphores.get(limit)
+        if sem is None:
+            sem = asyncio.Semaphore(limit)
+            self._llm_semaphores[limit] = sem
+        return sem
 
     async def check_config(self) -> dict[str, str]:
         if self._client is None:
@@ -132,8 +154,14 @@ class QwenProvider:
             )
         model = kwargs.get("model") or self.settings.qwen_chat_model
         t0 = time.monotonic()
+        sem = self._semaphore()
         try:
-            resp = await self._client.chat.completions.create(timeout=timeout, **kwargs)
+            if sem is None:
+                resp = await self._client.chat.completions.create(timeout=timeout, **kwargs)
+            else:
+                # 并发闸门：限制在途调用数，避免打满上游配额导致整批超时失败
+                async with sem:
+                    resp = await self._client.chat.completions.create(timeout=timeout, **kwargs)
         except Exception:
             dur_ms = (time.monotonic() - t0) * 1000
             logger.warning("llm.usage model=%s status=failed duration_ms=%.0f", model, dur_ms)
@@ -376,17 +404,24 @@ class QwenProvider:
                 model, ttft_ms or dur, prompt_tokens, completion_tokens, total_tokens, dur,
             )
 
-    async def request_tool_call(self, *, system: str, user: str, tools: list, model: str | None = None, temperature: float = 0.0):
+    async def request_tool_call(self, *, system: str, user: str, tools: list, model: str | None = None,
+                                temperature: float = 0.0, timeout_seconds: float | None = None):
         """一次非流式补全，请模型决定是否调用某个已声明工具。
 
         返回 dict 或 None：
           {"name": str, "arguments": dict}  模型要调的工具
           None                              模型没有要调工具（将直接给文本）
         若解析失败/异常亦返回 None，交由上层降级为纯上下文回答。
+
+        timeout_seconds：工具轮的显式超时（默认取 qwen_tool_call_timeout_seconds）。
+        必须比普通对话更短——工具轮是"辅助决策"，一次请求可能连续发生多轮，
+        单轮耗时过长会成倍放大整体延迟（见 ISSUE-20260914-MODEL-TOOL-LLM-CALL-AMPLIFICATION）。
         """
         if self._client is None:
             return None
         model = model or self.settings.qwen_chat_model
+        if timeout_seconds is None:
+            timeout_seconds = float(getattr(self.settings, "qwen_tool_call_timeout_seconds", 15.0))
         try:
             resp = await self.chat_completions(
                 model=model,
@@ -395,6 +430,7 @@ class QwenProvider:
                 tools=tools,
                 tool_choice="auto",
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                timeout=httpx.Timeout(timeout_seconds, connect=self.settings.qwen_chat_connect_timeout_seconds),
             )
             message = resp.choices[0].message
             if message.tool_calls and message.tool_calls[0].function.arguments:

@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     # 交互式 LLM 调用的受控超时：避免 DashScope 偶发抖动时单次请求干挂到 httpx 默认 120s
     qwen_chat_timeout_seconds: float = 30.0
     qwen_chat_connect_timeout_seconds: float = 8.0
+    # SDK 自动重试次数。openai SDK 默认 max_retries=2 → 30s 超时实际重试 3 次，
+    # 最坏 90s+（实测 duration_ms=95760），导致整批对照/请求被拖垮。
+    qwen_max_retries: int = 1
+    # 本进程在途 LLM 并发上限（<=0 表示不限流）。模型工具轮会把单请求的 LLM 调用
+    # 放大 2~3 倍，需限流避免打满上游配额。
+    qwen_max_concurrency: int = 8
+    # 模型工具轮单轮超时（比普通对话更短：工具轮是辅助决策，且一请求可能多轮）。
+    qwen_tool_call_timeout_seconds: float = 15.0
     # 与 docker 生产一致：真实 DashScope 通义千问 embedding 模型。旧默认 "qwen3.7-text-embedding"
     # 非真实模型名，曾导致入库向量与 API 查询向量模型不一致（向量检索失效）。必须与重嵌入用同一模型。
     qwen_embedding_model: str = "text-embedding-v4"

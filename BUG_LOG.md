@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 198 条真 bug 修复记录。
+- 共 199 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1873,6 +1873,20 @@ pipeline 路径：
 **影响**：① 对照/评测不可复现（资源耗尽引入假 DIFF）；② **生产风险**：`--workers 4` 下并发用户会把 LLM 配额打满，`advisor_ask_agent.py:8` 记录的历史延迟问题会重现且更严重。
 **解法方向（未实施，需实测决定）**：① **限流/并发保护**：`request_tool_call` 加显式超时 + 全局信号量（参考 `llm_intent_fallback_max_concurrency` 的既有做法）；② **减少轮数**：明确"事实类工具成功后如无未覆盖意图即结束"，避免为"补充"而多调一轮（当前已按 intent 去重，但仍会多调一次）；③ **只在必要时启用模型工具轮**：如仅规则低置信/多意图时使用，简单 query 走确定性路径（可显著降低调用量）；④ **对照脚本限速**：跑对照时加间隔或降并发，避免自造限流。
 **验证**：以 `inspect_query_dual`/对照时的 `llm.usage` 日志统计单条 query 的 LLM 调用次数与耗时（`status=failed` 出现即资源不足）。
+
+### ISSUE-20260914-LLM-SDK-RETRY-AMPLIFIES-TIMEOUT
+- 日期：2026-09-14
+- 分类：LLM 基础设施 / 超时与重试
+- 严重程度：P1
+**问题**：`ISSUE-20260914-MODEL-TOOL-LLM-CALL-AMPLIFICATION` 的根因之一被定位——实测 `llm.usage model=qwen-plus status=failed duration_ms=95760`（**95.7 秒**），远超配置的 `qwen_chat_timeout_seconds=30`。
+**根因**：**openai SDK 默认 `max_retries=2`**，而 `chat_completions` 传入的 30s 超时是**单次尝试**的超时，SDK 会自动重试 → `30s × (1 + 2) = 90s+`，与观测到的 95.7s 吻合（差额为重试间隔与连接耗时）。即：**配置写了 30s，实际最坏 90s+**，调用方以为"有超时保护"实则没有。
+**解决（三项保护一起上）**：
+1. **显式限制 SDK 重试**：`AsyncOpenAI(..., max_retries=settings.qwen_max_retries)`，默认 `1`（新增配置项）；最坏延迟降为 `30s × 2 = 60s`。
+2. **工具轮显式更短超时**：`request_tool_call` 传入 `qwen_tool_call_timeout_seconds`（默认 `15s`，新增配置项），此前它**未传 timeout**，会落到 httpx 的 120s 默认值。工具轮是辅助决策且一请求多轮，必须比普通对话更短。
+3. **进程级并发闸门**：`QwenProvider._semaphore()` 按 `qwen_max_concurrency`（默认 `8`）缓存 `asyncio.Semaphore`，在 `chat_completions` 内 `async with sem` 包裹真实调用，限制在途 LLM 调用数；配置 `<=0` 表示不限流。做法与既有 `CustomerAgentExecutionService._fallback_semaphores` 一致。
+**顺带修复**：加信号量时引入 `asyncio` 但**忘记 import**——新测试立刻以 `NameError` 暴露（若进生产会在**首次 LLM 调用**即崩溃）。已补 `import asyncio`。**这是"写测试"直接拦下一个生产级崩溃的实例。**
+**验证**：新增 `tests/test_llm_resource_guard.py` 共 8 个测试，钉住：SDK 重试被显式限制且 client 实际采用、信号量按 limit 复用同一实例、信号量确实限制并发峰值（8 任务并发上限 2）、`chat_completions` 源码确实经过信号量、工具轮超时短于普通对话、`request_tool_call` 显式传 timeout、**最坏延迟有界**（`超时 × (1+重试)` 普通 ≤60s、工具轮 ≤30s）。**用"还原重试/超时/信号量"确认 4 个测试会失败**。`tests 324 passed`。
+**影响**：对照/评测结果重新可信（不再混入资源耗尽的假 DIFF）；生产 `--workers 4` 下的配额打满风险受控。配置已透传 `docker-compose.yml` / `docker-compose.p0.yml`（`QWEN_MAX_RETRIES` / `QWEN_MAX_CONCURRENCY` / `QWEN_TOOL_CALL_TIMEOUT_SECONDS`）。**注意：`MODEL-TOOL-MISROUTES-NON-RAG-INTENTS` 与调用量放大本身（④只在必要时启用）仍未解决。**
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 
