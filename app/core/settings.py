@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     qwen_max_concurrency: int = 8
     # 模型工具轮单轮超时（比普通对话更短：工具轮是辅助决策，且一请求可能多轮）。
     qwen_tool_call_timeout_seconds: float = 15.0
+    # 模型工具轮使用的模型。实测对比（scripts/compare_tool_model_latency.py，8 条 query）：
+    #   qwen-flash  avg=904ms  p95=1092ms  工具选择 8/8 匹配  ← 最快且全对
+    #   qwen-plus   avg=1274ms p95=1398ms  工具选择 8/8 匹配
+    #   qwen-max    avg=1489ms p95=1589ms  工具选择 8/8 匹配
+    # 工具选择属"结构化决策"而非深度推理，故取最快的 qwen-flash。
+    # 注意：qwen-turbo / qwen3-max / qwen2.5-7b-instruct 在本账号无权限（PermissionDeniedError）。
+    qwen_tool_model: str = "qwen-flash"
     # 与 docker 生产一致：真实 DashScope 通义千问 embedding 模型。旧默认 "qwen3.7-text-embedding"
     # 非真实模型名，曾导致入库向量与 API 查询向量模型不一致（向量检索失效）。必须与重嵌入用同一模型。
     qwen_embedding_model: str = "text-embedding-v4"

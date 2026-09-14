@@ -7,11 +7,18 @@
 # - 本次已回滚 auto-repair 写入的 few_shot/intent_mappings（保持干净，人工审核后再落）。
 
 # 难度模型路由（按问题难易选模型）
+# ⚠️ 模型必须在本账号已开通，否则调用会 PermissionDeniedError 并**静默降级**。
+# 实测可用性（2026-09-14）：
+#   ✅ qwen-plus / qwen-max / qwen-flash
+#   ❌ qwen-turbo / qwen3-max / qwen2.5-7b-instruct  → PermissionDeniedError
+# 历史问题（ISSUE-20260914-TIER-S-ROUTES-TO-UNAUTHORIZED-MODEL）：tier-S 曾指向无权限的
+# qwen-turbo，导致**简单 query 的 LLM 意图兜底从未真正生效**（失败被 except 吞掉、静默回退规则），
+# 且每次白耗一次失败调用。现改用 qwen-flash（实测 avg=904ms，快于 plus 的 1274ms）。
 model_routing:
   default: qwen-plus
   tiers:
     # S：简单（单意图、明确、规则置信度高）
-    - {max: "S", model: "qwen-turbo"}
+    - {max: "S", model: "qwen-flash"}
     # M：中等（多意图、需检索、略模糊）
     - {max: "M", model: "qwen-plus"}
     # L：复杂（否定/指代/歧义/对抗/长句/缺参）

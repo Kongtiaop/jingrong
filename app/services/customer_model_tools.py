@@ -260,6 +260,13 @@ class CustomerModelToolLoop:
         self.tools = tools
         self.database = database
         self.max_rounds = max(1, int(max_rounds))
+        # 模型缺省取配置的 qwen_tool_model（实测 qwen-flash 最快且工具选择 8/8 匹配）。
+        if model is None:
+            try:
+                from app.core.settings import get_settings
+                model = getattr(get_settings(), "qwen_tool_model", None)
+            except Exception:  # noqa: BLE001 - 配置不可读时回退 provider 默认
+                model = None
         self.model = model
 
     async def _audit(self, *, customer_id: str, conversation_id: str, round_index: int,

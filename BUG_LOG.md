@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 206 条真 bug 修复记录。
+- 共 207 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2056,6 +2056,25 @@ llm.tool_round model=qwen-turbo error=PermissionDeniedError
 | `qwen2.5-7b-instruct` | ❌ PermissionDeniedError |
 **解决（待实施，需业务确认）**：把 tier-S 路由改为**已开通的模型**（`qwen-flash` 定位为轻量快速，适合简单 query）；并建议增加**启动期/首次调用期的模型可用性自检**，避免"配置指向无权限模型"这类问题继续静默。**若换模型，需先实测其意图识别准确率不低于原预期。**
 **同类模式**：这是本项目第 N 次「配置声明与实现实际脱节」——与 `AMBIGUOUS-JUDGE-NOT-WIRED`（配置 judge_ambiguous=true 但未接线）、`INTENT-FALLBACK-DEFAULT-LAYERING`（文档说默认关、compose 默认开）同族。**共性：配置层没有校验机制，错误只在运行时静默降级。**
+
+### ISSUE-20260914-MODEL-LATENCY-DATA-REFUTES-TIMEOUT-THEORY
+- 日期：2026-09-14
+- 分类：LLM 基础设施 / 延迟归因
+- 严重程度：P2（澄清，非 bug）
+**问题**：此前把工具轮的 `APITimeoutError`（16.8s）归因为"`qwen-plus` 在 `tool_choice=auto` 下太慢"。新增 `scripts/compare_tool_model_latency.py` 实测三模型 × 8 条 query 的延迟与工具选择匹配率，**该归因被数据推翻**：
+
+| 模型 | avg | p95 | 工具选择匹配 |
+|---|---|---|---|
+| `qwen-flash` | **904ms** | 1092ms | **8/8** |
+| `qwen-plus` | 1274ms | 1398ms | 8/8 |
+| `qwen-max` | 1489ms | 1589ms | 8/8 |
+
+**三者 p95 最大仅 1.6s，远低于 15s 超时** —— 单独调用根本不会超时。**故 16.8s 超时不是"模型慢"，而是环境因素**，候选：完整流程中的并发调用打满配额、工具轮 prompt 更长（8 个 schema + planned_block + context_lines）、或对照脚本连跑 28 个请求触发限流排队。**该归因待进一步定位（本条只负责澄清"不是模型慢"）。**
+**已落地（数据支持的结论）**：
+1. **工具轮模型改用 `qwen-flash`**：实测最快（904ms，比 plus 快 29%）且**工具选择 8/8 全对**——工具选择属"结构化决策"，无需强模型。新增配置 `qwen_tool_model`。
+2. **tier-S 路由从 `qwen-turbo` 改为 `qwen-flash`**：修复 `ISSUE-20260914-TIER-S-ROUTES-TO-UNAUTHORIZED-MODEL`（turbo 在本账号 `PermissionDeniedError`，导致简单 query 的 LLM 意图兜底从未真正生效）。
+**验证**：新增 `tests/test_model_config_guard.py` 共 5 个测试——**禁止把已知无权限模型写进路由配置**、默认模型须可用、tier 清单不得超过已确认可用集合、工具轮模型须可用、**工具轮超时须显著高于实测 p95**（避免正常调用被误判超时）。**用"把 tier-S 退回 qwen-turbo"确认 2 个测试会失败**。`tests 376 passed`。
+**附带价值**：`compare_tool_model_latency.py` 把"模型选型"从**主观判断**变成**可复现的数据对比**（延迟 + 工具选择匹配率双指标），后续换模型/换账号可复用。
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 
