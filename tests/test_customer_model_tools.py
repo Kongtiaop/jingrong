@@ -723,3 +723,50 @@ def test_partially_answered_is_distinct_from_needs_clarification():
     clarify = [TaskExecutionResult("t1", "workflow", "needs_clarification", answer="")]
     assert CustomerTaskExecutor.summarize(partial)[0] == "partially_answered"
     assert CustomerTaskExecutor.summarize(clarify)[0] == "needs_clarification"
+
+
+# ---------- 失败提示不得引导模型换工具 ----------
+# ISSUE-20260914-FAILURE-HINT-MISLEADS-TOOL-SWITCH：旧失败文案
+# "请换一个更明确的查询对象，或不要再重复相同参数" 被模型理解为"换个工具试试"，
+# 实测链路退化为 order -> workorder -> knowledge -> knowledge，产出 3 个无关 task。
+
+def test_failure_hint_forbids_switching_tools():
+    """失败回灌必须明确禁止改调其他工具。"""
+    tools = FakeReadTools(results={
+        "get_my_order_status": SimpleNamespace(success=False, data={}, answer="", error="fact_not_found")
+    })
+    provider = FakeProvider([
+        {"name": "get_my_order_status", "arguments": {"query": "ORD-1"}},
+        {"name": "get_my_order_status", "arguments": {"query": "ORD-2"}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=3)
+    asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="查订单"))
+
+    feedback = provider.calls[1]["user"]
+    assert "不要改调" in feedback or "请勿改调" in feedback, \
+        f"失败回灌未明确禁止换工具（旧文案曾导致模型改查工单/知识库）: {feedback[-300:]}"
+
+
+def test_system_prompt_forbids_tool_switch_on_failure():
+    """system prompt 必须含"失败时留在同一意图内"的规则。"""
+    from app.services.customer_model_tools import _TOOL_LOOP_SYSTEM
+    assert "留在同一意图内" in _TOOL_LOOP_SYSTEM
+    assert "不要改调" in _TOOL_LOOP_SYSTEM
+
+
+def test_low_confidence_hint_discourages_tool_switch():
+    """知识检索低置信时的提示同样不得鼓励换工具。"""
+    tools = FakeReadTools(results={
+        "search_customer_knowledge": SimpleNamespace(
+            success=False, data={"evidence_status": "low_confidence"}, answer="", error="low_confidence")
+    })
+    provider = FakeProvider([
+        {"name": "search_customer_knowledge", "arguments": {"query": "q1", "intent": "policy"}},
+        {"name": "search_customer_knowledge", "arguments": {"query": "q2", "intent": "policy"}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=3)
+    asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q"))
+    feedback = provider.calls[1]["user"]
+    assert "不要改调" in feedback or "请勿改调" in feedback

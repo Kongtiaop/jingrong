@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 203 条真 bug 修复记录。
+- 共 204 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1965,6 +1965,34 @@ graph:    completed + requires_handoff=False
 **验证**：新增 6 个测试——自述缺口识别、完整答案不误判、全半成功→`partially_answered`、全成功→`completed`、半成功+失败→`partially_completed`、**中间态必须区别于 `needs_clarification`（前者有答案、后者没有）**。`tests 356 passed`。
 **影响**：`overall_status` 现可表达三档完成度（`completed` / `partially_answered` / `partially_completed`），前端与 `ApiResponse` 均按字符串透传（`overall_status: str` 无枚举约束），无需改契约。
 **待观察**：`partially_answered` 是新增状态，前端目前只做通用展示；若要做差异化 UI（如"部分回答"标签 + 追问入口），需前端配合。
+
+### ISSUE-20260914-FAILURE-HINT-MISLEADS-TOOL-SWITCH
+- 日期：2026-09-14
+- 分类：Agent / 模型工具轮 / 提示词副作用
+- 严重程度：P2
+**问题**：`我的订单 ORD-123456 状态` 的图产出 **3 个 task**（管线只有 1 个）：
+```
+[graph] task=model-tool-1 intent=order_status       needs_clarification  fact_not_found
+[graph] task=model-tool-2 intent=workorder_status   needs_clarification  fact_not_found   ← 多出
+[graph] task=model-tool-3 intent=faq                ...                                  ← 多出
+```
+诊断显示模型**每轮失败都换一个工具**：
+```
+round1 get_my_order_status        (计划内)  -> False
+round2 get_my_workorder_status    (换工具)  -> False
+round3 search_customer_knowledge  (再换)    -> False
+round4 search_customer_knowledge  (改写)    -> False
+```
+**根因**：**我上一轮为修复"重复调用"写的失败提示语有歧义**。原文案：
+> `fact_not_found` → "未查到该对象（可能是订单号/工单号不存在或不属于当前客户），**请换一个更明确的查询对象**，或不要再重复相同参数。"
+
+模型把"**换一个查询对象**"理解成"**换一个工具试试**"，于是从订单 → 工单 → 知识库，**逐步游走到与用户问题无关的工具**（查订单失败后去查知识库"订单查不到怎么办"）。`workorder` 与 `order` 工具描述本就相近（"用户问我的订单/我的工单时使用"），进一步放大了误判。
+**这是我引入的副作用**——上一轮修复解决了"空转重复"，却制造了"盲目换工具"。两次都出在**失败反馈的措辞**上。
+**解决（两处）**：
+1. **失败提示明确禁止换工具**：各 error 类型一律加上"**请勿改调其他工具**"，并指明正确动作是"**在本工具内**换更明确的参数 / 改写 query / 直接停止（交由下游提示补充或转人工）"；`route_mismatch` 明确要求"改回计划内的工具"。
+2. **system prompt 新增第 7 条**：**"工具调用失败时留在同一意图内**：换参数或改写 query 重试；**不要改调与用户问题无关的其他工具**（例如查订单失败后不要改查工单或知识库），反复失败就停止"。
+**验证**：新增 3 个测试——失败回灌含"不要改调/请勿改调"、system prompt 含该规则、`low_confidence` 提示同样不鼓励换工具。**用"退回旧文案"确认前两个测试会失败**。`tests 359 passed`；`我的订单` 的 `requires_handoff` 已与管线一致（False）、clarification 文案一致。
+**教训**：**给模型的失败反馈是"行为指令"，措辞必须同时说明「该做什么」与「不该做什么」**。只给正向建议（"换个更明确的"）会把模型推向未预期的方向——尤其当它面对的是"工具选择"这种开放决策时。
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 
