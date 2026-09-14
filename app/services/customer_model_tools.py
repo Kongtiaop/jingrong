@@ -146,6 +146,10 @@ _KNOWLEDGE_INTENTS = frozenset({
     "company_info", "company_business", "faq", "workflow", "policy", "risk_public",
 })
 
+# 知识检索无依据时的澄清文案。取值与 graph.py 的 _FALLBACK_CLARIFICATION、
+# CustomerTaskExecutor._bounded_react_knowledge 的占位串**逐字一致**，避免同一语义多种文案。
+_FALLBACK_CLARIFICATION = "当前资料不足，可以补充问题或转人工客服。"
+
 # 期望路由：工具名 → CustomerQueryRouter 的 route，用于校验工具与意图一致
 _EXPECTED_ROUTE = {
     "get_my_workorder_status": "workorder_status",
@@ -525,10 +529,17 @@ class CustomerModelToolLoop:
                     str(intent) if tool_name == "search_customer_knowledge" and intent
                     else _EXPECTED_ROUTE.get(tool_name, tool_name)
                 )
-                # 与管线 CustomerTaskExecutor._execute_one 的语义对齐：
+                # 与管线 CustomerTaskExecutor 的语义对齐（`_execute_one` 与
+                # `_bounded_react_knowledge` 两处）：
                 #   fact_not_found / ambiguous_product → needs_clarification（请用户补充）
-                #   其他 → failed
-                needs_clarification = str(result.error or "") in {"fact_not_found", "ambiguous_product"}
+                #   low_confidence                     → needs_clarification（知识库无依据，转人工）
+                #   其他                               → failed
+                # 此前只映射了 fact_not_found/ambiguous_product，导致**知识检索的 low_confidence
+                # 落到 failed**，与管线的 needs_clarification 不一致
+                # （ISSUE-20260914-FAILED-VS-CLARIFICATION-MISMATCH：实测"开户流程是怎样的"
+                #   graph=task failed / pipeline=needs_clarification，两边都已转人工、仅状态标记不同）。
+                error_code = str(result.error or "")
+                needs_clarification = error_code in {"fact_not_found", "ambiguous_product", "low_confidence"}
                 if not any(r["intent"] == intent_label for r in outcome.results):
                     outcome.results.append({
                         "task_id": f"model-tool-{round_index}",
@@ -538,7 +549,9 @@ class CustomerModelToolLoop:
                         "data": {**data, "execution_mode": "model_tool_selection", "tool": tool_name},
                         "error": result.error,
                         "clarification": (
-                            "请补充更明确的查询对象或订单/产品信息。"
+                            ("请补充更明确的查询对象或订单/产品信息。"
+                             if error_code in {"fact_not_found", "ambiguous_product"}
+                             else _FALLBACK_CLARIFICATION)
                             if needs_clarification else None
                         ),
                     })

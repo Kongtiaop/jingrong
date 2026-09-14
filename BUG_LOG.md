@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 207 条真 bug 修复记录。
+- 共 208 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2075,6 +2075,26 @@ llm.tool_round model=qwen-turbo error=PermissionDeniedError
 2. **tier-S 路由从 `qwen-turbo` 改为 `qwen-flash`**：修复 `ISSUE-20260914-TIER-S-ROUTES-TO-UNAUTHORIZED-MODEL`（turbo 在本账号 `PermissionDeniedError`，导致简单 query 的 LLM 意图兜底从未真正生效）。
 **验证**：新增 `tests/test_model_config_guard.py` 共 5 个测试——**禁止把已知无权限模型写进路由配置**、默认模型须可用、tier 清单不得超过已确认可用集合、工具轮模型须可用、**工具轮超时须显著高于实测 p95**（避免正常调用被误判超时）。**用"把 tier-S 退回 qwen-turbo"确认 2 个测试会失败**。`tests 376 passed`。
 **附带价值**：`compare_tool_model_latency.py` 把"模型选型"从**主观判断**变成**可复现的数据对比**（延迟 + 工具选择匹配率双指标），后续换模型/换账号可复用。
+
+### ISSUE-20260914-FAILED-VS-CLARIFICATION-MISMATCH
+- 日期：2026-09-14
+- 分类：Agent / 模型工具轮 / 失败语义
+- 严重程度：P2
+**问题**：`开户流程是怎样的`（知识类 `workflow`）两侧状态标记不一致：
+```
+pipeline task = needs_clarification (error=low_confidence)  execution_mode=bounded_react
+graph    task = failed               (error=low_confidence)  execution_mode=model_tool_selection
+```
+两边**都已转人工**（`requires_handoff=True`、同一 `ticket_no`），仅状态标记不同。但 `failed` 会污染 `overall_status`（`needs_clarification` vs `failed`），并在对照中产生假差异。
+**根因**：`customer_model_tools` 的失败映射**只覆盖事实类错误**：
+```python
+needs_clarification = error_code in {"fact_not_found", "ambiguous_product"}   # 缺 low_confidence
+```
+于是**知识检索的 `low_confidence` 落到 `failed`**。而管线两处都把 `low_confidence` 视为 `needs_clarification`（`_execute_one` 与 `_bounded_react_knowledge`）。这是我在做「失败语义映射」修复时的**遗漏**——当时只考虑了事实工具的场景，漏掉了知识检索。
+**解决（两处）**：
+1. **补齐映射**：`needs_clarification` 加入 `low_confidence`；澄清文案按错误类型区分（`fact_not_found`/`ambiguous_product` → "请补充更明确的查询对象或订单/产品信息。"；`low_confidence` → "当前资料不足，可以补充问题或转人工客服。"）。
+2. **常量去重**：`_FALLBACK_CLARIFICATION` 原只在 `graph.py` 定义，本模块又用到却未定义（运行到该分支会 `NameError`——**被新测试当场抓出**）。已在 `customer_model_tools.py` 定义同名常量并**用测试钉住与 `graph.py` 逐字一致**，避免同一语义两种文案。
+**验证**：新增 `tests/test_model_tool_failure_semantics.py` 共 7 个测试——三类可恢复错误都映射为 `needs_clarification`、`low_confidence` 用知识类文案、`fact_not_found` 用事实类文案、**非可恢复错误仍是 `failed`**（不过度放宽）、两处常量逐字一致。**用"把 low_confidence 退回 failed"确认测试会失败**。`tests 383 passed`。
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 
