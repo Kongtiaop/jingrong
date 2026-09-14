@@ -220,6 +220,13 @@ class CustomerAgentExecutionService:
         if intent.template == "T1_INFORMATION_QUERY":
             # Only map to public-customer RAG. Do not infer an account/order/risk fact from a model label.
             public_intents = {"company_info", "company_business", "faq", "workflow", "policy", "risk_public"}
+            # 多意图保全：规则已识别出多个只读知识 task（如"公司业务"同时命中 company_info +
+            # company_business）时，不得因模板兜底把 plan 收敛成单 task —— 那会让用户少拿一路答案
+            # （历史现象：管线 task_intents=['company_info']，图=['company_info','company_business']）。
+            # 仅当规则 task 全部属于 public_intents（即本次兜底不改变路由性质）时，原样保留 plan。
+            rule_tasks = getattr(plan, "tasks", None) or []
+            if len(rule_tasks) > 1 and all(t.intent in public_intents for t in rule_tasks):
+                return plan
             requested = str(intent.primary_intent or "").strip()
             safe_intent = requested if requested in public_intents else "faq"
             task = IntentTask("t1", safe_intent, "rag_explanation", query, confidence=intent.confidence, arguments={}, execution_mode=execution_mode_for_intent(safe_intent))

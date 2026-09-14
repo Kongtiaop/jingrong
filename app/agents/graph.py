@@ -300,14 +300,23 @@ class SupervisorGraph:
         result = await self.react_tool.execute(
             name="search_customer_knowledge", customer_id=state.customer_id or "",
             query=query, intent=task.intent, entities=task.arguments)
-        sig = CustomerTaskExecutor._result_signature(result)
         attempts = state.react_attempts + [{
             "tool": "search_customer_knowledge", "iteration": len(state.react_attempts) + 1,
             "task_id": task.task_id, "intent": task.intent,
             "success": result.success, "error": result.error,
             "evidence_status": result.data.get("evidence_status") if result.data else None,
         }]
-        repeated = sig in state.seen_signatures
+        sig = CustomerTaskExecutor._result_signature(result)
+        # 早停哈希必须按 task 隔离：多意图时 t1/t2 常共用同一句 query（如"公司业务"同时命中
+        # company_info + company_business），若共用 seen_signatures，第二个 task 会立刻被判
+        # "结果重复、无进展"而早停成 needs_clarification → summarize 变 partially_completed。
+        # 因此每个 task 用 {index: [sig,...]} 独立记录；state.seen_signatures 保留扁平列表供审计。
+        per_task = dict(state.seen_signatures_by_task)
+        task_seen = list(per_task.get(str(index), []))
+        repeated = sig in task_seen
+        if not repeated:
+            task_seen.append(sig)
+        per_task[str(index)] = task_seen
         seen = state.seen_signatures if repeated else state.seen_signatures + [sig]
         citations = (result.data.get("citations") or []) if result.data else []
         done = repeated or (result.success and citations) or len(attempts) >= self.max_iterations
@@ -325,6 +334,7 @@ class SupervisorGraph:
             is_last = index + 1 >= len(plan.tasks)
             return {
                 "react_attempts": attempts, "seen_signatures": seen,
+                "seen_signatures_by_task": per_task,
                 "react_results": accumulated,
                 # 只有全部 task 处理完才置 react_result，条件边据此决定是否继续回环
                 "react_result": finished if is_last else None,

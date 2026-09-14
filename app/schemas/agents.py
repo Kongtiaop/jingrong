@@ -30,7 +30,8 @@ class AgentState(BaseModel):
     # 只读 ReAct 循环状态（read-only 知识意图走 LangGraph 条件循环）
     react_query: str = ""                              # 当前待处理查询（含改写）
     react_attempts: list[dict] = Field(default_factory=list)  # 每轮工具调用记录
-    seen_signatures: list[str] = Field(default_factory=list)  # 结果哈希集合（早停）
+    seen_signatures: list[str] = Field(default_factory=list)  # 结果哈希集合（早停，扁平供审计）
+    seen_signatures_by_task: dict = Field(default_factory=dict)  # 按 task 隔离的早停哈希 {task_index: [sig]}
     react_result: dict | None = None                   # 循环结束时的任务结果（最后一个 task）
     react_results: list[dict] = Field(default_factory=list)  # 多意图：各 task 的最终结果累积
     # 上下文（intent_plan_node 从短时/长时/共享记忆装载，供规划与生成使用）

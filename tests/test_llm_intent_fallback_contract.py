@@ -76,6 +76,36 @@ def test_trade_templates_never_applied_from_model(template):
     assert before == after == "unknown"
 
 
+def test_multi_knowledge_intent_not_collapsed_by_t1_fallback():
+    """回归：T1 兜底不得把多个只读知识 task 收敛成单个。
+
+    真实案例"你们公司的主营业务是什么"：planner 产出 company_info + company_business，
+    管线 T1 分支重建 plan 只保留 primary_intent → task_intents 从 2 个变 1 个，
+    用户少拿一路答案（图则保留 2 个，导致双跑对照报差异）。
+    """
+    plan = CustomerIntentPlanner().plan("你们公司的主营业务是什么")
+    assert [t.intent for t in plan.tasks] == ["company_info", "company_business"]
+
+    rule = CustomerAgentExecutionService._structured_from_rule_plan(plan)
+    llm = StructuredIntent(template="T1_INFORMATION_QUERY", primary_intent="faq",
+                           confidence=0.8, source="llm_fallback")
+    resolved = IntentPolicyResolver().resolve(rule_intent=rule, llm_intent=llm)
+    out = _service()._apply_structured_intent(plan, resolved)
+    assert [t.intent for t in out.tasks] == ["company_info", "company_business"], \
+        "多意图被 T1 兜底收敛成单 task"
+
+
+def test_t1_fallback_still_applies_to_single_unknown_query():
+    """单 task 的 unknown 查询仍可被 T1 兜底成 faq（保留模型兜底能力）。"""
+    plan = CustomerIntentPlanner().plan("随便聊聊吧")
+    rule = CustomerAgentExecutionService._structured_from_rule_plan(plan)
+    llm = StructuredIntent(template="T1_INFORMATION_QUERY", primary_intent="faq",
+                           confidence=0.8, source="llm_fallback")
+    resolved = IntentPolicyResolver().resolve(rule_intent=rule, llm_intent=llm)
+    out = _service()._apply_structured_intent(plan, resolved)
+    assert [t.intent for t in out.tasks] == ["faq"]
+
+
 def test_structured_from_rule_plan_preserves_original_intent():
     """primary_intent 必须保留规划器原始意图，而非模板桶——信息一旦丢失后续无法恢复。"""
     plan = CustomerIntentPlanner().plan("查一下我的持仓")

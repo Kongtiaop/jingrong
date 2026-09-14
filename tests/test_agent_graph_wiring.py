@@ -145,6 +145,41 @@ def test_react_loop_covers_all_knowledge_tasks():
     assert tool.intents == ["company_info", "company_business"]
 
 
+def test_same_query_across_tasks_does_not_false_early_stop():
+    """回归：多意图 task 共用同一句 query 时，早停哈希不得跨 task 误判"结果重复"。
+
+    真实案例（"你们公司的主营业务是什么"）：plan 产出 company_info + company_business，
+    两个 task 的 query 文本完全相同 → _result_signature 相同 → 若共用 seen_signatures，
+    第二个 task 立即 repeated=True → 早停成 needs_clarification →
+    summarize 变 partially_completed + requires_handoff=True（把用户错误转人工）。
+    修法：早停哈希按 task 隔离（seen_signatures_by_task）。
+    """
+
+    class SameQueryPlanner:
+        def plan(self, query, context=None):
+            return IntentPlan(normalized_query=query, tasks=[
+                IntentTask("t1", "company_info", "rag_explanation", query, confidence=.70),
+                IntentTask("t2", "company_business", "rag_explanation", query, confidence=.75),
+            ])
+
+    supervisor = SupervisorGraph(planner=SameQueryPlanner(), react_tool=FakeKnowledgeTool())
+    final = asyncio.run(supervisor.build().ainvoke(_state(user_message="你们公司的主营业务是什么")))
+
+    statuses = [r["status"] for r in final["task_results"]]
+    assert statuses == ["succeeded", "succeeded"], f"第二个 task 被误判早停: {statuses}"
+    assert final["overall_status"] == "completed"
+    assert final["needs_handoff"] is False, "不应因误判早停而把用户转人工"
+
+
+def test_per_task_signatures_tracked_separately():
+    """seen_signatures_by_task 应按 task index 分别记录，供审计定位。"""
+    tool = FakeKnowledgeTool()
+    supervisor = SupervisorGraph(planner=MultiKnowledgePlanner(), react_tool=tool)
+    final = asyncio.run(supervisor.build().ainvoke(_state(user_message="公司业务")))
+    by_task = final.get("seen_signatures_by_task") or {}
+    assert set(by_task.keys()) == {"0", "1"}, f"应为每个 task 独立记录: {by_task}"
+
+
 def test_react_generate_covers_all_knowledge_tasks():
     """多意图下每个 task 都要经过 LLM 生成，不能只有第一个有答案。"""
 
