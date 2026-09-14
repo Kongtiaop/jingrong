@@ -7,6 +7,7 @@ from app.services.customer_query_router import CustomerQueryRouter
 from app.infrastructure.qwen import QwenProvider
 from app.core.settings import get_settings
 from app.repositories.knowledge import KnowledgeRepository
+from app.services.customer_rag_answer import build_answerability_judge
 from app.services.customer_rag_service import CustomerRagService
 from app.services.knowledge_retrieval import WealthKnowledgeRetriever
 
@@ -36,7 +37,16 @@ class CustomerReadTools:
         if name in {"search_customer_knowledge", "explain_order_status", "explain_workorder_status"}:
             selected_intent = intent or ("workflow" if name != "search_customer_knowledge" else "faq")
             retriever = WealthKnowledgeRetriever(KnowledgeRepository(self.database))
-            rag = await CustomerRagService(retriever, embedding_provider=QwenProvider(get_settings())).answer(query=query, intent=selected_intent)
+            provider = QwenProvider(get_settings())
+            # 接上分层门控的 ambiguous 带 LLM-judge：
+            # config/understanding.yaml 声明 `judge_ambiguous: true`，但此处此前未传 ambiguous_judge，
+            # 导致 0.35~0.65 中间带实际走死阈值 min_similarity=0.55（配置与实现脱节，judge 形同虚设）。
+            # build_answerability_judge 用 qwen-max + temperature=0，judge 失败按不可作答（保守拒答）。
+            rag = await CustomerRagService(
+                retriever,
+                embedding_provider=provider,
+                ambiguous_judge=build_answerability_judge(provider),
+            ).answer(query=query, intent=selected_intent)
             return CustomerReadToolResult(name=name, success=not rag.handoff_required, data={"citations": [item.__dict__ for item in rag.citations], "evidence_status": rag.evidence_status}, answer=rag.message, error="low_confidence" if rag.handoff_required else None)
         async with self.database.session_factory() as session:
             result = await CustomerQueryRouter().route(session=session, customer_id=customer_id, query=query, entities=entities)

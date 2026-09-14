@@ -64,3 +64,53 @@ def test_ambiguous_edge_boundary():
     # 恰在 reject 边界（>= 不算 reject）
     assert decide_evidence(0.35, reject=REJECT, answer=ANSWER, judge_result=False) == "reject"
     assert decide_evidence(0.35, reject=REJECT, answer=ANSWER, judge_result=True) == "answer"
+
+
+# ---- 回归：CustomerReadTools 必须把 ambiguous_judge 接上 ----
+# ISSUE-20260914-AMBIGUOUS-JUDGE-NOT-WIRED：config/understanding.yaml 声明
+# `judge_ambiguous: true`，但 customer_tools.py 构造 CustomerRagService 时未传
+# ambiguous_judge → 0.35~0.65 中间带实际走死阈值 min_similarity=0.55，judge 形同虚设。
+# decide_evidence 单测全绿也发现不了——缺的是"接线"这一层，故此处专门钉住。
+
+
+def test_customer_read_tools_wires_ambiguous_judge():
+    """检索知识工具构造 RAG 服务时必须传入 ambiguous_judge（否则配置的 judge 不生效）。
+
+    注意：customer_tools.py 是**模块级** `from ... import CustomerRagService`，
+    因此要 patch `app.services.customer_tools.CustomerRagService`（该模块自己的绑定），
+    而不是源模块 customer_rag_service。
+    """
+    import asyncio
+    from app.services import customer_tools as tools_mod
+
+    captured = {}
+    original = tools_mod.CustomerRagService
+
+    class SpyRag:
+        def __init__(self, retriever, embedding_provider=None, config=None, ambiguous_judge=None):
+            captured["ambiguous_judge"] = ambiguous_judge
+
+        async def answer(self, *, query, intent, top_k=None):
+            from app.services.customer_rag_service import CustomerRagResult
+            return CustomerRagResult(intent=intent, answer_mode="rag_answer",
+                                     evidence_status="sufficient", citations=[],
+                                     handoff_required=False, message="ok")
+
+    tools_mod.CustomerRagService = SpyRag
+    try:
+        tools = tools_mod.CustomerReadTools(database=object())
+        asyncio.run(tools.execute(name="search_customer_knowledge", customer_id="c1",
+                                  query="什么是双录", intent="policy"))
+    finally:
+        tools_mod.CustomerRagService = original
+
+    assert captured.get("ambiguous_judge") is not None, \
+        "CustomerReadTools 未传 ambiguous_judge → 配置的 judge_ambiguous 不会生效"
+
+
+def test_judge_ambiguous_config_is_true_so_wiring_matters():
+    """若配置把 judge_ambiguous 关掉，本接线问题就不成立；钉住前提便于日后判断。"""
+    from app.services.customer_rag_service import CustomerRagService
+    svc = CustomerRagService(retriever=object(), embedding_provider=None)
+    assert svc.thresholds.get("judge_ambiguous") is True, \
+        "配置 judge_ambiguous 已改为非 true，需重新评估接线必要性"

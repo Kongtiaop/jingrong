@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 183 条真 bug 修复记录。
+- 共 185 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1576,4 +1576,36 @@ Schema 缓存 key 如果不绑定权限上下文，用户 A 可能命中用户 B
 3. 需回归评测：移除后要确认"帮我比较一下这几个产品"这类**真筛选**请求仍能正常进入推荐流程。
 **为何本次未修**：本任务目标是"图与管线等价"（ISSUE-20260914-GRAPH-MISSING-PREFERENCE-CHAIN），修此正则会让两条路径**行为同时改变**，属于独立议题，且需评测集验证。图当前**如实继承**该行为，恰好保证等价性可验证。
 **验证**：`extract_preference_statement` + `pure_preference_statement` 直接调用复现（见上表）。
+
+### ISSUE-20260914-AMBIGUOUS-JUDGE-NOT-WIRED
+- 日期：2026-09-14
+- 分类：RAG / 配置与实现脱节
+- 严重程度：P1
+**问题**：`config/understanding.yaml` 声明 `judge_ambiguous: true`（中间带用 LLM-judge 判证据充分性），但 `customer_tools.py` 构造 `CustomerRagService` 时**未传 `ambiguous_judge`**，judge 从未被调用。容器内实测确认：`ambiguous_judge = None`。
+**根因**：**配置声明与实现接线脱节**。`CustomerRagService.__init__` 的 `ambiguous_judge=None` 是默认值，`answer()` 内的判断是 `if thresholds.get("judge_ambiguous") and self.ambiguous_judge is not None and ...`——**两个条件都要满足**，而配置为 `true`、对象为 `None`，故整个分支静默跳过，**降级为死阈值**。现成的 `build_answerability_judge()`（`customer_rag_answer.py:23`，用 qwen-max + temperature=0）**存在但无任何调用方**。
+**实际影响**：分层证据门控退化为单阈值。配置 `reject=0.35 / answer=0.65 / min_similarity=0.55`，中间带 `0.35~0.65` 本应由 judge 判定，实际走 `best_sim >= 0.55 ? answer : reject`。例如 `best_sim=0.53` 本可经 judge 判为可作答，却因低于 0.55 被硬拒转人工。**配置里写的能力从未生效。**
+**解决**：`customer_tools.py` 检索知识工具分支接上 judge——复用同一个 `QwenProvider`（避免重复构造），`CustomerRagService(retriever, embedding_provider=provider, ambiguous_judge=build_answerability_judge(provider))`。judge 内部异常按"不可作答"处理（保守拒答），保持原有安全取向。
+**验证**：新增 2 个回归测试——`test_customer_read_tools_wires_ambiguous_judge`（用 Spy 捕获构造参数，断言 `ambiguous_judge is not None`）+ `test_judge_ambiguous_config_is_true_so_wiring_matters`（钉住配置前提）。**用"撤销接线"确认首个测试会失败**。`tests 275 passed`。
+**通用教训**：`decide_evidence` 这类纯函数单测全绿，**完全无法发现"接线缺失"**——能力已实现、配置已声明、单测通过，但调用方没传参。同类问题本项目已出现多次（ISSUE-20260914-INTENT-FALLBACK-DEFAULT-LAYERING 的 compose 覆盖、ISSUE-20260914-LANGGRAPH-NOT-WIRED 的三开关未透传）。**共性：配置/文档层与实际生效层之间没有校验**。建议后续为关键开关增加启动期自检（如 `judge_ambiguous=true` 但 `ambiguous_judge is None` 时打 warning）。
+
+### ISSUE-20260914-RAG-EVIDENCE-THRESHOLD-MARGIN
+- 日期：2026-09-14
+- 分类：RAG / 可复现性
+- 严重程度：P2
+- 状态：OPEN（已定位，未修；需设计决策）
+**问题**：双跑对照中 `你们公司的主营业务是什么` 两次运行结论不同（一次 `partially_completed`+转人工、一次 `completed`），同一代码同一 query 不可复现。容器内实测定位到根因：**该 query 的 `best_sim` 落在阈值边缘**。
+
+```
+原始 query  -> embedding_degraded  best_sim=None
+改写后 query -> sufficient         best_sim=0.5667
+min_similarity 阈值 = 0.55
+余量 = 0.0167  ← 仅 1.67%
+```
+**根因**：图的 ReAct 循环含 `_REWRITE_POOL` 改写重试（`tool_calls=2` 即证据）。改写后文本的向量相似度**恰好落在 0.55 上方 1.67%**，检索结果的微小波动（RRF 排序微变、多召回/少召回一条）即可让 `best_sim` 跌破阈值 → `low_confidence` → 该 task `needs_clarification` → `summarize` 判 `partially_completed` + `requires_handoff=True`。而**同一轮中另一 task 已成功生成答案**，于是出现"既给出详细答案、又转人工"的表象。
+**重要澄清（推翻一版误判）**：`embedding_degraded`（`best_sim=None`）**不会**导致拒答——`decide_evidence` 对 `best_sim is None` 明确 `return "answer"`（注释："没有相似度信号，不按相似度拒"）。故 embedding 降级与本次不一致**无因果**，`low_confidence` 只能来自 `answer()` 中 `if not useful`（检索 0 条或全低于 `min_score=0.0001`）。**初始推断曾把两者关联，经实测证伪。**
+**解法方向（未实施，需设计决策）**：
+1. 阈值加滞回/置信带（如 `0.50~0.60` 视为不确定，走 judge 或降级为"部分作答"而非直接拒）；
+2. RAG 判定改为**确定性可复现**（固定 embedding、固定 top_k、记录 `best_sim` 到审计以便事后归因）；
+3. **修正 `needs_handoff` 判定粒度**：单个 task 失败即整体转人工过于激进——已有可用答案时应返回"部分作答 + 提示"，而非同时给答案又转人工（自相矛盾的用户体验）。
+**验证**：容器内调用 `CustomerRagService.answer` 对原文/改写文本分别取 `best_sim`（见上）；`ambiguous_judge=None` 与 `thresholds` 亦同轮实测。
 
