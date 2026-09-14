@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 200 条真 bug 修复记录。
+- 共 202 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1902,6 +1902,45 @@ pipeline 路径：
 2. **工具层**（`customer_model_tools.py`）：新增 `_KNOWLEDGE_INTENTS` 白名单，`search_customer_knowledge` 收到**非知识类 intent** 时强制回落为 `faq`，防止模型绕过路由层直接构造越界调用。
 **验证**：新增测试——非知识类 intent 被强制回落 faq（5 个参数化）、合法知识 intent 原样透传（6 个参数化）、白名单不含专用路径意图、专用路径意图**端到端路由**不得进入模型工具轮（3 个参数化，断言实际 `_route_after_plan` 决策而非仅白名单函数）、`unknown` 不进模型工具轮、只读查询意图保留模型调度。**用"移除意图门禁"确认路由层 3 个测试会失败**（首次写法只测白名单函数，撤销路由条件后仍通过——已改为测实际路由决策，避免假绿）。`tests 346 passed`。
 **效果**：`你好`/`推荐适合我的产品`/`我想转人工客服` 回归各自确定性路径，与管线语义一致；`查我的持仓`/`我有没有风险限制`/`公司主营业务` 等**只读查询仍享受模型自主工具调度**（本次改造的目标得以保留）。
+
+### ISSUE-20260914-TOOL-FAILURE-NOT-FEED-BACK
+- 日期：2026-09-14
+- 分类：Agent / 模型工具轮 / 失败反馈与预算浪费
+- 严重程度：P1
+**问题**：诊断 `"我的订单 ORD-123456 状态"` 显示模型**选对了工具**但循环空转：
+```
+[round 1] get_my_order_status  {'query': 'ORD-123456'}  -> False
+[round 2] get_my_order_status  {'query': 'ORD-123456'}  -> False   ← 参数完全相同
+[round 3] get_my_order_status  {'query': 'ORD-123456'}  -> False
+[round 4] get_my_order_status  {'query': 'ORD-123456'}  -> False
+stopped_reason = budget_exhausted      results = []
+```
+**4 轮全部传入完全相同的参数、4 次全失败、无任何结果**，纯浪费预算与 LLM 配额。
+**根因（两点）**：
+1. **失败信息回灌不足**：旧实现只写 `f"[{tool}] 未取得结果（{error}）"`，**未回灌已试参数、也未给出可执行的调整建议**，模型无法据此改变策略，只能重复同一调用。
+2. **缺重复调用闸门**：确定性工具用**完全相同的参数**调用必然得到相同结果，但循环未拦截，直到 `budget_exhausted`。
+**对照影响**：该 query 因此 `requires_handoff=True`（工具失败 → `low_confidence` → 转人工），而管线正确返回 `needs_clarification`+"请补充订单信息"、不转人工。**图把"订单查不到"误判成"需要转人工"。**
+**解决**：
+1. **失败反馈结构化**：回灌 `error` 具体值 + **已试参数** + 按 error 类型给出的可执行建议（`fact_not_found`→"未查到该对象，请换更明确的查询对象或不要重复相同参数"；`low_confidence`→"请改写 query 换个说法，若已改写两次以上仍失败请停止"；`route_mismatch`→"该工具与意图不匹配，请改用其他工具" 等）。
+2. **重复调用闸门**：对 `(tool, arguments)` 做规范化 key（`json.dumps(sort_keys=True)`），**完全相同的重复调用直接拦截**、不再执行、写审计 `error="duplicate_call_skipped"`、并把"该调用已试过且结果相同"告知模型后结束循环。**参数不同的重试（如换 query 改写）仍允许。**
+**验证**：新增/更新测试——相同调用只执行一次且 `stopped_reason=duplicate_call_skipped`、被拦截的重复调用留审计、成功后再发同一调用也被拦截、**参数不同的重试不被拦截**（防止闸门过严）、失败反馈含 error/已试参数/调整建议。**用"撤销闸门与覆盖修复"确认 2 个测试会失败**。`tests 350 passed`。
+
+### ISSUE-20260914-COVERAGE-FALSE-POSITIVE
+- 日期：2026-09-14
+- 分类：Agent / 模型工具轮 / 覆盖判定
+- 严重程度：P1
+**问题**：诊断 `"你们公司的主营业务是什么"` 显示模型 **4 轮全部使用 `intent=company_info`**，`company_business` **从未被检索**：
+```
+[round 1] search_customer_knowledge {'intent': 'company_info', 'query': '公司主营业务'}
+[round 2] search_customer_knowledge {'intent': 'company_info', ...}
+[round 3] ... [round 4] ...  （均为 company_info）
+事后算未覆盖意图 = []      ← 误判"全部覆盖"
+```
+对照中 `task_intents: pipeline=['company_info','company_business']` vs `graph=['company_info']`——图少一个 task。
+**根因**：`_uncovered_intents()` 的覆盖判定用了**两级兜底**：先看结果里的 `intent`，若未命中再看 `data.tool` 是否被调用过。而 `company_info` 与 `company_business` **共用同一个工具** `search_customer_knowledge`，于是"调过该工具"被误判为"两个意图都已覆盖"，`pending=[]` → **规则兜底不触发** → 缺的意图既没被模型检索、也没被规则补齐。
+**解决**：覆盖判定**只按结果里的 `intent` 字段**，**移除 `data.tool` 兜底**。共用工具的不同意图必须各自被检索过才算覆盖；`greeting`/`human_handoff`/`business_operation` 等映射为 `None` 的非只读意图仍跳过（不参与兜底）。
+**验证**：新增测试 `test_knowledge_intents_sharing_one_tool_are_still_tracked_individually`——模型只检索 `company_info` 时，`company_business` 必须被识别为未覆盖并被补齐。**用"退回工具兜底"确认该测试会失败**。`tests 350 passed`。
+**教训**：**"共用资源的意图"不能用资源维度判覆盖**——`company_info` 与 `company_business` 语义不同但共用检索工具，按工具粒度判定必然假阳性。凡"多对一"映射，覆盖判定必须落在**细粒度（intent）**上。
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 

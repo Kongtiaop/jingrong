@@ -286,19 +286,37 @@ def test_backstop_ignores_intents_outside_readonly_tools():
     assert len(provider.calls) == 1, "非只读意图不应触发兜底"
 
 
-def test_knowledge_intents_share_single_tool_coverage():
-    """company_info 与 company_business 同由 search_customer_knowledge 覆盖，只需调一次。"""
+def test_knowledge_intents_sharing_one_tool_are_still_tracked_individually():
+    """回归 ISSUE-20260914-COVERAGE-FALSE-POSITIVE：共用同一工具的意图必须**分别**判定覆盖。
+
+    旧逻辑用"工具是否被调用过"兜底，导致只检索了 company_info 时误判 company_business
+    也已覆盖（实测模型 4 轮全用 intent=company_info，company_business 从未检索，
+    但 pending=[]，兜底不触发，图少一个 task）。
+    现改为**只按 intent 字段判覆盖**，因此 company_business 应被识别为未覆盖并被补齐。
+    """
     tools = FakeReadTools()
-    provider = FakeProvider([
-        {"name": "search_customer_knowledge", "arguments": {"query": "公司业务", "intent": "company_info"}},
-        None,
-    ])
+
+    class ScriptedProvider:
+        def __init__(self):
+            self.calls = []
+            self._client = object()
+            self._n = 0
+
+        async def request_tool_call(self, *, system, user, tools, model=None, temperature=0.0):
+            self.calls.append(user)
+            self._n += 1
+            if self._n == 1:
+                return {"name": "search_customer_knowledge",
+                        "arguments": {"query": "公司业务", "intent": "company_info"}}
+            return None   # 之后一直想停
+
+    provider = ScriptedProvider()
     loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
     outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="公司业务",
                                    planned_intents=["company_info", "company_business"]))
-    # company_info 已被 intent 覆盖；company_business 由同一工具覆盖（covered_tools 命中）
-    assert outcome.stopped_reason == "no_tool_call"
-    assert len(provider.calls) == 2, "同一工具已覆盖两个知识意图，不应再追问"
+    intents = {r["intent"] for r in outcome.results}
+    assert "company_business" in intents, \
+        "company_business 未被检索却被误判已覆盖（共用工具的假阳性）"
 
 
 # ---------- 重复调用同一 intent 应去重（回归） ----------
@@ -485,19 +503,31 @@ def test_no_tool_call_returns_empty_for_fallback():
 
 
 def test_failed_tool_result_is_recorded_but_no_success_result():
-    """工具失败 → 记账但不出成功结果，且把失败信息回灌模型。"""
+    """工具失败 → 记账但不出成功结果，且把**失败原因+参数**回灌模型。
+
+    回归 ISSUE-20260914-TOOL-FAILURE-NOT-FEED-BACK：旧实现只回灌 error 字符串，
+    模型不知道该怎么调整，于是重复同样的调用直到预算耗尽（实测 4 轮全失败）。
+    """
     tools = FakeReadTools(results={
         "get_my_order_status": SimpleNamespace(
             success=False, data={}, answer="", error="fact_not_found")
     })
-    provider = FakeProvider([{"name": "get_my_order_status", "arguments": {"query": "ORD-1"}}, None])
+    provider = FakeProvider([
+        {"name": "get_my_order_status", "arguments": {"query": "ORD-1"}},
+        {"name": "get_my_order_status", "arguments": {"query": "ORD-2"}},   # 换参数再试
+        None,
+    ])
     loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=3)
     outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="查订单"))
 
     assert outcome.rounds[0].success is False
     assert outcome.rounds[0].error == "fact_not_found"
     assert outcome.results == []
-    assert "未取得结果" in provider.calls[1]["user"], "失败信息应回灌给模型再决策"
+    # 回灌内容必须含失败原因、已试参数与可执行的调整建议
+    feedback = provider.calls[1]["user"]
+    assert "fact_not_found" in feedback, "应回灌具体 error"
+    assert "ORD-1" in feedback, "应回灌已试参数"
+    assert "重复" in feedback or "换" in feedback, "应给出可执行的调整建议"
 
 
 # ---------- 审计与 schema ----------
@@ -540,3 +570,83 @@ def test_every_schema_entry_well_formed():
         fn = item["function"]
         assert fn["name"] and fn["description"], f"{fn.get('name')} 缺 name/description"
         assert fn["parameters"]["type"] == "object"
+
+
+# ---------- 重复调用闸门 ----------
+# ISSUE-20260914-TOOL-FAILURE-NOT-FEED-BACK：实测"我的订单 ORD-123456 状态"连续 4 轮
+# 传入**完全相同**的 (工具, 参数)，4 次全失败、无任何结果，纯浪费预算与配额。
+
+def test_identical_repeated_call_is_blocked():
+    """完全相同的 (工具, 参数) 重复调用应被拦截，不再消耗预算。"""
+    tools = FakeReadTools(results={
+        "get_my_order_status": SimpleNamespace(success=False, data={}, answer="", error="fact_not_found")
+    })
+
+    class AlwaysSameProvider:
+        def __init__(self):
+            self._client = object()
+
+        async def request_tool_call(self, *, system, user, tools, model=None, temperature=0.0):
+            return {"name": "get_my_order_status", "arguments": {"query": "ORD-123456"}}
+
+    loop = CustomerModelToolLoop(provider=AlwaysSameProvider(), tools=tools,
+                                 database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1",
+                                   query="我的订单 ORD-123456 状态",
+                                   planned_intents=["order_status"]))
+    assert len(tools.calls) == 1, f"相同调用应只执行一次，实际 {len(tools.calls)} 次"
+    assert outcome.stopped_reason == "duplicate_call_skipped"
+
+
+def test_duplicate_call_is_audited():
+    """被拦截的重复调用也要留审计。"""
+    tools = FakeReadTools(results={
+        "get_my_order_status": SimpleNamespace(success=False, data={}, answer="", error="fact_not_found")
+    })
+    db = FakeDatabase()
+
+    class AlwaysSameProvider:
+        def __init__(self):
+            self._client = object()
+
+        async def request_tool_call(self, *, system, user, tools, model=None, temperature=0.0):
+            return {"name": "get_my_order_status", "arguments": {"query": "ORD-1"}}
+
+    loop = CustomerModelToolLoop(provider=AlwaysSameProvider(), tools=tools,
+                                 database=db, max_rounds=4)
+    asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="查订单"))
+    assert any("duplicate_call_skipped" in row.detail for row in db.audits)
+
+
+def test_successful_call_then_identical_retry_is_blocked():
+    """成功结果之后若再发同一调用（参数完全相同）也应拦截——结果不会变。"""
+    tools = FakeReadTools()
+
+    class SameAfterSuccess:
+        def __init__(self):
+            self._client = object()
+
+        async def request_tool_call(self, *, system, user, tools, model=None, temperature=0.0):
+            return {"name": "get_my_asset_summary", "arguments": {}}
+
+    loop = CustomerModelToolLoop(provider=SameAfterSuccess(), tools=tools,
+                                 database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="查资产"))
+    assert len(tools.calls) == 1
+    assert len(outcome.results) == 1
+
+
+def test_near_duplicate_with_different_args_is_allowed():
+    """参数不同的调用（如换 query 改写）应允许——只有完全相同才拦截。"""
+    tools = FakeReadTools(results={
+        "get_my_order_status": SimpleNamespace(success=False, data={}, answer="", error="fact_not_found")
+    })
+    provider = FakeProvider([
+        {"name": "get_my_order_status", "arguments": {"query": "ORD-1"}},
+        {"name": "get_my_order_status", "arguments": {"query": "ORD-1 帮我查明细"}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="查订单"))
+    assert len(tools.calls) == 2, "参数不同的重试不应被拦截"
+    assert outcome.stopped_reason != "duplicate_call_skipped"

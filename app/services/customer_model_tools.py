@@ -175,19 +175,20 @@ _INTENT_TO_TOOL = {
 
 def _uncovered_intents(planned_intents: list[str] | None,
                        results: list[dict]) -> list[str]:
-    """规计划中的意图里，哪些尚未被任何成功结果覆盖。
+    """计划中的意图里，哪些尚未被任何成功结果覆盖。
 
-    用"意图→所需工具"映射 + 已成功结果里的 `intent`/`data.tool` 比对。
-    知识类意图共用 search_customer_knowledge，故只按该工具是否被成功调用过判断。
+    判定依据：已成功结果里的 `intent` 字段（**不**用 `data.tool` 兜底）。
+
+    为什么不能用"工具是否被调用过"兜底（ISSUE-20260914-COVERAGE-FALSE-POSITIVE）：
+    多个知识类意图共用 `search_customer_knowledge`，若按工具判覆盖，
+    则"只检索了 company_info"会被误判为"company_business 也已覆盖"。
+    实测该 query 模型 4 轮全用 intent=company_info，company_business **从未检索**，
+    但旧逻辑返回 pending=[]（判定已覆盖），导致图少一个 task 且兜底不触发。
     """
     if not planned_intents:
         return []
-    covered_tools: set[str] = set()
     covered_intents: set[str] = set()
     for item in results:
-        data = item.get("data") or {}
-        if data.get("tool"):
-            covered_tools.add(str(data["tool"]))
         if item.get("intent"):
             covered_intents.add(str(item["intent"]))
 
@@ -195,11 +196,8 @@ def _uncovered_intents(planned_intents: list[str] | None,
     for intent in planned_intents:
         if intent in covered_intents:
             continue
-        needed = _INTENT_TO_TOOL.get(intent)
-        if needed is None:
+        if _INTENT_TO_TOOL.get(intent) is None:
             # 未知意图（如 greeting/human_handoff/business_operation）不由只读工具覆盖，跳过
-            continue
-        if needed in covered_tools:
             continue
         pending.append(intent)
     return pending
@@ -343,6 +341,7 @@ class CustomerModelToolLoop:
         """
         outcome = ModelToolOutcome()
         context_lines: list[str] = []
+        seen_calls: set[str] = set()   # 已执行过的 (工具, 参数) 组合，用于重复调用闸门
         planned_block = ""
         if planned_intents:
             planned_block = (
@@ -387,6 +386,26 @@ class CustomerModelToolLoop:
 
             tool_name = str(decision.get("name") or "").strip()
             arguments = decision.get("arguments") or {}
+
+            # 重复调用闸门：完全相同的 (工具, 参数) 重复调用在确定性工具上必然得到相同结果，
+            # 继续下去只是浪费预算与配额。实测"我的订单 ORD-123456 状态"连续 4 轮传入完全相同的
+            # 参数，4 次都失败、无任何结果（ISSUE-20260914-TOOL-FAILURE-NOT-FEED-BACK）。
+            call_key = f"{tool_name}:{json.dumps(arguments, sort_keys=True, ensure_ascii=False)}"
+            if call_key in seen_calls:
+                outcome.rounds.append(ToolRound(
+                    round_index=round_index, tool=tool_name, arguments=arguments,
+                    success=False, error="duplicate_call_skipped"))
+                await self._audit(customer_id=customer_id, conversation_id=conversation_id,
+                                  round_index=round_index, tool=tool_name, arguments=arguments,
+                                  success=False, error="duplicate_call_skipped",
+                                  evidence_status=None, citations=0)
+                # 明确告知模型"该调用已试过"，并结束——再循环不会有新信息
+                context_lines.append(
+                    f"[{tool_name}] 该调用（参数={arguments}）本轮已执行过且结果相同，不再重复。"
+                )
+                outcome.stopped_reason = "duplicate_call_skipped"
+                break
+            seen_calls.add(call_key)
 
             # 硬白名单：模型编造工具名（或试图写操作）在此被拒
             if tool_name not in _ALLOWED_TOOL_NAMES:
@@ -461,7 +480,22 @@ class CustomerModelToolLoop:
                 # 导致 task 丢失（实测 graph 只剩 1 个 task，管线有 2 个）。
                 context_lines.append(f"[{tool_name}] {result.answer[:600]}")
             else:
-                context_lines.append(f"[{tool_name}] 未取得结果（{result.error}）")
+                # 失败也要把**具体原因 + 已试过的参数**回灌，否则模型只能重复同样的调用。
+                # 实测："我的订单 ORD-123456 状态" 模型 4 轮都传同一 query、4 次全失败，
+                # stopped_reason=budget_exhausted 且无任何结果
+                # （ISSUE-20260914-TOOL-FAILURE-NOT-FED-BACK）。
+                failure_hint = {
+                    "fact_not_found": "未查到该对象（可能是订单号/工单号不存在或不属于当前客户），"
+                                      "请换一个更明确的查询对象，或不要再重复相同参数。",
+                    "ambiguous_product": "产品不明确，请补充完整产品名称。",
+                    "low_confidence": "知识库无匹配依据，请改写 query 换个说法再试一次；"
+                                      "若已改写两次以上仍失败，请停止调用。",
+                    "route_mismatch": "该工具与查询意图不匹配，请改用其他工具。",
+                    "tool_not_allowed": "该工具不允许调用。",
+                }.get(str(result.error or ""), "请调整参数或改用其他工具，不要重复相同调用。")
+                context_lines.append(
+                    f"[{tool_name}] 调用失败（error={result.error}，参数={arguments}）→ {failure_hint}"
+                )
                 if round_index == self.max_rounds:
                     outcome.stopped_reason = "budget_exhausted"
         else:
