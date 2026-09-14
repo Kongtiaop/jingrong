@@ -18,6 +18,28 @@ async def _call_chat(provider, **kwargs):
 class CustomerRagAnswer:
     answer: str
     generation_status: str
+    # 生成的答案是否**自述资料不足**（半成功：拿到了引用，但引用不足以完整回答）
+    # 依据 generate() 的提示词要求："如果引用不足以回答，必须明确说资料不足并建议转人工"。
+    # 这是 ISSUE-20260914-NO-PARTIAL-STATE 的中间态信号：此前只有 succeeded/failed 两态，
+    # 导致"引用了相关制度但答不出具体流程"被标成 succeeded+completed，用户误以为问题已解决。
+    insufficient: bool = False
+
+
+# 模型被要求"引用不足时明确说资料不足"，故用固定表述做结构化识别。
+# 宁可漏判（回落到 succeeded）也不误判：只在答案**明确自述缺口**时才置位。
+_INSUFFICIENT_MARKERS = (
+    "资料不足", "资料中未", "资料未", "引用中未", "引用资料中未", "引用内容中未",
+    "未包含", "未提供", "未明确", "未提及", "无法提供准确", "无法准确回答",
+    "没有足够依据", "未找到",
+)
+
+
+def answer_reports_insufficient(text: str) -> bool:
+    """答案是否自述"资料不足/引用未涵盖"——用于判定半成功。"""
+    body = (text or "").strip()
+    if not body:
+        return False
+    return any(marker in body for marker in _INSUFFICIENT_MARKERS)
 
 
 def build_answerability_judge(provider: QwenProvider):
@@ -90,7 +112,9 @@ class CustomerRagAnswerService:
             )
             text = (response.choices[0].message.content or "").strip()
             if not text:
-                return CustomerRagAnswer(answer=result.message, generation_status="empty_response")
-            return CustomerRagAnswer(answer=text, generation_status="generated")
+                return CustomerRagAnswer(answer=result.message, generation_status="empty_response",
+                                         insufficient=True)
+            return CustomerRagAnswer(answer=text, generation_status="generated",
+                                     insufficient=answer_reports_insufficient(text))
         except Exception:  # noqa: BLE001
             return CustomerRagAnswer(answer="当前回答服务暂时不可用，已保留检索依据并建议转人工客服。", generation_status="generation_failed")

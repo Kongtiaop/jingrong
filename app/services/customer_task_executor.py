@@ -257,18 +257,36 @@ class CustomerTaskExecutor:
 
     @staticmethod
     def summarize(results: list[TaskExecutionResult], *, requires_handoff: bool = False) -> tuple[str, str | None, str]:
-        """Return stable overall status, first clarification, and aggregate answer."""
+        """Return stable overall status, first clarification, and aggregate answer.
+
+        状态语义（含中间态）：
+        - `completed`          ：全部 task 成功且证据完整。
+        - `partially_answered` ：有 task **拿到了引用并生成了答案，但答案自述资料不足**
+                                 （引用相关却不完整）。与 `partially_completed` 的区别：
+                                 后者是"部分 task 失败"，前者是"任务都在、但答案不完整"。
+                                 此前缺失该状态，导致"答了但没答全"被标成 `completed`
+                                 （ISSUE-20260914-NO-PARTIAL-STATE）。
+        - `partially_completed`：部分 task 成功、部分失败/需澄清。
+        - `needs_clarification` / `failed` / `blocked_by_human`：见下。
+        """
         if requires_handoff:
             status = "handoff"
         elif not results:
             status = "needs_clarification"
         else:
             succeeded = sum(item.status == "succeeded" for item in results)
+            # "已作答"包含完整成功与半成功（partially_answered 也是答了，只是不完整）
+            answered = sum(item.status in {"succeeded", "partially_answered"} for item in results)
+            partial_answer = any(item.status == "partially_answered" for item in results)
             needs_clarification = any(item.status in {"needs_clarification", "needs_confirmation"} for item in results)
             failed = any(item.status in {"failed", "blocked"} for item in results)
             if succeeded == len(results):
                 status = "completed"
-            elif succeeded and (needs_clarification or failed):
+            elif partial_answer and not (needs_clarification or failed):
+                # 全部 task 都已作答（无失败/待澄清），只是答案自述不完整 → 中间态
+                status = "partially_answered"
+            elif answered and (needs_clarification or failed):
+                # 部分 task 作答（含半成功）、部分失败/待澄清
                 status = "partially_completed"
             elif needs_clarification:
                 status = "needs_clarification"

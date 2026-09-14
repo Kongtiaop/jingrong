@@ -480,7 +480,10 @@ def test_budget_exhausted_when_model_keeps_calling():
 
     assert len(outcome.rounds) == 3, f"应恰好用满 3 轮，实际 {len(outcome.rounds)}"
     assert outcome.stopped_reason == "budget_exhausted"
-    assert outcome.results == []
+    # 失败结果现保留为 task 结果（语义与管线对齐，见 ISSUE-20260914-TOOL-FAILURE-DROPPED），
+    # 但状态必须是失败/待澄清类，绝不能标 succeeded。
+    assert all(r["status"] != "succeeded" for r in outcome.results), \
+        "失败的工具结果不得标记为 succeeded"
 
 
 def test_model_unavailable_degrades_without_exception():
@@ -502,11 +505,16 @@ def test_no_tool_call_returns_empty_for_fallback():
     assert outcome.called_any is False
 
 
-def test_failed_tool_result_is_recorded_but_no_success_result():
-    """工具失败 → 记账但不出成功结果，且把**失败原因+参数**回灌模型。
+def test_failed_tool_result_is_recorded_as_clarification():
+    """工具失败 → 保留为 task 结果（needs_clarification），并回灌失败原因+参数。
 
-    回归 ISSUE-20260914-TOOL-FAILURE-NOT-FEED-BACK：旧实现只回灌 error 字符串，
-    模型不知道该怎么调整，于是重复同样的调用直到预算耗尽（实测 4 轮全失败）。
+    回归两条：
+    - ISSUE-20260914-TOOL-FAILURE-NOT-FEED-BACK：旧实现只回灌 error 字符串，
+      模型不知道该怎么调整，于是重复同样的调用直到预算耗尽（实测 4 轮全失败）。
+    - ISSUE-20260914-TOOL-FAILURE-DROPPED：旧实现失败时**不产出 task 结果**，
+      导致 `fact_not_found` 的"请补充信息"语义丢失、回退确定性 ReAct 后误转人工。
+      现与管线 `CustomerTaskExecutor._execute_one` 对齐：
+      `fact_not_found`/`ambiguous_product` → needs_clarification。
     """
     tools = FakeReadTools(results={
         "get_my_order_status": SimpleNamespace(
@@ -522,7 +530,10 @@ def test_failed_tool_result_is_recorded_but_no_success_result():
 
     assert outcome.rounds[0].success is False
     assert outcome.rounds[0].error == "fact_not_found"
-    assert outcome.results == []
+    # 失败结果被保留，且语义为"需补充信息"而非 succeeded
+    assert outcome.results, "失败结果应保留为 task 结果（否则丢失 fact_not_found 语义）"
+    assert outcome.results[0]["status"] == "needs_clarification"
+    assert outcome.results[0]["clarification"], "应带有'请补充信息'的 clarification"
     # 回灌内容必须含失败原因、已试参数与可执行的调整建议
     feedback = provider.calls[1]["user"]
     assert "fact_not_found" in feedback, "应回灌具体 error"
@@ -650,3 +661,65 @@ def test_near_duplicate_with_different_args_is_allowed():
     outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="查订单"))
     assert len(tools.calls) == 2, "参数不同的重试不应被拦截"
     assert outcome.stopped_reason != "duplicate_call_skipped"
+
+
+# ---------- 中间态：partially_answered（答了但没答全） ----------
+# ISSUE-20260914-NO-PARTIAL-STATE：此前只有 succeeded/failed 两态，导致
+# "拿到相关引用、生成了答案，但答案自述资料不足"被标成 succeeded → summarize 判
+# `completed`，用户看到"资料不足"却被告知问题已解决。
+# 实测"开户流程是怎样的"：graph 答"引用中未包含开户流程步骤…资料聚焦于X" 却报 completed。
+
+def test_answer_reports_insufficient_detects_self_reported_gap():
+    """答案自述"引用未包含/资料不足"应被识别。"""
+    from app.services.customer_rag_answer import answer_reports_insufficient
+    assert answer_reports_insufficient("引用内容中未包含开户流程的具体步骤，资料不足。")
+    assert answer_reports_insufficient("引用资料中未提供该项说明")
+    assert answer_reports_insufficient("无法准确回答该问题")
+
+
+def test_answer_reports_insufficient_ignores_complete_answers():
+    """完整答案不应被误判为不足（宁漏判不误判）。"""
+    from app.services.customer_rag_answer import answer_reports_insufficient
+    assert not answer_reports_insufficient("根据引用，本公司主营基金销售与保险经纪业务。")
+    assert not answer_reports_insufficient("")
+    assert not answer_reports_insufficient("您的总资产为 302,361.52 元。")
+
+
+def test_summarize_returns_partially_answered_for_insufficient_answer():
+    """全部 task 都已作答、但答案自述不足 → partially_answered（而非 completed）。"""
+    from app.services.customer_task_executor import CustomerTaskExecutor, TaskExecutionResult
+    results = [TaskExecutionResult("t1", "workflow", "partially_answered",
+                                   answer="引用中未包含开户流程步骤。",
+                                   clarification="可补充更具体的信息或转人工客服。")]
+    status, clarification, answer = CustomerTaskExecutor.summarize(results)
+    assert status == "partially_answered", f"应为中间态，实际 {status}"
+    assert clarification
+    assert "未包含开户流程" in answer
+
+
+def test_summarize_completed_when_all_succeeded():
+    """证据完整时仍是 completed（中间态不干扰正常路径）。"""
+    from app.services.customer_task_executor import CustomerTaskExecutor, TaskExecutionResult
+    results = [TaskExecutionResult("t1", "faq", "succeeded", answer="完整答案")]
+    status, _, _ = CustomerTaskExecutor.summarize(results)
+    assert status == "completed"
+
+
+def test_summarize_partial_answer_with_failure_is_partially_completed():
+    """半成功 + 有 task 失败 → 仍是 partially_completed（粒度更粗的状态优先）。"""
+    from app.services.customer_task_executor import CustomerTaskExecutor, TaskExecutionResult
+    results = [
+        TaskExecutionResult("t1", "workflow", "partially_answered", answer="未包含细节"),
+        TaskExecutionResult("t2", "policy", "needs_clarification", answer=""),
+    ]
+    status, _, _ = CustomerTaskExecutor.summarize(results)
+    assert status == "partially_completed"
+
+
+def test_partially_answered_is_distinct_from_needs_clarification():
+    """中间态必须区别于 needs_clarification——前者有答案，后者没有。"""
+    from app.services.customer_task_executor import CustomerTaskExecutor, TaskExecutionResult
+    partial = [TaskExecutionResult("t1", "workflow", "partially_answered", answer="部分答案")]
+    clarify = [TaskExecutionResult("t1", "workflow", "needs_clarification", answer="")]
+    assert CustomerTaskExecutor.summarize(partial)[0] == "partially_answered"
+    assert CustomerTaskExecutor.summarize(clarify)[0] == "needs_clarification"

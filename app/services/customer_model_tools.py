@@ -496,6 +496,34 @@ class CustomerModelToolLoop:
                 context_lines.append(
                     f"[{tool_name}] 调用失败（error={result.error}，参数={arguments}）→ {failure_hint}"
                 )
+                # 失败结果也必须**保留为 task 结果**（而非只回灌给模型就丢弃）。
+                # 原因（ISSUE-20260914-TOOL-FAILURE-DROPPED）：
+                # 管线把 `fact_not_found` / `ambiguous_product` 映射为 **needs_clarification**
+                # （"请补充更明确的查询对象或订单/产品信息"），而不是失败或转人工。
+                # 若这里丢弃失败结果，`outcome.results` 为空 → `_route_after_model_tool`
+                # 回退到确定性 ReAct（对 order_status 走知识检索）→ 检索不到 → low_confidence
+                # → 误转人工。实测"我的订单 ORD-123456 状态"图 requires_handoff=True 而管线 False。
+                intent_label = (
+                    str(intent) if tool_name == "search_customer_knowledge" and intent
+                    else _EXPECTED_ROUTE.get(tool_name, tool_name)
+                )
+                # 与管线 CustomerTaskExecutor._execute_one 的语义对齐：
+                #   fact_not_found / ambiguous_product → needs_clarification（请用户补充）
+                #   其他 → failed
+                needs_clarification = str(result.error or "") in {"fact_not_found", "ambiguous_product"}
+                if not any(r["intent"] == intent_label for r in outcome.results):
+                    outcome.results.append({
+                        "task_id": f"model-tool-{round_index}",
+                        "intent": intent_label,
+                        "status": "needs_clarification" if needs_clarification else "failed",
+                        "answer": result.answer or "",
+                        "data": {**data, "execution_mode": "model_tool_selection", "tool": tool_name},
+                        "error": result.error,
+                        "clarification": (
+                            "请补充更明确的查询对象或订单/产品信息。"
+                            if needs_clarification else None
+                        ),
+                    })
                 if round_index == self.max_rounds:
                     outcome.stopped_reason = "budget_exhausted"
         else:

@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 202 条真 bug 修复记录。
+- 共 203 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1941,6 +1941,30 @@ stopped_reason = budget_exhausted      results = []
 **解决**：覆盖判定**只按结果里的 `intent` 字段**，**移除 `data.tool` 兜底**。共用工具的不同意图必须各自被检索过才算覆盖；`greeting`/`human_handoff`/`business_operation` 等映射为 `None` 的非只读意图仍跳过（不参与兜底）。
 **验证**：新增测试 `test_knowledge_intents_sharing_one_tool_are_still_tracked_individually`——模型只检索 `company_info` 时，`company_business` 必须被识别为未覆盖并被补齐。**用"退回工具兜底"确认该测试会失败**。`tests 350 passed`。
 **教训**：**"共用资源的意图"不能用资源维度判覆盖**——`company_info` 与 `company_business` 语义不同但共用检索工具，按工具粒度判定必然假阳性。凡"多对一"映射，覆盖判定必须落在**细粒度（intent）**上。
+
+### ISSUE-20260914-NO-PARTIAL-STATE
+- 日期：2026-09-14
+- 分类：Agent / 状态语义 / 用户体验
+- 严重程度：P2（语义失真，非功能故障）
+**问题**：`开户流程是怎样的` 出现"答案内容好但状态失真"：图的答案**自述资料不足**却报 `completed`：
+```
+pipeline: needs_clarification + requires_handoff=True   "当前知识库没有足够依据，建议转人工客服…"
+graph:    completed + requires_handoff=False
+          "根据您提供的资料，引用内容中未包含开户流程的具体步骤…资料主要聚焦于：投资者分类/适当性管理/风险等级划分…"
+```
+用户看到"资料不足"的答案，却被系统标记为**已完成**。
+**排查澄清（推翻了我此前的两个错误假设）**：
+1. 我曾以为这是"图丢掉了已有答案"→ 实测图**保留了**答案且有 5 条引用。
+2. 我曾以为是我上一轮"收窄 judge 区间"的副作用（放行了不相关引用）→ 实测 `workflow` 的原文 `best_sim=0.5043` **落在 judge 区间 [0.35,0.55) 内，judge 判了 yes**；两种模式对照显示 judge=False 时原文是 `low_confidence`、judge=True 时变 `sufficient`——**judge 主动认为引用包含相关制度依据**。
+3. 即：**这不是 bug，是真实的中间态**——检索到了相关制度文档（引用确实相关），但文档中没有"开户流程步骤"这一具体答案。生成时 LLM 如实说明了缺口。
+**根因**：**状态机缺少中间态**。`TaskExecutionResult.status` 只有 `succeeded`/`failed`/`needs_clarification` 等，没有"答了但不完整"。于是 `summarize` 只能判 `completed`，**无法区分"完整作答"与"答了但资料不足"**——与 `ISSUE-20260914-COMPLETED-STATUS-MASKED-BY-DROPPED-TASK` 同族（`overall_status` 无法表达真实完成度）。
+**解决**：
+1. `CustomerRagAnswer` 新增 `insufficient` 字段，`generate()` 依据**提示词已有要求**（"如果引用不足以回答，必须明确说资料不足"）结构化识别答案自述缺口（`answer_reports_insufficient()`，宁可漏判不误判）。
+2. `generate_node` 在 `insufficient=True` 时把 task 标为 **`partially_answered`**，并补一句 clarification（"当前资料未完全覆盖该问题，可补充更具体的信息或转人工客服"）。
+3. `summarize` 新增 `partially_answered` 判定：**全部 task 都已作答（无失败/待澄清）但答案自述不完整** → `partially_answered`（区别于 `partially_completed`="部分 task 失败"）。同时把 `partially_answered` 计入"已作答"，使"半成功 + 有失败"正确落到 `partially_completed`（而非误落 `needs_clarification`——该 bug 由新测试当场抓出）。
+**验证**：新增 6 个测试——自述缺口识别、完整答案不误判、全半成功→`partially_answered`、全成功→`completed`、半成功+失败→`partially_completed`、**中间态必须区别于 `needs_clarification`（前者有答案、后者没有）**。`tests 356 passed`。
+**影响**：`overall_status` 现可表达三档完成度（`completed` / `partially_answered` / `partially_completed`），前端与 `ApiResponse` 均按字符串透传（`overall_status: str` 无枚举约束），无需改契约。
+**待观察**：`partially_answered` 是新增状态，前端目前只做通用展示；若要做差异化 UI（如"部分回答"标签 + 追问入口），需前端配合。
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 

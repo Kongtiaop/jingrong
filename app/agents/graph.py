@@ -507,6 +507,16 @@ class SupervisorGraph:
                 query=state.react_query or state.user_message, result=rag_result)
             r["answer"] = generated.answer
             r["data"] = {**(r.get("data") or {}), "generation_status": generated.generation_status}
+            # 中间态：拿到了引用、生成了答案，但答案**自述资料不足**（引用没覆盖问题本身）。
+            # 此前只有 succeeded/failed 两态，这类"半成功"被标成 succeeded → summarize 判
+            # `completed`，用户看到"资料不足"却被告知问题已解决
+            # （ISSUE-20260914-NO-PARTIAL-STATE）。
+            # 注意：不置 handoff（引用确实相关，只是不完整），仅标记状态供下游如实表达。
+            if getattr(generated, "insufficient", False):
+                r["status"] = "partially_answered"
+                r["data"] = {**r["data"], "insufficient_evidence": True}
+                if not r.get("clarification"):
+                    r["clarification"] = "当前资料未完全覆盖该问题，可补充更具体的信息或转人工客服。"
             out.append(r)
             changed = True
         return {"task_results": out} if changed else {}
