@@ -636,18 +636,39 @@ class SupervisorGraph:
             return "persist_node"
         return "route_node"
 
+    # 只有这些"只读查询"意图才允许进入模型自主工具轮。
+    # 其余意图都有**专用确定性路径**，交给知识检索工具处理会产生错误结果
+    # （ISSUE-20260914-MODEL-TOOL-MISROUTES-NON-RAG-INTENTS）：
+    #   - product_recommendation → SuitabilityService（实时 Product + 适当性），走 RAG 只会拿到
+    #     "产品推荐使用实时 Product 数据…"这类短路占位串被当成答案；
+    #   - greeting → CustomerTaskExecutor 的固定话术，走 RAG 变成"检索+生成"多绕一圈，
+    #     且生成失败时用户看到"当前回答服务暂时不可用"；
+    #   - human_handoff → 直接转人工；business_operation → 交易草稿（绝不进只读工具）。
+    MODEL_TOOL_INTENTS = frozenset({
+        "asset_summary", "order_status", "workorder_status", "risk_restriction", "product_status",
+        "company_info", "company_business", "faq", "workflow", "policy", "risk_public",
+    })
+
+    @classmethod
+    def _model_tool_applicable(cls, plan: IntentPlan) -> bool:
+        """plan 是否全部由"模型工具轮可处理的只读查询意图"构成。"""
+        tasks = getattr(plan, "tasks", None) or []
+        return bool(tasks) and all(t.intent in cls.MODEL_TOOL_INTENTS for t in tasks)
+
     def _route_after_plan(self, state: AgentState) -> str:
         """按意图类型与澄清状态决定下一节点：模型工具轮 / 确定性 ReAct / 确定性执行 / clarify / handoff。
 
         只读查询优先走模型自主工具调度（若已启用并注入了 factory）；否则回退确定性 ReAct。
+        **意图级门禁**：非只读查询意图（推荐/问候/转人工/交易草稿）一律不进模型工具轮，
+        它们各有专用确定性路径，交给知识检索工具会产出错误答案。
         """
         if state.plan.get("clarification"):
             if state.clarification_count + 1 >= 2:
                 return "handoff_node"
             return "clarify_node"
-        if self._model_tool_selection_enabled():
-            return "model_tool_node"
         plan = _rebuild_plan(state.plan)
+        if self._model_tool_selection_enabled() and self._model_tool_applicable(plan):
+            return "model_tool_node"
         if self.react_tool is not None and self._is_readonly_knowledge(plan):
             return "react_step_node"
         return "execute_node"

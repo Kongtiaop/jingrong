@@ -364,6 +364,55 @@ def test_fact_tool_duplicate_is_deduplicated():
     assert len(outcome.results) == 1, "同 intent 重复调用应去重"
 
 
+# ---------- intent 硬门禁：知识检索工具不得承载非知识类意图 ----------
+# ISSUE-20260914-MODEL-TOOL-MISROUTES-NON-RAG-INTENTS：模型曾用 search_customer_knowledge
+# 去答 product_recommendation / greeting / human_handoff，拿到 RAG 的短路占位串
+# （"产品推荐使用实时 Product 数据…"）当成答案，导致对照 DIFF。
+
+@pytest.mark.parametrize("bad_intent", [
+    "product_recommendation", "greeting", "human_handoff", "business_operation", "unknown",
+])
+def test_non_knowledge_intent_is_coerced_to_faq(bad_intent):
+    """知识检索工具收到非知识类 intent 时必须回落为 faq，不得透传。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "search_customer_knowledge",
+         "arguments": {"query": "q", "intent": bad_intent}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q"))
+    assert tools.calls, "工具应被调用"
+    assert tools.calls[0]["intent"] == "faq", \
+        f"{bad_intent} 不应透传给知识检索（会被 RAG 短路成占位串）"
+
+
+@pytest.mark.parametrize("good_intent", sorted({
+    "company_info", "company_business", "faq", "workflow", "policy", "risk_public",
+}))
+def test_knowledge_intents_pass_through_unchanged(good_intent):
+    """合法知识类 intent 必须原样透传（否则会丢失多意图语义）。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "search_customer_knowledge",
+         "arguments": {"query": "q", "intent": good_intent}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q"))
+    assert tools.calls[0]["intent"] == good_intent
+
+
+def test_knowledge_intents_whitelist_excludes_dedicated_paths():
+    """白名单本身不得含任何"有专用确定性路径"的意图。"""
+    from app.services.customer_model_tools import _KNOWLEDGE_INTENTS
+    must_exclude = {"product_recommendation", "greeting", "human_handoff",
+                    "business_operation", "asset_summary", "order_status",
+                    "workorder_status", "risk_restriction", "product_status"}
+    assert not (_KNOWLEDGE_INTENTS & must_exclude), \
+        f"白名单混入了专用路径意图: {_KNOWLEDGE_INTENTS & must_exclude}"
+
+
 def test_model_can_chain_knowledge_then_stop():
     """知识类工具可续调补充，模型不再调用时结束。"""
     tools = FakeReadTools()

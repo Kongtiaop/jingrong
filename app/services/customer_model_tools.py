@@ -139,6 +139,13 @@ CUSTOMER_READ_TOOL_SCHEMAS: list[dict] = [
 # 双重校验——即使模型返回未声明/写操作工具名，也会在此被拒。
 _ALLOWED_TOOL_NAMES = frozenset(item["function"]["name"] for item in CUSTOMER_READ_TOOL_SCHEMAS)
 
+# search_customer_knowledge 允许的 intent 白名单：**只含公开知识类**。
+# product_recommendation / greeting / human_handoff / business_operation 等
+# 都有专用确定性路径，绝不由知识检索工具承担（越界会产出错误答案）。
+_KNOWLEDGE_INTENTS = frozenset({
+    "company_info", "company_business", "faq", "workflow", "policy", "risk_public",
+})
+
 # 期望路由：工具名 → CustomerQueryRouter 的 route，用于校验工具与意图一致
 _EXPECTED_ROUTE = {
     "get_my_workorder_status": "workorder_status",
@@ -393,9 +400,15 @@ class CustomerModelToolLoop:
                 outcome.stopped_reason = "tool_not_allowed"
                 break
 
-            # customer_id 由服务端注入，模型无法指定查谁（防越权）
+            # 客户身份由服务端注入，模型无法指定查谁（防越权）
             tool_query = str(arguments.get("query") or query)
             intent = arguments.get("intent")
+            # intent 硬门禁：search_customer_knowledge 只处理**公开知识类**意图。
+            # 防止模型把 product_recommendation / greeting / human_handoff 等
+            # "有专用确定性路径"的意图塞进知识检索——那会让 RAG 的短路占位串被当成答案
+            # （ISSUE-20260914-MODEL-TOOL-MISROUTES-NON-RAG-INTENTS）。
+            if tool_name == "search_customer_knowledge" and intent not in _KNOWLEDGE_INTENTS:
+                intent = "faq"
             entities = {k: v for k, v in arguments.items() if k == "product_name" and v}
 
             result = await self.tools.execute(

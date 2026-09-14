@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 199 条真 bug 修复记录。
+- 共 200 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1887,6 +1887,21 @@ pipeline 路径：
 **顺带修复**：加信号量时引入 `asyncio` 但**忘记 import**——新测试立刻以 `NameError` 暴露（若进生产会在**首次 LLM 调用**即崩溃）。已补 `import asyncio`。**这是"写测试"直接拦下一个生产级崩溃的实例。**
 **验证**：新增 `tests/test_llm_resource_guard.py` 共 8 个测试，钉住：SDK 重试被显式限制且 client 实际采用、信号量按 limit 复用同一实例、信号量确实限制并发峰值（8 任务并发上限 2）、`chat_completions` 源码确实经过信号量、工具轮超时短于普通对话、`request_tool_call` 显式传 timeout、**最坏延迟有界**（`超时 × (1+重试)` 普通 ≤60s、工具轮 ≤30s）。**用"还原重试/超时/信号量"确认 4 个测试会失败**。`tests 324 passed`。
 **影响**：对照/评测结果重新可信（不再混入资源耗尽的假 DIFF）；生产 `--workers 4` 下的配额打满风险受控。配置已透传 `docker-compose.yml` / `docker-compose.p0.yml`（`QWEN_MAX_RETRIES` / `QWEN_MAX_CONCURRENCY` / `QWEN_TOOL_CALL_TIMEOUT_SECONDS`）。**注意：`MODEL-TOOL-MISROUTES-NON-RAG-INTENTS` 与调用量放大本身（④只在必要时启用）仍未解决。**
+
+### ISSUE-20260914-MODEL-TOOL-INTENT-GATE-IMPLEMENTED
+- 日期：2026-09-14
+- 分类：Agent / 模型工具轮 / 意图级门禁
+- 严重程度：P1
+**问题**：落实 `ISSUE-20260914-MODEL-TOOL-MISROUTES-NON-RAG-INTENTS` 的修复方案 ①+②。此前 `_route_after_plan` 只判断"开关是否开启"，**对所有意图**都放行到 `model_tool_node`，于是：
+- `你好`（greeting）→ 模型调 `search_customer_knowledge` → `CustomerRagService` 返回 greeting 短路文案 → 再经 `generate_node` 让 LLM "基于该文案生成" → **生成失败时用户看到"当前回答服务暂时不可用，已保留检索依据并建议转人工客服。"**（对照中 `你好` 的 graph 侧正是此文案）
+- `推荐适合我的产品`（product_recommendation）→ RAG 短路返回 `"产品推荐使用实时 Product 数据和适当性服务，不依赖当前缺失的产品 RAG 文档。"` 被当成推荐答案；而**真正的推荐应由 `SuitabilityService`（实时 Product + 适当性）完成**
+- `我想转人工客服`（human_handoff）→ 本应直接转人工，却先做了一轮知识检索并生成一段"未找到转人工路径"的长文
+**根因**：模型工具轮**缺少意图级门禁**——把"模型自主选工具"错误地扩大到了**所有**查询，包括那些**已有专用确定性路径**的意图。工具语义边界未被约束。
+**解决（两层门禁）**：
+1. **路由层**（`graph.py`）：新增 `MODEL_TOOL_INTENTS` 白名单（只含只读查询类：`asset_summary`/`order_status`/`workorder_status`/`risk_restriction`/`product_status` + 知识类 `company_info`/`company_business`/`faq`/`workflow`/`policy`/`risk_public`）与 `_model_tool_applicable(plan)`；`_route_after_plan` 改为**必须同时满足"开关开启"且"意图适用"**才进模型工具轮，否则回退确定性分支（`react_step_node`/`execute_node`）。`product_recommendation`/`greeting`/`human_handoff`/`business_operation`/`unknown` 一律排除。
+2. **工具层**（`customer_model_tools.py`）：新增 `_KNOWLEDGE_INTENTS` 白名单，`search_customer_knowledge` 收到**非知识类 intent** 时强制回落为 `faq`，防止模型绕过路由层直接构造越界调用。
+**验证**：新增测试——非知识类 intent 被强制回落 faq（5 个参数化）、合法知识 intent 原样透传（6 个参数化）、白名单不含专用路径意图、专用路径意图**端到端路由**不得进入模型工具轮（3 个参数化，断言实际 `_route_after_plan` 决策而非仅白名单函数）、`unknown` 不进模型工具轮、只读查询意图保留模型调度。**用"移除意图门禁"确认路由层 3 个测试会失败**（首次写法只测白名单函数，撤销路由条件后仍通过——已改为测实际路由决策，避免假绿）。`tests 346 passed`。
+**效果**：`你好`/`推荐适合我的产品`/`我想转人工客服` 回归各自确定性路径，与管线语义一致；`查我的持仓`/`我有没有风险限制`/`公司主营业务` 等**只读查询仍享受模型自主工具调度**（本次改造的目标得以保留）。
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 

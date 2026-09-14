@@ -127,6 +127,78 @@ class FakeKnowledgeTool:
                   "citations": [{"chunk_id": f"{intent}-c1", "content": f"{intent} 内容"}]})
 
 
+# ---------- 模型工具轮的意图级门禁（回归：越界导致错误答案） ----------
+# ISSUE-20260914-MODEL-TOOL-MISROUTES-NON-RAG-INTENTS：model_tool_node 曾对**所有**查询生效，
+# 于是 product_recommendation/greeting/human_handoff 也被丢给知识检索工具，
+# 拿到 RAG 短路占位串当答案（"产品推荐使用实时 Product 数据…"）。
+
+@pytest.mark.parametrize("query,expected_intent", [
+    ("你好", "greeting"),
+    ("推荐适合我的产品", "product_recommendation"),
+    ("我想转人工客服", "human_handoff"),
+])
+def test_dedicated_path_intents_excluded_from_model_tool(query, expected_intent):
+    """有专用确定性路径的意图不得进入模型工具轮。
+
+    必须测**实际路由决策**（_route_after_plan），而不只是白名单函数——
+    否则路由条件被改回"只看开关"时测试不会失败。
+    """
+    from app.services.customer_intent import CustomerIntentPlanner
+    from app.agents.graph import _plan_to_dict
+
+    plan = CustomerIntentPlanner().plan(query)
+    assert [t.intent for t in plan.tasks] == [expected_intent]
+    assert SupervisorGraph._model_tool_applicable(plan) is False, \
+        f"{expected_intent} 不应进模型工具轮"
+
+    # 端到端：即使用户开了模型工具开关，路由也必须把它导向确定性节点
+    supervisor = SupervisorGraph(model_tool_loop_factory=lambda **kw: None, database=object())
+    supervisor._model_tool_selection_enabled = lambda: True   # 强制开关为开
+    state = _state(user_message=query)
+    state.plan = _plan_to_dict(plan)
+    assert supervisor._route_after_plan(state) != "model_tool_node", \
+        f"{expected_intent} 被误路由到模型工具轮"
+
+
+@pytest.mark.parametrize("query", [
+    "查一下我的持仓", "我的资产有多少", "我有没有风险限制",
+    "你们公司的主营业务是什么",
+])
+def test_readonly_query_intents_allowed_in_model_tool(query):
+    """只读查询类意图应保留模型自主工具调度能力。"""
+    from app.services.customer_intent import CustomerIntentPlanner
+    plan = CustomerIntentPlanner().plan(query)
+    assert SupervisorGraph._model_tool_applicable(plan) is True, \
+        f"{query} 应走模型工具轮"
+
+
+def test_unknown_intent_does_not_enter_model_tool():
+    """"什么是双录" 规划为 unknown（规则未识别），不应进模型工具轮。
+
+    实测该 query 管线与图均为 needs_clarification（对照 OK），
+    门禁把它交回确定性 execute_node 反而与管线一致。
+    """
+    from app.services.customer_intent import CustomerIntentPlanner
+    plan = CustomerIntentPlanner().plan("什么是双录")
+    assert [t.intent for t in plan.tasks] == ["unknown"]
+    assert SupervisorGraph._model_tool_applicable(plan) is False
+
+
+def test_model_tool_intents_whitelist_matches_expectation():
+    """门禁白名单必须只含只读查询意图。"""
+    whitelist = SupervisorGraph.MODEL_TOOL_INTENTS
+    forbidden = {"product_recommendation", "greeting", "human_handoff", "business_operation"}
+    assert not (whitelist & forbidden), f"白名单混入专用路径意图: {whitelist & forbidden}"
+
+
+def test_model_tool_requires_enabled_flag():
+    """开关关闭时即便意图适用也不应进模型工具轮。"""
+    from app.services.customer_intent import CustomerIntentPlanner
+    plan = CustomerIntentPlanner().plan("查一下我的持仓")
+    supervisor = SupervisorGraph()   # 未注入 factory
+    assert supervisor._model_tool_selection_enabled() is False
+
+
 # ---------- 对照公平性：ReAct 预算与兜底文案必须与管线一致 ----------
 # ISSUE-20260914-REACT-BUDGET-AND-PLACEHOLDER-DIVERGENCE：图默认 4/8 而管线 20/20，
 # 同一 query 检索尝试次数不同 → 双跑对照本身不公平；且图的兜底文案自造，
