@@ -4,7 +4,11 @@ services:
     # ParadeDB pg16 镜像：含 pgvector(0.8.4) + pg_search(0.25.6)，PGDATA 仍为 /var/lib/postgresql/data，
     # 与既有 PG16 数据卷兼容。若需回退 tsvector 可换回 pgvector/pgvector:pg16。
     image: docker.m.daocloud.io/paradedb/paradedb:pg16
-    container_name: wealth-postgres
+    # 不设 container_name：container_name 是全局唯一、不受 project name 隔离，
+    # 而 docker-compose.yml 也硬编码了 wealth-postgres，两套 compose 会互相抢名字
+    # （ISSUE-20260914-COMPOSE-CONTAINER-NAME-VOLUME-CONFLICT）。
+    # 交给 Compose 自动命名为 wealth-p0-postgres-1，与 CI 已引用的 wealth-p0-api-1 风格一致，
+    # 使本地(wealth-manager)与生产/复现(wealth-p0)可并存互不干扰。
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-wealth_manager}
@@ -26,7 +30,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
-    container_name: wealth-redis
+    # 同上：不设 container_name，避免与 docker-compose.yml 的 wealth-redis 抢名字。
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
     ports:

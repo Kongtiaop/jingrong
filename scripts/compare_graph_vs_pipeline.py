@@ -21,6 +21,7 @@ import asyncio
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
 # `python scripts/x.py` 只会把 scripts/ 放进 sys.path，导致 `import app` 失败。
 # 这里显式补上仓库根目录，本地与容器内均可直接运行。
@@ -56,6 +57,21 @@ class ComparisonRow:
     error: str | None = None
 
 
+async def _reset_query_state(memory, *, customer_id: str, conversation_ids: list[str]) -> None:
+    """清掉本次 query 涉及的短时记忆，让两条路径处于同一初始状态。
+
+    为什么必须做：`clarification_count` 等状态存在 Redis 短时记忆里并按 conversation_id 累积。
+    若不清，前一条 query 写脏的计数会让后一条无关问句直接触发"澄清 2 次转人工"，
+    导致两条路径行为分叉——这是 ISSUE-20260914-CLARIFICATION-COUNT-BLEED 的成因。
+    此前只能靠人工 `redis-cli FLUSHDB`，现在脚本内置。
+    """
+    for conv in conversation_ids:
+        try:
+            await memory.clear_short_term(customer_id=customer_id, conversation_id=conv)
+        except Exception:  # noqa: BLE001 - 清理失败不阻塞对照
+            pass
+
+
 async def compare(*, customer_id: str, queries: list[str], use_checkpoint: bool,
                   conversation_prefix: str) -> list[ComparisonRow]:
     from app.core.settings import get_settings
@@ -63,6 +79,7 @@ async def compare(*, customer_id: str, queries: list[str], use_checkpoint: bool,
     from app.infrastructure.redis_client import RedisClient
     from app.services.customer_agent_execution import CustomerAgentExecutionService
     from app.services.graph_agent_runner import GraphAgentRunner, shadow_diff
+    from app.services.memory_service import CustomerMemoryService
 
     settings = get_settings()
     database = Database(settings)
@@ -75,13 +92,22 @@ async def compare(*, customer_id: str, queries: list[str], use_checkpoint: bool,
             conninfo_from_database_url(settings.database_url))
         print("checkpointer: postgres ready")
 
+    # 每次运行使用唯一前缀：避免上一次运行的短时记忆残留（工单号/计数/活跃产品）影响本次结果。
+    # 之前前缀固定为 "dualrun"，重复运行会复用同一批 Redis key，需人工 FLUSHDB。
+    run_id = f"{conversation_prefix}-{uuid4().hex[:8]}"
+    memory = CustomerMemoryService(database, redis_client.client)
+
     rows: list[ComparisonRow] = []
     try:
         for index, query in enumerate(queries):
             # 每次独立 conversation_id：避免两条路径互相污染短时记忆
-            conversation_id = f"{conversation_prefix}-{index}"
+            conversation_id = f"{run_id}-{index}"
             pipeline_conv = f"{conversation_id}-pipe"
             graph_conv = f"{conversation_id}-graph"
+
+            # 两条路径开跑前先清状态，保证初始条件一致（免手动 FLUSHDB）
+            await _reset_query_state(memory, customer_id=customer_id,
+                                     conversation_ids=[pipeline_conv, graph_conv])
 
             pipeline = await CustomerAgentExecutionService(
                 database, redis_client.client, settings=settings
