@@ -31,7 +31,8 @@ class AgentState(BaseModel):
     react_query: str = ""                              # 当前待处理查询（含改写）
     react_attempts: list[dict] = Field(default_factory=list)  # 每轮工具调用记录
     seen_signatures: list[str] = Field(default_factory=list)  # 结果哈希集合（早停）
-    react_result: dict | None = None                   # 循环结束时的任务结果
+    react_result: dict | None = None                   # 循环结束时的任务结果（最后一个 task）
+    react_results: list[dict] = Field(default_factory=list)  # 多意图：各 task 的最终结果累积
     # 上下文（intent_plan_node 从短时/长时/共享记忆装载，供规划与生成使用）
     conversation_id: str = ""                          # 用于短时记忆读写与 checkpointer thread_id
     conversation_context: str = ""                     # 共享记忆 conversation_summary

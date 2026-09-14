@@ -105,6 +105,90 @@ class ClearPlanner:
                           tasks=[IntentTask("t1", "asset_summary", "business_fact", query, confidence=.9)])
 
 
+class MultiKnowledgePlanner:
+    """"公司业务"同时命中 company_info + company_business（真实规划器会产出两个 task）。"""
+
+    def plan(self, query, context=None):
+        return IntentPlan(normalized_query=query, tasks=[
+            IntentTask("t1", "company_info", "rag_explanation", query, confidence=.70),
+            IntentTask("t2", "company_business", "rag_explanation", query, confidence=.75),
+        ])
+
+
+class FakeKnowledgeTool:
+    def __init__(self):
+        self.intents = []
+
+    async def execute(self, *, name, customer_id, query, intent, entities):
+        self.intents.append(intent)
+        return SimpleNamespace(
+            success=True, error=None, answer=f"{intent} 的答案",
+            data={"evidence_status": "sufficient",
+                  "citations": [{"chunk_id": f"{intent}-c1", "content": f"{intent} 内容"}]})
+
+
+# ---------- 多意图：ReAct 路径不得丢 task（真实回归 bug） ----------
+
+def test_react_loop_covers_all_knowledge_tasks():
+    """回归：此前 react_step_node 只取 plan.tasks[0]，多意图时后续 task 被静默丢弃。
+
+    真实案例：query "你们公司的主营业务是什么" 规划出 company_info + company_business，
+    管线产出 2 个结果，图只产出 1 个（对照脚本报 task_intents 差异）。
+    """
+    tool = FakeKnowledgeTool()
+    supervisor = SupervisorGraph(planner=MultiKnowledgePlanner(), react_tool=tool)
+    graph = supervisor.build()
+    final = asyncio.run(graph.ainvoke(_state(user_message="你们公司的主营业务是什么")))
+
+    intents = [r["intent"] for r in final["task_results"]]
+    assert intents == ["company_info", "company_business"], f"多意图 task 丢失: {intents}"
+    assert tool.intents == ["company_info", "company_business"]
+
+
+def test_react_generate_covers_all_knowledge_tasks():
+    """多意图下每个 task 都要经过 LLM 生成，不能只有第一个有答案。"""
+
+    class FakeGenerator:
+        def __init__(self):
+            self.queries = []
+
+        async def generate(self, *, query, result):
+            self.queries.append(result.intent)
+            return SimpleNamespace(answer=f"生成:{result.intent}", generation_status="generated")
+
+    gen = FakeGenerator()
+    supervisor = SupervisorGraph(planner=MultiKnowledgePlanner(), react_tool=FakeKnowledgeTool(),
+                                 answer_generator=gen)
+    graph = supervisor.build()
+    final = asyncio.run(graph.ainvoke(_state(user_message="公司业务")))
+
+    assert sorted(gen.queries) == ["company_business", "company_info"]
+    assert all(r["answer"].startswith("生成:") for r in final["task_results"])
+
+
+def test_single_knowledge_task_unchanged_by_multi_intent_support():
+    """单 task 路径行为不变（向后兼容）。"""
+
+    class SingleKnowledgePlanner:
+        def plan(self, query, context=None):
+            return IntentPlan(normalized_query=query,
+                              tasks=[IntentTask("t1", "policy", "rag_explanation", query, confidence=.8)])
+
+    gen_calls = []
+
+    class Gen:
+        async def generate(self, *, query, result):
+            gen_calls.append(1)
+            return SimpleNamespace(answer="单意图答案", generation_status="generated")
+
+    supervisor = SupervisorGraph(planner=SingleKnowledgePlanner(), react_tool=FakeKnowledgeTool(),
+                                 answer_generator=Gen())
+    final = asyncio.run(supervisor.build().ainvoke(_state(user_message="什么是双录")))
+    assert len(final["task_results"]) == 1
+    assert final["task_results"][0]["answer"] == "单意图答案"
+    assert len(gen_calls) == 1
+
+
 # ---------- 澄清计数语义（与管线对齐的核心风险点） ----------
 
 def test_clarify_increments_count_and_persists():

@@ -273,12 +273,29 @@ class SupervisorGraph:
         return patch
 
     # ---- 只读 ReAct 循环（LangGraph 条件回环） ----
+    def _react_task_index(self, state: AgentState) -> int:
+        """当前循环正在处理第几个 task（已完成数 = len(react_results)）。"""
+        return len(state.react_results)
+
     async def react_step_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
-        """只读知识意图的 ReAct 一步：调用知识工具，结果哈希早停，未完成则改写查询回环。"""
+        """只读知识意图的 ReAct 一步：调用知识工具，结果哈希早停，未完成则改写查询回环。
+
+        多意图：plan.tasks 可能含多个只读知识 task（如"公司"同时命中 company_info + company_business）。
+        此前只取 tasks[0]，后续 task 会被静默丢弃（管线会全部执行）。现按 react_results 长度推进到
+        下一个未完成的 task；每个 task 的结果累积进 react_results，最后由 react_done_node 汇总。
+        """
         if self.react_tool is None:
             raise RuntimeError("read-only ReAct 需要注入 react_tool")
         plan = _rebuild_plan(state.plan)
-        task = plan.tasks[0]
+        if not plan.tasks:
+            return {"react_result": None, "react_results": list(state.react_results)}
+
+        index = self._react_task_index(state)
+        if index >= len(plan.tasks):
+            # 所有 task 已处理完 → 结束循环
+            return {"react_result": dict(state.react_results[-1]) if state.react_results else None}
+
+        task = plan.tasks[index]
         query = state.react_query or task.query
         result = await self.react_tool.execute(
             name="search_customer_knowledge", customer_id=state.customer_id or "",
@@ -286,6 +303,7 @@ class SupervisorGraph:
         sig = CustomerTaskExecutor._result_signature(result)
         attempts = state.react_attempts + [{
             "tool": "search_customer_knowledge", "iteration": len(state.react_attempts) + 1,
+            "task_id": task.task_id, "intent": task.intent,
             "success": result.success, "error": result.error,
             "evidence_status": result.data.get("evidence_status") if result.data else None,
         }]
@@ -295,33 +313,50 @@ class SupervisorGraph:
         done = repeated or (result.success and citations) or len(attempts) >= self.max_iterations
         if done:
             ok = result.success and bool(citations)
+            finished = {
+                "task_id": task.task_id, "intent": task.intent,
+                "status": "succeeded" if ok else "needs_clarification",
+                "answer": result.answer if ok else "当前资料不足。",
+                "data": {**(result.data or {}), "execution_mode": "bounded_react", "tool_calls": attempts},
+                "error": None if ok else (result.error or "tool_budget_exhausted"),
+                "clarification": None if ok else "当前资料不足，可以补充问题或转人工客服。",
+            }
+            accumulated = list(state.react_results) + [finished]
+            is_last = index + 1 >= len(plan.tasks)
             return {
                 "react_attempts": attempts, "seen_signatures": seen,
-                "react_result": {
-                    "task_id": task.task_id, "intent": task.intent,
-                    "status": "succeeded" if ok else "needs_clarification",
-                    "answer": result.answer if ok else "当前资料不足。",
-                    "data": {**(result.data or {}), "execution_mode": "bounded_react", "tool_calls": attempts},
-                    "error": None if ok else (result.error or "tool_budget_exhausted"),
-                    "clarification": None if ok else "当前资料不足，可以补充问题或转人工客服。",
-                },
+                "react_results": accumulated,
+                # 只有全部 task 处理完才置 react_result，条件边据此决定是否继续回环
+                "react_result": finished if is_last else None,
+                # 进入下一个 task 时重置改写/查询，避免沿用上一个 task 的改写串
+                "react_query": "" if not is_last else query,
             }
         idx = len(state.react_attempts)
         next_q = f"{task.query} {_REWRITE_POOL[idx]}" if idx < len(_REWRITE_POOL) else query
         return {"react_query": next_q, "react_attempts": attempts, "seen_signatures": seen}
 
     async def react_done_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
+        if state.react_results:
+            return {"task_results": [dict(r) for r in state.react_results]}
         if state.react_result:
             return {"task_results": [dict(state.react_result)]}
         return {"task_results": []}
 
     async def generate_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
-        """只读 ReAct 命中引用后，调 LLM 基于引用生成最终答案（补全只读链路）。"""
+        """只读 ReAct 命中引用后，调 LLM 基于引用生成最终答案（补全只读链路）。
+
+        多意图：对每个命中的 task 各生成一次答案，避免只有第一个 task 有 LLM 答复。
+        """
         if not state.task_results or self.answer_generator is None:
             return {}
-        r = dict(state.task_results[0])
-        citations = (r.get("data") or {}).get("citations") or []
-        if r.get("status") == "succeeded" and citations:
+        out: list[dict] = []
+        changed = False
+        for raw in state.task_results:
+            r = dict(raw)
+            citations = (r.get("data") or {}).get("citations") or []
+            if r.get("status") != "succeeded" or not citations:
+                out.append(r)
+                continue
             rag_result = CustomerRagResult(
                 intent=r.get("intent", "faq"), answer_mode="rag_answer",
                 evidence_status=(r.get("data") or {}).get("evidence_status", "sufficient"),
@@ -341,8 +376,9 @@ class SupervisorGraph:
                 query=state.react_query or state.user_message, result=rag_result)
             r["answer"] = generated.answer
             r["data"] = {**(r.get("data") or {}), "generation_status": generated.generation_status}
-            return {"task_results": [r]}
-        return {}
+            out.append(r)
+            changed = True
+        return {"task_results": out} if changed else {}
 
     async def persist_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
         """落库收尾：短时记忆回写、活跃产品长时记忆、情景记忆提炼入队。
