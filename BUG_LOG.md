@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 179 条真 bug 修复记录。
+- 共 182 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1424,7 +1424,7 @@ Schema 缓存 key 如果不绑定权限上下文，用户 A 可能命中用户 B
 - 分类：Agent / 记忆 / 测试工具
 **问题**：图版 vs 管线版双跑对照中，"什么是双录""现金管理保本计划在售吗""这个那个"等**无关**查询在图里被判成 `handoff`（直接转人工），而管线判成 `needs_clarification`，一致率仅 7/14。
 **根因**：`clarification_count` 从 Redis 短时记忆读取（`graph.py` 与管线同逻辑），而对照脚本对两条路径使用**不同 conversation_id**（`-pipe`/`-graph` 后缀）→ 两条路径读到不同的 Redis key、计数状态不同步。更关键的是**同一路径跨 query 复用计数**：前一批查询把计数写脏后，后续任何澄清问句都会因 `clarification_count + 1 >= 2` 直接转人工，**跳过澄清**。属对照工具的设计缺陷，非路由逻辑错误。
-**解决**：定位手段为对照前执行 `redis-cli FLUSHDB` 清空短时记忆。根治方向（未做）：对照脚本应在每条 query 前重置该会话短时记忆，使两条路径处于同一初始状态。
+**解决**：定位手段为对照前执行 `redis-cli FLUSHDB` 清空短时记忆。**根治已完成**：对照脚本现内置两层隔离——每条 query 前 `clear_short_term()` 清两条路径的 key、每次运行用带随机后缀的 `run_id`（见 ISSUE-20260914-COMPARE-SCRIPT-STATEFUL-RERUN），不再需要人工 FLUSHDB。
 **验证**：`FLUSHDB` 后同一批 query 一致率 **7/14 → 11/14**，预测的 4 条全部从 `handoff` 翻回 `needs_clarification`，证实为计数污染而非路由错误。
 
 ### ISSUE-20260914-INTENT-FALLBACK-FACT-DOWNGRADE
@@ -1460,7 +1460,7 @@ Schema 缓存 key 如果不绑定权限上下文，用户 A 可能命中用户 B
 - 分类：部署 / Compose / 环境
 **问题**：本地 `docker compose up -d --build` 报 `Conflict. The container name "/wealth-postgres" is already in use`，服务起不来（但镜像已构建成功）。
 **根因**：`docker-compose.yml`（`name: wealth-manager`）与 `docker-compose.p0.yml`（`name: wealth-p0`）**硬编码了相同的 `container_name: wealth-postgres` / `wealth-redis`**，而 `container_name` 是**全局唯一**、不受 project name 隔离 → 两套 compose 互相抢名字。同时两者**卷名不同**（`docker-compose.yml` 用前缀默认卷 `wealth-manager_wealth_pgdata`；`docker-compose.p0.yml` 用 `name: wealth_pgdata` 固定卷名），因此混用时还可能连到**空卷**看到空库。此前本地曾混跑两套 compose，留下 `wealth-p0-*` 与 `wealth-postgres`/`wealth-redis` 残留容器（均已 Exited）。
-**解决**：清掉残留容器后统一用 `docker compose -f docker-compose.p0.yml up -d`（数据在固定卷 `wealth_pgdata`，`docker inspect wealth-postgres` 确认挂载即此卷；删容器不丢数据）。根治方向（未做）：去掉 `docker-compose.p0.yml` 的 `container_name`，改用自动命名（`wealth-p0-postgres-1`，与 CI 已有的 `wealth-p0-api-1` 风格一致），使两套 compose 可并存互不干扰。
+**解决**：清掉残留容器后统一用 `docker compose -f docker-compose.p0.yml up -d`（数据在固定卷 `wealth_pgdata`，`docker inspect wealth-postgres` 确认挂载即此卷；删容器不丢数据）。**根治已完成**：`docker-compose.p0.yml` 的 `container_name` 已移除（见 ISSUE-20260914-COMPOSE-CONTAINER-NAME-FIXED），改用自动命名 `wealth-p0-postgres-1`，两套 compose 现可并存互不干扰。
 **验证**：`docker compose -f docker-compose.p0.yml ps` 全部 11 个服务 Up，postgres/redis 均 healthy，API 8010 端口 health=ok。
 
 ### ISSUE-20260914-INTENT-TEMPLATE-LOSSY-CHANNEL
@@ -1510,4 +1510,38 @@ Schema 缓存 key 如果不绑定权限上下文，用户 A 可能命中用户 B
 **影响**：用户说"我偏好稳健"时，图不会写入长时记忆 → 后续会话/推荐无法复用该偏好；同一句话两条路径答复策略也不同（管线先确认、图直接推荐）。**因此"图优于管线"仅成立于意图识别维度**，完整看是"意图识别更稳、偏好链路缺失"。
 **解决**：**未做（切流前置项）**。需在图的 `intent_plan_node`（或新增 `preference_node`）补齐 `extract_preference_statement` + `remember` + `pure_preference_statement` 短路，补齐后方可与管线谈等价替换。
 **验证**：`grep -c "pure_preference_statement\|extract_preference_statement" app/agents/graph.py` → 0；管线对应命中见上述行号。
+
+### ISSUE-20260914-COMPARE-SCRIPT-STATEFUL-RERUN
+- 日期：2026-09-14
+- 分类：工具脚本 / 测试可信度
+**问题**：`scripts/compare_graph_vs_pipeline.py` 的 `--prefix` 默认值固定为 `"dualrun"`，导致**每次运行复用同一批 `conversation_id`**（`dualrun-7-graph` 等）→ 上一轮的短时记忆（转人工工单号、`clarification_count`、`active_product`）被下一轮继承。**观测证据**：相隔多轮、中间重建过镜像的两次运行，转人工工单号完全相同（`WO202609140445419AB4A3`）——正常应每次新生成。此前靠人工 `redis-cli FLUSHDB` 掩盖了该问题。
+**根因**：脚本设计时只考虑了"同一轮内两条路径要隔离"（分别用 `-pipe`/`-graph` 后缀），**未考虑"跨轮次运行之间也要隔离"**。`FLUSHDB` 是外部手工补救而非脚本保证，一旦忘记执行，对照结果就不可复现、且可能把残留状态误判成编排差异（与 ISSUE-20260914-CLARIFICATION-COUNT-BLEED 同源，但那条只暴露了同一轮内跨 query 的污染，本条暴露的是跨运行污染）。
+**解决**：脚本内建两层隔离——① 每条 query 执行前调 `CustomerMemoryService.clear_short_term()` 清掉 `-pipe`/`-graph` 两个 key，保证两条路径初始状态一致（免手动 FLUSHDB）；② 每次运行生成 `run_id = f"{prefix}-{uuid4().hex[:8]}"`，彻底避免跨运行残留。
+**验证**：`python scripts/compare_graph_vs_pipeline.py --help` 在未设 `PYTHONPATH` 下 rc=0；`tests 267 passed`；`docker compose config` 两份均通过。
+
+### ISSUE-20260914-INTENT-FALLBACK-DEFAULT-LAYERING
+- 日期：2026-09-14
+- 分类：文档 / 配置 / 认知偏差
+**问题**：多份文档（`答辩面试实现细节手册.md`、`_draft_agents.md`、`面试速记卡.md`、`面试问答-与叶绍康相关.md`、`系统接线现状与接线后预测.md` 等 6 份）均表述"**LLM 回退默认关闭**"，读者会据此认为线上是纯规则路径。**实际线上是开启的**——排查 ISSUE-20260914-INTENT-FALLBACK-FACT-DOWNGRADE 时正是被这一表述误导，一度把生产降级缺陷当成"只有 shadow 模式、不影响执行"而未优先处理。
+**根因**：**默认值分三层，文档只写了其中一层**：
+| 层 | 值 |
+|---|---|
+| `app/core/settings.py` 代码默认 | `False` |
+| `docker-compose.p0.yml:69`（生产/CI 部署，实际生效） | `${LLM_INTENT_FALLBACK_ENABLED:-true}` → **开启** |
+| 本地 `.env` | 视配置 |
+
+文档只引用 `settings.py` 的 `False`，**漏了 compose 的覆盖**。而 `.github/workflows/ci-cd.yml` 部署走的正是 `docker-compose.p0.yml`，所以"代码默认"与"线上实际"不一致。
+**解决**：6 份文档统一改为区分三层的准确表述（"代码默认关 / p0 compose 生产默认开"），并在 `系统接线现状与接线后预测.md` 的 N10 条目补记该开关开启后暴露的降级缺陷链接。`docs/` 按 `.gitignore` 不入库，故为本地修正。
+**验证**：`Select-String docs/*.md -Pattern "默认关闭"` 逐条复核，确认剩余命中均为已修正的三层说明或与 LLM 回退无关（如图的三开关、断点续跑）。
+**通用教训**：**排查"某能力是否生效"时，必须追到部署清单（compose）的最终值，不能只看代码默认值**——本项目 `docker-compose.yml` 与 `docker-compose.p0.yml` 的 environment 是白名单且带 `${VAR:-default}` 覆盖，代码默认与线上实际可以完全不同（同类问题亦见于三开关是否透传，见 ISSUE-20260914-LANGGRAPH-NOT-WIRED）。
+
+### ISSUE-20260914-COMPOSE-CONTAINER-NAME-FIXED
+- 日期：2026-09-14
+- 分类：部署 / Compose
+**问题**：落实 ISSUE-20260914-COMPOSE-CONTAINER-NAME-VOLUME-CONFLICT 中记录的"根治方向（未做）"——去掉 `docker-compose.p0.yml` 的 `container_name`，使本地与生产两套 compose 可并存，不再互相抢 `wealth-postgres`/`wealth-redis` 名字。
+**根因**：`container_name` 全局唯一、不受 `name:`（project）隔离，而 `docker-compose.yml`（project `wealth-manager`）与 `docker-compose.p0.yml`（project `wealth-p0`）**硬编码了同一组容器名**；同时两者卷名不同（前者用前缀默认卷 `wealth-manager_wealth_pgdata`，后者用 `name: wealth_pgdata` 固定卷），混用时既冲突又可能连到空卷。
+**解决**：删除 `docker-compose.p0.yml` 中 postgres/redis 的 `container_name`，交由 Compose 自动命名 `wealth-p0-postgres-1`/`wealth-p0-redis-1`——与 CI 已在使用的 `wealth-p0-api-1` 命名风格一致。**卷不受影响**：`volumes: wealth_pgdata: name: wealth_pgdata` 是显式固定名，与容器名无关，数据保留。
+**风险核对**：确认 `.github/workflows/ci-cd.yml` 仅引用 `wealth-p0-api-1`（第 85 行 `docker logs`）与端口健康检查（`curl 127.0.0.1:8010/api/v1/health`），**不依赖 postgres/redis 容器名**，故改动不影响 CD。
+**升级注意**：已部署环境执行 `up -d` 后 postgres/redis 会换新容器名，旧容器变为孤儿；建议 `docker rm -f wealth-postgres wealth-redis` 清理，**数据在固定卷 `wealth_pgdata` 中不受影响**。
+**验证**：`docker compose -f docker-compose.p0.yml config --quiet` 通过；改动后 `container_name` 仅存在于注释中。
 
