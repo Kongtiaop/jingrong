@@ -48,6 +48,16 @@ class Settings(BaseSettings):
     llm_intent_fallback_timeout_seconds: float = 8.0
     llm_intent_fallback_max_concurrency: int = 4
 
+    # LangGraph Supervisor 真图接线（渐进式三开关，默认全关 → 生产仍走确定性管线）
+    # agent_graph_enabled：API 真正改走 SupervisorGraph 编译图（会替换管线执行）。
+    agent_graph_enabled: bool = False
+    # agent_graph_shadow_enabled：管线照常返回用户，图在后台并行跑一遍，差异写审计。切流前的对照期用。
+    agent_graph_shadow_enabled: bool = False
+    # agent_checkpoint_enabled：把图状态持久化到 Postgres（断点续跑）；thread_id = conversation_id。
+    agent_checkpoint_enabled: bool = False
+    agent_graph_max_iterations: int = 4
+    agent_graph_max_tool_calls: int = 8
+
     jwt_secret: str = Field(default="change-me-in-development-please-rotate-32", repr=False)
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440

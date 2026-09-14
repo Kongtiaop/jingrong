@@ -17,12 +17,7 @@ def memory_checkpointer() -> Any:
     return MemorySaver()
 
 
-def postgres_checkpointer(conninfo: str, *, loop: Any | None = None) -> Any:
-    """PostgreSQL 持久化 Checkpointer（生产跨实例恢复）。
-
-    依赖 `langgraph-checkpoint-postgres` 包与一个可用的 async 连接池。
-    未装包会给出安装提示；装好后 `await cp.setup()` 建表即可用。
-    """
+def _load_saver_class() -> Any:
     try:
         # v3.x 异步 saver 在 .aio 子模块；旧版在顶层
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver as _Saver
@@ -33,10 +28,45 @@ def postgres_checkpointer(conninfo: str, *, loop: Any | None = None) -> Any:
             raise RuntimeError(
                 "Postgres Checkpointer 需要额外依赖。请先：pip install 'langgraph-checkpoint-postgres' psycopg[binary] psycopg-pool"
             ) from exc
+    return _Saver
+
+
+def postgres_checkpointer(conninfo: str, *, min_size: int = 1, max_size: int = 5) -> Any:
+    """PostgreSQL 持久化 Checkpointer（生产跨实例恢复）。
+
+    依赖 `langgraph-checkpoint-postgres` 包与一个可用的 async 连接池。
+    未装包会给出安装提示；装好后 `await cp.setup()` 建表即可用。
+
+    min_size/max_size 必须显式给：psycopg_pool 的 min_size 默认是 4，只传 max_size<4 会直接
+    ValueError；而 min_size=4 意味着每个 API 进程一启动就常驻 4 条空闲连接，多 worker 部署
+    （uvicorn --workers N）会放大成 N×4。故这里显式 min_size=1。
+
+    注意：本函数只构造、不开池。直接用 `ensure_postgres_checkpointer()` 一步到位。
+    """
+    _Saver = _load_saver_class()
     from psycopg_pool import AsyncConnectionPool
     # autocommit=True：setup() 里 CREATE INDEX CONCURRENTLY 不能在事务块内执行
-    pool = AsyncConnectionPool(conninfo=conninfo, max_size=5, kwargs={"autocommit": True})
+    pool = AsyncConnectionPool(conninfo=conninfo, min_size=min_size, max_size=max_size,
+                               open=False, kwargs={"autocommit": True})
     return _Saver(pool)
+
+
+async def ensure_postgres_checkpointer(conninfo: str, *, min_size: int = 1, max_size: int = 5) -> Any:
+    """async 工厂：建池 → 开池 → setup() 建表，一步到位。生产接线用这个。
+
+    调用方负责在应用 shutdown 时 `await cp.conn.close()` 关池。
+    """
+    saver = postgres_checkpointer(conninfo, min_size=min_size, max_size=max_size)
+    pool = saver.conn
+    await pool.open(wait=True, timeout=15)
+    await saver.setup()
+    return saver
+
+
+def conninfo_from_database_url(database_url: str) -> str:
+    """asyncpg URL → psycopg 连接串（checkpointer 走 psycopg，不共用 asyncpg 引擎）。"""
+    import re
+    return re.sub(r"^postgresql\+asyncpg://", "postgresql://", database_url)
 
 
 def thread_config(thread_id: str) -> dict:

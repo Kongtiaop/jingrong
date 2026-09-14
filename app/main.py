@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from app.api import api_router
 from app.common.exceptions import AppException, app_exception_handler, validation_exception_handler
 from app.common.logging import configure_logging
+from app.common.logging.config import get_logger
 from app.common.middleware.trace import TraceIdMiddleware
 from app.core.settings import get_settings
 from app.db.health import DatabaseHealth
@@ -26,6 +27,8 @@ from app.services.trading_service import TradingService
 from app.services.data_catalog_seed import ensure_data_catalog_seed
 from app.services.understanding_config import understanding_config
 from sqlalchemy import text
+
+logger = get_logger(__name__)
 
 # 启动初始化跨进程互斥锁键（任意稳定整数；多 worker 各自实例共用此键）
 _STARTUP_LOCK_KEY = 727001
@@ -87,9 +90,25 @@ async def lifespan(app: FastAPI):
             "keep DATABASE_BACKEND=postgresql and run MySQL validation scripts separately"
         )
     app.state.trading_service = TradingService(settings=settings)
+    # LangGraph 断点续跑：仅当开关打开才建 Postgres checkpointer（会建表 + 占连接池）。
+    # 失败不阻塞启动：图在无 checkpointer 时仍可跑，只是没有跨进程断点。
+    app.state.agent_checkpointer = None
+    if getattr(settings, "agent_checkpoint_enabled", False):
+        try:
+            from app.agents.checkpointer import conninfo_from_database_url, ensure_postgres_checkpointer
+            app.state.agent_checkpointer = await ensure_postgres_checkpointer(
+                conninfo_from_database_url(settings.database_url))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent_checkpointer_init_failed err=%s: %s", type(exc).__name__, exc)
     try:
         yield
     finally:
+        checkpointer = getattr(app.state, "agent_checkpointer", None)
+        if checkpointer is not None:
+            try:
+                await checkpointer.conn.close()
+            except Exception:  # noqa: BLE001
+                pass
         await redis_client.close()
         await database.dispose()
 

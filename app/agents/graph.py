@@ -13,7 +13,7 @@ from app.services.knowledge_retrieval import KnowledgeCitation
 
 
 class PlanProvider(Protocol):
-    def plan(self, query: str) -> IntentPlan: ...
+    def plan(self, query: str, context: dict | None = None) -> IntentPlan: ...
 
 
 class TaskExecutor(Protocol):
@@ -33,6 +33,9 @@ class AnswerGenerator(Protocol):
 
 
 _REWRITE_POOL = ["请提供官方流程、适用条件和注意事项", "请说明相关制度或流程，并给出依据"]
+
+# 长时记忆可读白名单（与 customer_agent_execution.LONG_TERM_READ_KEYS 保持一致）
+LONG_TERM_READ_KEYS = {"active_product", "risk_preference", "product_preference", "investment_horizon_preference"}
 
 
 def _rebuild_plan(plan_dict: dict) -> IntentPlan:
@@ -63,35 +66,144 @@ def _plan_to_dict(plan: IntentPlan) -> dict:
     }
 
 
+def _active_product_from_short_term(short_term: dict) -> str | None:
+    """从短时记忆里取"当前对话活跃产品"，供指代消解（与管线同逻辑）。"""
+    ap = short_term.get("active_product")
+    if isinstance(ap, str) and ap.strip():
+        return ap.strip()
+    for res in reversed(short_term.get("task_results") or []):
+        if not isinstance(res, dict):
+            continue
+        data = res.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        rec = data.get("recommendation") or {}
+        matches = rec.get("matches") or []
+        if matches and isinstance(matches[-1], dict) and matches[-1].get("name"):
+            return str(matches[-1]["name"])
+        for key in ("product_name", "name"):
+            if data.get(key):
+                return str(data[key])
+    return None
+
+
+def _active_product_from_results(results) -> str | None:
+    """从本轮执行结果里取活跃产品（供持久化到短时记忆）。"""
+    for res in reversed(results):
+        data = res.data or {}
+        rec = data.get("recommendation") or {}
+        matches = rec.get("matches") or []
+        if matches and isinstance(matches[-1], dict) and matches[-1].get("name"):
+            return str(matches[-1]["name"])
+        for key in ("product_name", "name"):
+            if data.get(key):
+                return str(data[key])
+    return None
+
+
 class SupervisorGraph:
     """真实编排 LangGraph 图：把确定性编排管线映射成可编译/可运行的状态图。
 
-    节点：intent_plan → route → (澄清条件分支：clarify / handoff / execute) → summarize。
+    节点：intent_plan → route → (澄清条件分支：clarify / handoff / execute
+          / 只读 ReAct 回环 react_step→react_done→generate) → summarize → persist → END。
+
     每个节点复用现有确定性 handler（CustomerIntentPlanner / route_for_plan /
     CustomerTaskExecutor / CustomerTaskExecutor.summarize），故"图"与"确定性管线"
     共享同一套业务逻辑，只是用 LangGraph 显式表达节点、边与条件路由。
-    planner / executor 可注入（测试传 fake），默认用真实实现。
+
+    planner / executor / react_tool / answer_generator 可注入（测试传 fake），默认用真实实现。
+    database / redis_client 可选注入：不给则图退化为"纯逻辑图"（不读写记忆、不建工单），
+    仍可编译运行 —— 现有单测走这条路。给全则 persist/clarify/handoff 节点补齐管线全部副作用。
     """
 
     def __init__(self, *, planner: PlanProvider | None = None, executor: TaskExecutor | None = None,
                  react_tool: ReadOnlyTool | None = None, answer_generator: AnswerGenerator | None = None,
+                 database: Any | None = None, redis_client: Any | None = None,
                  max_iterations: int = 4, max_tool_calls: int = 8) -> None:
         self.planner = planner or CustomerIntentPlanner()
         self.executor = executor
         self.react_tool = react_tool
         self.answer_generator = answer_generator
+        self.database = database
+        self.redis_client = redis_client
         self.max_iterations = max_iterations
         self.max_tool_calls = max_tool_calls
+
+    # ---- 记忆辅助（database 未注入时全部安全降级为空操作） ----
+    def _memory(self):
+        if self.database is None:
+            return None
+        from app.services.memory_service import CustomerMemoryService
+        return CustomerMemoryService(self.database, self.redis_client)
 
     @staticmethod
     def _is_readonly_knowledge(plan: IntentPlan) -> bool:
         """只读知识意图（走 LangGraph ReAct 循环）；其余（交易/风控等）走确定性节点。"""
         return bool(plan.tasks) and all(t.intent in CustomerTaskExecutor.REACT_INTENTS for t in plan.tasks)
 
+    def _plan(self, query: str, active_product: str | None) -> IntentPlan:
+        """调用 planner，兼容只接受单参数的轻量/测试实现。"""
+        try:
+            return self.planner.plan(query, context={"active_product": active_product})
+        except TypeError:
+            return self.planner.plan(query)
+
     # ---- 节点 ----
     async def intent_plan_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
-        plan = self.planner.plan(state.user_message)
-        return {"plan": _plan_to_dict(plan)}
+        """装载短时/长时/共享记忆，拼澄清补答 query，再规划。
+
+        与管线一致的关键点：
+        - 澄清补答时把 original_query + 本轮 user_message 拼接，否则规划器看不到原问题
+        - active_product 从短时记忆（或长时事实兜底）取，供指代消解
+        """
+        memory = self._memory()
+        short_term: dict = {}
+        if memory is not None and state.conversation_id:
+            try:
+                short_term = await memory.load_short_term(
+                    customer_id=state.customer_id or "", conversation_id=state.conversation_id)
+            except Exception:  # noqa: BLE001 - 记忆读取失败不阻塞主流程
+                short_term = {}
+
+        clarification_count = int(short_term.get("clarification_count") or state.clarification_count or 0)
+        pending = short_term.get("pending_intent_plan") or state.pending_intent_plan or {}
+        original_query = short_term.get("original_query") or state.user_message
+        combined = (f"{original_query} {state.user_message}".strip()
+                    if pending.get("tasks") and state.user_message != original_query
+                    else state.user_message)
+
+        facts: dict = {}
+        if memory is not None:
+            try:
+                rows = await memory.load_long_term(customer_id=state.customer_id or "")
+                facts = {r.key: str(r.value) for r in rows
+                         if getattr(r, "key", None) in LONG_TERM_READ_KEYS and getattr(r, "value", "")}
+            except Exception:  # noqa: BLE001
+                facts = {}
+
+        conversation_context = state.conversation_context
+        if self.database is not None and not conversation_context:
+            try:
+                from app.services.shared_memory_service import SharedMemoryService
+                shared = await SharedMemoryService(self.database, self.redis_client).recall(
+                    customer_id=state.customer_id or "", agent_type="customer_service",
+                    key="conversation_summary")
+                if shared:
+                    conversation_context = str(shared[0].value)
+            except Exception:  # noqa: BLE001 - 上下文读取失败不阻塞
+                conversation_context = ""
+
+        active_product = _active_product_from_short_term(short_term) or facts.get("active_product") or state.active_product
+        plan = self._plan(combined, active_product)
+        return {
+            "plan": _plan_to_dict(plan),
+            "clarification_count": clarification_count,
+            "pending_intent_plan": pending,
+            "combined_query": combined,
+            "active_product": active_product or "",
+            "long_term_facts": facts,
+            "conversation_context": conversation_context,
+        }
 
     async def route_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
         plan = _rebuild_plan(state.plan)
@@ -99,17 +211,22 @@ class SupervisorGraph:
         return {"route": route, "selected_agents": list(agents)}
 
     async def execute_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
-        if self.executor is None:
+        if self.executor is not None:
+            results = await self.executor.execute(customer_id=state.customer_id or "", plan=_rebuild_plan(state.plan))
+        elif self.database is not None:
+            # 与管线一致：注入 conversation_summary，否则生成质量与管线不等价
+            executor = CustomerTaskExecutor(self.database, conversation_summary=state.conversation_context)
+            results = await executor.execute(customer_id=state.customer_id or "", plan=_rebuild_plan(state.plan))
+        else:
             raise RuntimeError("SupervisorGraph 缺少 executor（真实运行需注入 CustomerTaskExecutor）")
-        plan = _rebuild_plan(state.plan)
-        results = await self.executor.execute(customer_id=state.customer_id or "", plan=plan)
         return {"task_results": [r.__dict__ for r in results]}
 
     async def summarize_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
         results = [TaskExecutionResult(**r) for r in state.task_results]
+        plan = _rebuild_plan(state.plan)
         overall, clarification, aggregate_answer = CustomerTaskExecutor.summarize(
-            results, requires_handoff=_rebuild_plan(state.plan).requires_handoff)
-        needs_handoff = _rebuild_plan(state.plan).requires_handoff or any(r.error == "low_confidence" for r in results)
+            results, requires_handoff=plan.requires_handoff)
+        needs_handoff = plan.requires_handoff or any(r.error == "low_confidence" for r in results)
         return {
             "overall_status": overall,
             "clarification": clarification,
@@ -118,19 +235,42 @@ class SupervisorGraph:
         }
 
     async def clarify_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
+        clarification = (state.plan or {}).get("clarification") or "请补充信息。"
         return {
             "overall_status": "needs_clarification",
             "clarification_count": state.clarification_count + 1,
-            "final_response": (state.plan or {}).get("clarification") or "请补充信息。",
+            "clarification": clarification,
+            "final_response": clarification,
         }
 
     async def handoff_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
-        return {
+        """转人工：建工单/客服会话，写入 state 供 runner 回给前端。"""
+        patch: dict[str, Any] = {
             "overall_status": "handoff",
             "clarification_count": state.clarification_count + 1,
             "final_response": "为避免反复追问，已为您转接人工客服。",
             "needs_handoff": True,
         }
+        if self.database is not None and state.customer_id:
+            try:
+                from app.services.customer_rag_handoff import CustomerRagHandoffService
+                plan = _rebuild_plan(state.plan)
+                intent = next((t.intent for t in plan.tasks if t.intent != "human_handoff"), "human_handoff")
+                evidence = "clarification_exhausted" if (state.plan or {}).get("clarification") else "customer_requested"
+                handoff = await CustomerRagHandoffService(self.database).handoff(
+                    customer_id=state.customer_id, query=state.combined_query or state.user_message,
+                    intent=intent, evidence_status=evidence, citations=[])
+                patch.update({
+                    "work_order_id": handoff.get("work_order_id"),
+                    "ticket_no": handoff.get("ticket_no"),
+                    "customer_service_session_id": handoff.get("customer_service_session_id"),
+                    "customer_service_session_status": handoff.get("customer_service_session_status"),
+                })
+                if handoff.get("ticket_no"):
+                    patch["final_response"] = f"为避免反复追问，已为您转接人工客服，工单号：{handoff['ticket_no']}。"
+            except Exception:  # noqa: BLE001 - 转人工失败仍返回话术，不阻塞
+                pass
+        return patch
 
     # ---- 只读 ReAct 循环（LangGraph 条件回环） ----
     async def react_step_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
@@ -197,11 +337,108 @@ class SupervisorGraph:
                 ) for c in citations],
                 handoff_required=False, message=r.get("answer", ""),
             )
-            generated = await self.answer_generator.generate(query=state.react_query or state.user_message, result=rag_result)
+            generated = await self.answer_generator.generate(
+                query=state.react_query or state.user_message, result=rag_result)
             r["answer"] = generated.answer
             r["data"] = {**(r.get("data") or {}), "generation_status": generated.generation_status}
             return {"task_results": [r]}
         return {}
+
+    async def persist_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
+        """落库收尾：短时记忆回写、活跃产品长时记忆、情景记忆提炼入队。
+
+        与管线 customer_agent_execution.py 的收尾段对齐。database 未注入时为空操作。
+        """
+        memory = self._memory()
+        if memory is None or not state.conversation_id:
+            return {"persisted": False}
+
+        results = [TaskExecutionResult(**r) for r in state.task_results]
+        active_product = _active_product_from_results(results) or state.active_product
+        plan = _rebuild_plan(state.plan)
+
+        # 只在需要时补建工单：summarize 判定 needs_handoff 但走的是 execute 分支（非 handoff_node）
+        patch: dict[str, Any] = {}
+        if state.needs_handoff and not state.ticket_no and state.customer_id:
+            try:
+                from app.services.customer_rag_handoff import CustomerRagHandoffService
+                low_conf = any(r.error == "low_confidence" for r in results)
+                handoff = await CustomerRagHandoffService(self.database).handoff(
+                    customer_id=state.customer_id, query=state.combined_query or state.user_message,
+                    intent=next((t.intent for t in plan.tasks if t.intent != "human_handoff"), "human_handoff"),
+                    evidence_status="low_confidence" if low_conf else "customer_requested", citations=[])
+                patch.update({
+                    "work_order_id": handoff.get("work_order_id"),
+                    "ticket_no": handoff.get("ticket_no"),
+                    "customer_service_session_id": handoff.get("customer_service_session_id"),
+                    "customer_service_session_status": handoff.get("customer_service_session_status"),
+                })
+            except Exception:  # noqa: BLE001
+                pass
+
+        handoff_state = None
+        if state.work_order_id or patch.get("work_order_id"):
+            handoff_state = {
+                "work_order_id": state.work_order_id or patch.get("work_order_id"),
+                "ticket_no": state.ticket_no or patch.get("ticket_no"),
+                "customer_service_session_id": state.customer_service_session_id or patch.get("customer_service_session_id"),
+                "customer_service_session_status": state.customer_service_session_status or patch.get("customer_service_session_status"),
+            }
+
+        try:
+            await memory.save_short_term(
+                customer_id=state.customer_id or "", conversation_id=state.conversation_id,
+                state={
+                    "conversation_id": state.conversation_id,
+                    "original_query": state.combined_query or state.user_message,
+                    "latest_query": state.user_message,
+                    "task_results": list(state.task_results),
+                    "plan_execution_modes": sorted({t.execution_mode for t in plan.tasks}),
+                    "clarification": state.clarification,
+                    "missing_parameter": bool(state.clarification),
+                    "clarification_count": state.clarification_count,
+                    "pending_intent_plan": {} if state.overall_status != "needs_clarification" else {
+                        "tasks": [t.__dict__ for t in plan.tasks],
+                        "execution_modes": sorted({t.execution_mode for t in plan.tasks}),
+                    },
+                    "handoff": handoff_state,
+                    "active_product": active_product or "",
+                })
+        except Exception:  # noqa: BLE001 - 记忆写入失败不阻塞
+            pass
+
+        if active_product and state.is_customer:
+            try:
+                await memory.remember(
+                    customer_id=state.customer_id or "", key="active_product", value=active_product,
+                    memory_type="conversation_fact", source="conversation",
+                    conversation_id=state.conversation_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 情景记忆后台提炼：每轮入队 memory.summary_extract，由 memory_worker 递进落库
+        try:
+            from uuid import uuid4
+            from app.models.outbox import OutboxEvent
+            async with self.database.session_factory() as session:
+                session.add(OutboxEvent(
+                    id=str(uuid4()), event_type="memory.summary_extract",
+                    aggregate_type="customer_memory", aggregate_id=state.customer_id,
+                    payload_json={
+                        "customer_id": state.customer_id, "conversation_id": state.conversation_id,
+                        "original_query": state.combined_query or state.user_message,
+                        "latest_query": state.user_message,
+                        "task_results": [r.answer for r in results if r.answer][:5],
+                        "active_product": active_product or "",
+                        "handoff_reason": "low_confidence" if any(r.error == "low_confidence" for r in results) else "",
+                    },
+                    status="pending",
+                ))
+                await session.commit()
+        except Exception:  # noqa: BLE001 - 摘要入队失败不阻塞
+            pass
+
+        return {"persisted": True, **patch}
 
     def _should_continue_react(self, state: AgentState) -> str:
         return "react_done_node" if state.react_result else "react_step_node"
@@ -232,6 +469,7 @@ class SupervisorGraph:
         g.add_node("react_step_node", self.react_step_node)
         g.add_node("react_done_node", self.react_done_node)
         g.add_node("generate_node", self.generate_node)
+        g.add_node("persist_node", self.persist_node)
 
         g.add_edge(START, "intent_plan_node")
         g.add_edge("intent_plan_node", "route_node")
@@ -245,7 +483,9 @@ class SupervisorGraph:
         g.add_edge("react_done_node", "generate_node")
         g.add_edge("generate_node", "summarize_node")
         g.add_edge("execute_node", "summarize_node")
-        g.add_edge("summarize_node", END)
-        g.add_edge("clarify_node", END)
-        g.add_edge("handoff_node", END)
+        # summarize 后统一落库收尾；handoff 已自行建单，clarify 需回写澄清态，两者都进 persist
+        g.add_edge("summarize_node", "persist_node")
+        g.add_edge("persist_node", END)
+        g.add_edge("clarify_node", "persist_node")
+        g.add_edge("handoff_node", "persist_node")
         return g.compile(checkpointer=checkpointer, interrupt_before=interrupt_before, interrupt_after=interrupt_after)

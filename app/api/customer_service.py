@@ -41,6 +41,8 @@ router = APIRouter(prefix="/customer-service/sessions", tags=["customer-service"
 ACTIVE_STATUSES = {"human_active"}
 RECLAIMABLE_STATUSES = {"waiting_human", "paused"}
 TERMINAL_STATUSES = {"resolved", "closed", "expired"}
+# 影子对照后台任务的强引用集合（asyncio 只持弱引用，不持有会被 GC 提前回收）
+_SHADOW_TASKS: set[asyncio.Task] = set()
 
 
 def _is_customer(user: User) -> bool:
@@ -196,6 +198,52 @@ async def intent_plan(request: Request, payload: CustomerServiceActionRequest, u
         ) for item in plan.tasks],
         clarification=plan.clarification, requires_handoff=plan.requires_handoff,
     ), trace_id=get_trace_id())
+
+
+async def _run_customer_agent(request: Request, *, user: User, conversation_id: str, query: str,
+                              is_customer: bool) -> CustomerTaskExecutionResponse:
+    """客户 Agent 统一入口：按开关决定走 LangGraph 真图还是确定性管线。
+
+    三开关语义（settings）：
+    - agent_graph_enabled：图作为权威路径执行并返回。
+    - agent_graph_shadow_enabled：管线照常返回用户；图在旁路跑一遍，差异写审计（切流前对照）。
+    - 两者都关（默认）：纯管线，与接入前行为完全一致。
+
+    影子只在管线路径上触发：图已经是权威时无需自我对照。
+    """
+    settings = request.app.state.settings
+    database = request.app.state.database
+    redis_client = request.app.state.redis.client
+    graph_enabled = bool(getattr(settings, "agent_graph_enabled", False))
+    shadow_enabled = bool(getattr(settings, "agent_graph_shadow_enabled", False))
+
+    if graph_enabled:
+        from app.services.graph_agent_runner import GraphAgentRunner
+        runner = GraphAgentRunner(
+            database, redis_client, settings=settings,
+            checkpointer=getattr(request.app.state, "agent_checkpointer", None))
+        return await runner.execute(
+            customer_id=user.id, conversation_id=conversation_id, query=query,
+            is_customer=is_customer, user_id=user.id,
+            role=next((r.code for r in user.roles), None))
+
+    result = await CustomerAgentExecutionService(
+        database, redis_client, settings=settings
+    ).execute(customer_id=user.id, conversation_id=conversation_id, query=query)
+
+    if shadow_enabled:
+        from app.services.graph_agent_runner import GraphAgentRunner
+        runner = GraphAgentRunner(
+            database, redis_client, settings=settings,
+            checkpointer=getattr(request.app.state, "agent_checkpointer", None))
+        # 不 await 阻塞响应：影子对照丢到后台任务，异常在 runner 内部已全部吞掉。
+        # 必须持有强引用：asyncio 只持弱引用，纯 fire-and-forget 任务可能被 GC 掉。
+        task = asyncio.create_task(runner.run_shadow(
+            customer_id=user.id, conversation_id=conversation_id, query=query,
+            pipeline_result=result, is_customer=is_customer))
+        _SHADOW_TASKS.add(task)
+        task.add_done_callback(_SHADOW_TASKS.discard)
+    return result
 
 
 @router.post("/agent/execute", response_model=ApiResponse[CustomerTaskExecutionResponse])
@@ -384,7 +432,9 @@ async def execute_unified_agent(request: Request, payload: UnifiedAgentRequest, 
                     clarification=None,
                 )
             else:
-                result = await CustomerAgentExecutionService(request.app.state.database, request.app.state.redis.client, settings=request.app.state.settings).execute(customer_id=user.id, conversation_id=conversation_id, query=payload.content)
+                result = await _run_customer_agent(
+                    request, user=user, conversation_id=conversation_id, query=payload.content,
+                    is_customer=True)
     selected = [agent for agent in result.agents if agent in available_agents]
     if not selected:
         if "CustomerServiceAgent" in available_agents:
@@ -408,7 +458,8 @@ async def execute_unified_agent(request: Request, payload: UnifiedAgentRequest, 
 @router.post("/execute-plan", response_model=ApiResponse[CustomerTaskExecutionResponse])
 async def execute_plan(request: Request, payload: CustomerServiceActionRequest, user: Annotated[User, Depends(current_user)]):
     conversation_id = request.headers.get("X-Conversation-Id") or str(uuid4())
-    result = await CustomerAgentExecutionService(request.app.state.database, request.app.state.redis.client, settings=request.app.state.settings).execute(customer_id=user.id, conversation_id=conversation_id, query=payload.note)
+    result = await _run_customer_agent(request, user=user, conversation_id=conversation_id,
+                                       query=payload.note, is_customer=_is_customer(user))
     result.route = "customer_service"
     result.agents = ["CustomerServiceAgent"]
     return ApiResponse(data=result, trace_id=get_trace_id())
@@ -452,7 +503,7 @@ async def customer_agent_websocket(websocket: WebSocket, conversation_id: str):
         try:
             if content.startswith("[cancel-test]"):
                 await asyncio.sleep(2)
-            result = await CustomerAgentExecutionService(websocket.app.state.database, websocket.app.state.redis.client, settings=websocket.app.state.settings).execute(customer_id=user.id, conversation_id=conversation_id, query=content)
+            result = await _run_customer_agent(websocket, user=user, conversation_id=conversation_id, query=content, is_customer=True)
             await emit("agent.progress", request_id, {"stage": "rendering", "display": "正在整理回复"})
             for chunk in display_chunks(result.answer):
                 await emit("agent.output.chunk", request_id, {"content": chunk})
