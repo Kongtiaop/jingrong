@@ -92,14 +92,20 @@ async def lifespan(app: FastAPI):
     app.state.trading_service = TradingService(settings=settings)
     # LangGraph 断点续跑：仅当开关打开才建 Postgres checkpointer（会建表 + 占连接池）。
     # 失败不阻塞启动：图在无 checkpointer 时仍可跑，只是没有跨进程断点。
+    # 但必须打 ERROR（而非 warning）：开关开着却没生效属于"静默降级"，运维会误以为断点续跑已启用。
     app.state.agent_checkpointer = None
     if getattr(settings, "agent_checkpoint_enabled", False):
         try:
             from app.agents.checkpointer import conninfo_from_database_url, ensure_postgres_checkpointer
             app.state.agent_checkpointer = await ensure_postgres_checkpointer(
                 conninfo_from_database_url(settings.database_url))
+            logger.info("agent_checkpointer_ready thread_id=conversation_id")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("agent_checkpointer_init_failed err=%s: %s", type(exc).__name__, exc)
+            logger.error(
+                "agent_checkpointer_init_failed err=%s: %s — "
+                "AGENT_CHECKPOINT_ENABLED=true 但断点续跑未生效，图将以无 checkpoint 模式运行",
+                type(exc).__name__, exc,
+            )
     try:
         yield
     finally:

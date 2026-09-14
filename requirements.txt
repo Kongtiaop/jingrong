@@ -18,7 +18,11 @@ argon2-cffi>=25,<26
 SQLAlchemy>=2.0.51,<3
 asyncpg>=0.31,<1
 aiomysql>=0.2,<1
-psycopg>=3.3,<4
+# psycopg[binary] 提供 libpq 后端（psycopg-binary 预编译 wheel）：LangGraph AsyncPostgresSaver
+# （断点续跑）走 psycopg，而 python:3.12-slim 基础镜像没有 libpq。只装裸 psycopg 会在 import 时报
+# "no pq wrapper available"，导致 AGENT_CHECKPOINT_ENABLED=true 时启动即失败。
+# 用 binary 无需 gcc/libpq-dev，不增加镜像构建复杂度。
+psycopg[binary]>=3.3,<4
 alembic>=1.18,<2
 pgvector>=0.3,<1
 
