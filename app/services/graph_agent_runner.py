@@ -131,16 +131,31 @@ class GraphAgentRunner:
     def _compiled(self):
         if self._graph is None:
             from app.agents.graph import SupervisorGraph
+            from app.services.customer_model_tools import CustomerModelToolLoop
             from app.services.customer_rag_answer import CustomerRagAnswerService
             from app.services.customer_tools import CustomerReadTools
             from app.infrastructure.qwen import QwenProvider
 
+            provider = QwenProvider(self.settings)
+            read_tools = CustomerReadTools(self.database)
+
+            def _model_tool_factory(*, max_rounds: int):
+                """模型自主工具调度：只读工具白名单 + 有界轮数 + 全程审计。
+
+                只读查询交由模型决定调哪个工具；资金/风控仍是确定性路径
+                （写操作不在工具集中，模型即使编造工具名也会被硬白名单拒绝）。
+                """
+                return CustomerModelToolLoop(
+                    provider=provider, tools=read_tools, database=self.database,
+                    max_rounds=max_rounds, model=None)
+
             graph = SupervisorGraph(
                 executor=self.executor,
-                react_tool=CustomerReadTools(self.database),
-                answer_generator=CustomerRagAnswerService(QwenProvider(self.settings)),
+                react_tool=read_tools,
+                answer_generator=CustomerRagAnswerService(provider),
                 database=self.database,
                 redis_client=self.redis_client,
+                model_tool_loop_factory=_model_tool_factory,
                 max_iterations=self.settings.agent_graph_max_iterations,
                 max_tool_calls=self.settings.agent_graph_max_tool_calls,
             )

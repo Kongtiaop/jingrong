@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     # （ISSUE-20260914-REACT-BUDGET-AND-PLACEHOLDER-DIVERGENCE）。
     agent_graph_max_iterations: int = 20
     agent_graph_max_tool_calls: int = 20
+    # 只读查询的**模型自主工具调度**（function calling）：由模型决定调哪个只读工具、传什么参数、
+    # 是否再调一轮。资金/风控仍走确定性路径（本开关只影响只读工具选择）。
+    # 关闭时回退到图的确定性 ReAct（工具名硬编码 + 固定模板改写）。
+    agent_model_tool_selection_enabled: bool = False
+    # 模型工具循环的最大轮数（防无限轮）；过大会拉高延迟，建议 2~4。
+    agent_model_tool_max_rounds: int = 4
 
     jwt_secret: str = Field(default="change-me-in-development-please-rotate-32", repr=False)
     jwt_algorithm: str = "HS256"

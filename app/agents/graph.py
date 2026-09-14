@@ -133,6 +133,7 @@ class SupervisorGraph:
     def __init__(self, *, planner: PlanProvider | None = None, executor: TaskExecutor | None = None,
                  react_tool: ReadOnlyTool | None = None, answer_generator: AnswerGenerator | None = None,
                  database: Any | None = None, redis_client: Any | None = None,
+                 model_tool_loop_factory: Any | None = None,
                  max_iterations: int | None = None, max_tool_calls: int | None = None) -> None:
         self.planner = planner or CustomerIntentPlanner()
         self.executor = executor
@@ -140,6 +141,9 @@ class SupervisorGraph:
         self.answer_generator = answer_generator
         self.database = database
         self.redis_client = redis_client
+        # 模型自主工具调度的构造器：签名 (max_rounds: int) -> CustomerModelToolLoop。
+        # 由 runner 注入（内部绑定 provider/tools/database）；缺省为 None → 走确定性 ReAct。
+        self.model_tool_loop_factory = model_tool_loop_factory
         # ReAct 预算默认直接取管线的常量，杜绝两条路径再次漂移
         # （历史上图默认 4/8 而管线 20/20，导致双跑对照不公平）。
         self.max_iterations = (max_iterations if max_iterations is not None
@@ -336,7 +340,52 @@ class SupervisorGraph:
                 pass
         return patch
 
-    # ---- 只读 ReAct 循环（LangGraph 条件回环） ----
+    # ---- 模型自主工具调度（只读查询；与确定性 ReAct 二选一） ----
+    def _model_tool_selection_enabled(self) -> bool:
+        """是否启用模型自主工具选择。未注入 provider/开关关闭时返回 False → 走确定性 ReAct。"""
+        if self.model_tool_loop_factory is None or self.database is None:
+            return False
+        try:
+            from app.core.settings import get_settings
+            return bool(getattr(get_settings(), "agent_model_tool_selection_enabled", False))
+        except Exception:  # noqa: BLE001 - 配置不可读时保守走确定性路径
+            return False
+
+    async def model_tool_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
+        """模型自主选择只读工具并循环，直到模型不再调用或预算用尽。
+
+        与 `react_step_node` 的区别：工具名、参数、改写、是否续调**全部由模型决定**，
+        而非硬编码 `search_customer_knowledge` + 2 条固定改写模板。
+        安全：模型只能从只读白名单里选（写操作进不来），customer_id 由服务端注入。
+        """
+        if self.model_tool_loop_factory is None:
+            raise RuntimeError("model_tool_node 需要注入 model_tool_loop_factory")
+        try:
+            from app.core.settings import get_settings
+            max_rounds = int(getattr(get_settings(), "agent_model_tool_max_rounds", 4))
+        except Exception:  # noqa: BLE001
+            max_rounds = 4
+
+        loop = self.model_tool_loop_factory(max_rounds=max_rounds)
+        outcome = await loop.run(
+            customer_id=state.customer_id or "",
+            conversation_id=state.conversation_id,
+            query=state.combined_query or state.user_message,
+        )
+        patch: dict[str, Any] = {
+            "model_tool_rounds": [r.__dict__ for r in outcome.rounds],
+            "model_tool_names": list(outcome.tool_names),
+            "model_tool_stopped_reason": outcome.stopped_reason,
+        }
+        if outcome.results:
+            patch["task_results"] = outcome.results
+        return patch
+
+    def _route_after_model_tool(self, state: AgentState) -> str:
+        """模型工具轮拿到结果 → 直接 summary；没拿到 → 回退确定性 ReAct。"""
+        return "summarize_node" if state.task_results else "react_step_node"
+
+    # ---- 只读 ReAct 循环（确定性兜底：工具名硬编码 + 固定模板改写） ----
     def _react_task_index(self, state: AgentState) -> int:
         """当前循环正在处理第几个 task（已完成数 = len(react_results)）。"""
         return len(state.react_results)
@@ -585,11 +634,16 @@ class SupervisorGraph:
         return "route_node"
 
     def _route_after_plan(self, state: AgentState) -> str:
-        """按意图类型与澄清状态决定下一节点：read-only ReAct / 确定性执行 / clarify / handoff。"""
+        """按意图类型与澄清状态决定下一节点：模型工具轮 / 确定性 ReAct / 确定性执行 / clarify / handoff。
+
+        只读查询优先走模型自主工具调度（若已启用并注入了 factory）；否则回退确定性 ReAct。
+        """
         if state.plan.get("clarification"):
             if state.clarification_count + 1 >= 2:
                 return "handoff_node"
             return "clarify_node"
+        if self._model_tool_selection_enabled():
+            return "model_tool_node"
         plan = _rebuild_plan(state.plan)
         if self.react_tool is not None and self._is_readonly_knowledge(plan):
             return "react_step_node"
@@ -608,6 +662,7 @@ class SupervisorGraph:
         g.add_node("handoff_node", self.handoff_node)
         g.add_node("react_step_node", self.react_step_node)
         g.add_node("react_done_node", self.react_done_node)
+        g.add_node("model_tool_node", self.model_tool_node)
         g.add_node("generate_node", self.generate_node)
         g.add_node("persist_node", self.persist_node)
 
@@ -619,6 +674,11 @@ class SupervisorGraph:
         g.add_conditional_edges("route_node", self._route_after_plan, {
             "clarify_node": "clarify_node", "handoff_node": "handoff_node",
             "execute_node": "execute_node", "react_step_node": "react_step_node",
+            "model_tool_node": "model_tool_node",
+        })
+        # 模型工具轮：拿到结果直接 summary；没拿到则回退确定性 ReAct（双保险）
+        g.add_conditional_edges("model_tool_node", self._route_after_model_tool, {
+            "summarize_node": "summarize_node", "react_step_node": "react_step_node",
         })
         g.add_conditional_edges("react_step_node", self._should_continue_react, {
             "react_step_node": "react_step_node", "react_done_node": "react_done_node",

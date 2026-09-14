@@ -34,6 +34,10 @@ class AgentState(BaseModel):
     seen_signatures_by_task: dict = Field(default_factory=dict)  # 按 task 隔离的早停哈希 {task_index: [sig]}
     react_result: dict | None = None                   # 循环结束时的任务结果（最后一个 task）
     react_results: list[dict] = Field(default_factory=list)  # 多意图：各 task 的最终结果累积
+    # 模型自主工具调度（只读查询）：工具名/参数/是否续调由模型决定
+    model_tool_rounds: list[dict] = Field(default_factory=list)  # 每轮调用记账（审计用）
+    model_tool_names: list[str] = Field(default_factory=list)    # 实际调用过的工具（按序）
+    model_tool_stopped_reason: str = ""                          # no_tool_call/done/budget_exhausted/tool_not_allowed
     # 上下文（intent_plan_node 从短时/长时/共享记忆装载，供规划与生成使用）
     conversation_id: str = ""                          # 用于短时记忆读写与 checkpointer thread_id
     conversation_context: str = ""                     # 共享记忆 conversation_summary

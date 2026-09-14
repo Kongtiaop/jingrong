@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 188 条真 bug 修复记录。
+- 共 189 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1683,4 +1683,28 @@ fused.sort(key=lambda item: (-item[1], str(item[0].id)))
 **影响面**：这是**两条路径共用的检索层**，故修复后管线与图的判定同时变得可复现——解释了为何此前观察到抖动发生在**管线侧**而非图侧。
 **验证**：`tests 279 passed`；新增 `scripts/check_rag_determinism.py`——对同一 query 连续检索 N 次，比对 `evidence_status`/`best_sim`/命中集合顺序的签名哈希，全一致则判定可复现（退出码 0）。**该脚本需在容器/有 DB 环境执行**，本地无法验证（本次仅完成静态修复 + 单测通过）。
 **残留风险**：tie-breaker 只保证**顺序确定**，不消除 `best_sim` 本身贴近阈值的脆弱性——`0.5667 vs 0.55` 的余量问题仍需通过滞回带或 judge 策略处理（见 ISSUE-20260914-RAG-EVIDENCE-THRESHOLD-MARGIN）。
+
+### ISSUE-20260914-MODEL-DRIVEN-READONLY-TOOL-SELECTION
+- 日期：2026-09-14
+- 分类：Agent / 能力增强（需求方明确要求）
+- 严重程度：P1（能力缺口）
+**问题（此前现状）**：系统自称"ReAct"，但**工具选择是硬编码的**，模型不参与——
+- `graph.py:365`：`react_tool.execute(name="search_customer_knowledge", ...)` 工具名写死；
+- `customer_task_executor.py:19`：`TOOL_BY_INTENT` 是"意图→工具"静态字典；
+- 改写用 `_REWRITE_POOL` 两条固定模板硬试（实测同一 query 6 次调用里 4 次是重复无效改写）。
+即："会循环"但**不会自主选工具、不会自主改写、不会判断该不该续调**。属"确定性编排 + 有界重试"，**不是 Agent 自主调度**。
+**需求**：**只读查询**交由模型自主选择工具调用；**资金/风控保持确定性路径**（这条边界不变）。
+**方案**：新增 `app/services/customer_model_tools.py`，复用既有 `QwenProvider.request_tool_call`（`tool_choice="auto"`，`qwen.py:379`，此前仅投顾侧用过）：
+- `CUSTOMER_READ_TOOL_SCHEMAS`：8 个**只读**工具的 OpenAI function schema，含面向模型的 description（模型据此选择）；
+- `CustomerModelToolLoop.run()`：有界循环——模型输出 `{name, arguments}` → 执行 → 结果回灌 → 再问，直到模型不再调用或用尽 `max_rounds`；
+- 图中新增 `model_tool_node`，经 `_route_after_plan` 优先分流；拿到结果 → `summarize_node`，未拿到 → **回退确定性 `react_step_node`**（双保险，不空转）。
+**五项安全边界（硬约束，非提示词约束）**：
+1. **写操作进不来**：工具集只含只读查询；`_ALLOWED_TOOL_NAMES` 硬白名单二次校验，模型即使返回 `create_order` 也只得到 `tool_not_allowed` 且**不触达工具层**；
+2. **不能越权指定客户**：`customer_id` 由服务端注入，**忽略**模型参数中的 `customer_id`（SubjectScope 仍由工具内部强制）；
+3. **有界循环**：`max_rounds` 上限（默认 4），用尽即 `budget_exhausted`；
+4. **降级安全**：provider 不可用/模型不调工具 → 返回 `stopped_reason` 而非异常，由图回退确定性路径；
+5. **全程审计**：每轮落 `AuditLog(action="customer_agent.tool_call")`，含 `selection="model"`、`read_only=true`。
+**开关**：`AGENT_MODEL_TOOL_SELECTION_ENABLED`（默认 false → 行为与之前完全一致）、`AGENT_MODEL_TOOL_MAX_ROUNDS`；已透传 `docker-compose.yml` / `docker-compose.p0.yml` / `.env.example`。
+**验证**：新增 `tests/test_customer_model_tools.py` 共 20 个测试，重点覆盖安全边界——写操作被拒、越权参数被忽略、预算用尽、模型不可用降级、每轮审计、schema 只读性与白名单一致性。**用"撤销白名单守卫 + 撤销服务端注入"确认测试会失败**。`tests 299 passed`。
+**已知取舍（需观察）**：`advisor_ask_agent.py:8` 记录了历史教训——多轮 `request_tool_call` 会让点名产品句**白等数百毫秒到数秒**。本方案以 `max_rounds=4` + "事实类工具一次成功即结束"缓解，但**延迟增加是固有代价**，建议开启后实测 P95。
 
