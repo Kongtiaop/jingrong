@@ -50,6 +50,21 @@ def _dump(label: str, resp) -> None:
             print(f"{'':{len(label) + 3}}  call[{i}] tool={call.get('tool')} "
                   f"success={call.get('success')} error={call.get('error')} "
                   f"evidence={call.get('evidence_status')}")
+            # 打参数：区分"同一工具不同改写"与"重复同一调用"必须看 args
+            args = call.get("arguments")
+            if args:
+                print(f"{'':{len(label) + 5}}args={args}")
+        # 模型调度循环的停止原因：判断"为什么停了"（主动停 / 越界 / 重复 / 预算耗尽）
+        trace = data.get("model_tool_trace") or {}
+        if trace:
+            print(f"{'':{len(label) + 3}}model_tool: rounds={len(trace.get('rounds') or [])} "
+                  f"stopped_reason={trace.get('stopped_reason')!r}")
+            for step in trace.get("decisions") or []:
+                print(f"{'':{len(label) + 5}}decision[r{step.get('round')}] "
+                      f"tool={step.get('tool')} outcome={step.get('outcome')} "
+                      f"args={step.get('arguments')}")
+                if step.get("reasoning"):
+                    print(f"{'':{len(label) + 7}}reasoning={step['reasoning']!r}")
 
 
 async def main() -> int:

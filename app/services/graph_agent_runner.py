@@ -23,18 +23,35 @@ logger = get_logger(__name__)
 
 
 def _results_from_state(state: dict) -> list[TaskExecutionResultResponse]:
-    return [
-        TaskExecutionResultResponse(
+    """把图状态里的 task_results 转成响应，并**附加模型工具调度轨迹**。
+
+    为什么把轨迹塞进每个 task 的 data：`model_tool_rounds` / `model_tool_decisions` 只存在
+    图状态里，而 API 响应与排查脚本都只看 `results[].data`，导致"模型为什么多调一个工具"
+    在图外完全不可见——只能靠猜。这里把它随结果一并带出，保证**留痕可查**。
+    仅在模型自主调度真的跑过时才附加，避免污染确定性路径的响应体。
+    """
+    rounds = state.get("model_tool_rounds") or []
+    decisions = state.get("model_tool_decisions") or []
+    stopped_reason = state.get("model_tool_stopped_reason") or ""
+    trace = (
+        {"rounds": rounds, "decisions": decisions, "stopped_reason": stopped_reason}
+        if (rounds or decisions or stopped_reason) else {}
+    )
+    out: list[TaskExecutionResultResponse] = []
+    for item in (state.get("task_results") or []):
+        data = dict(item.get("data") or {})
+        if trace and "model_tool_trace" not in data:
+            data["model_tool_trace"] = trace
+        out.append(TaskExecutionResultResponse(
             task_id=item.get("task_id", ""),
             intent=item.get("intent", ""),
             status=item.get("status", ""),
             answer=item.get("answer", "") or "",
-            data=item.get("data") or {},
+            data=data,
             error=item.get("error"),
             clarification=item.get("clarification"),
-        )
-        for item in (state.get("task_results") or [])
-    ]
+        ))
+    return out
 
 
 def response_from_state(*, state: dict, conversation_id: str) -> CustomerTaskExecutionResponse:

@@ -379,6 +379,10 @@ class SupervisorGraph:
             "model_tool_rounds": [r.__dict__ for r in outcome.rounds],
             "model_tool_names": list(outcome.tool_names),
             "model_tool_stopped_reason": outcome.stopped_reason,
+            # 模型的原始决策序列（含自述理由与被拦下的越界/重复调用）。
+            # 与 rounds 的差别：rounds 只记已执行的，decisions 记"模型想做什么"，
+            # 是排查"为什么多调一个工具"的唯一直接证据。
+            "model_tool_decisions": list(outcome.decisions),
         }
         if outcome.results:
             patch["task_results"] = outcome.results

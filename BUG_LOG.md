@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 210 条真 bug 修复记录。
+- 共 211 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2133,3 +2133,39 @@ answer = '您最近的工单 WO… 当前状态为 open。\n当前知识库没�
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 
+### ISSUE-20260914-MODEL-DECISION-REASONING-DISCARDED
+- 日期：2026-09-14
+- 分类：Agent 可观测性 / 模型调度
+- 严重程度：P1（不是答案错误，而是**根因不可观测**）
+**现象**：`我的工单进展如何` 稳定复现"模型多调一个计划外工具"（`explain_workorder_status`）导致自相矛盾，
+但**为什么模型要调它**无从判断——只能从"它失败了、结果错了"反推原因，反复猜测。
+**根因**：`QwenProvider.request_tool_call` **丢弃了 `message.content`**。
+模型发起 tool_call 时通常会**同时给出一段文本**说明理由，而该函数只回传
+`{"name", "arguments"}`，`content` 直接丢弃；`ToolRound` 也没有承载理由的字段。
+结果：**模型的自述理由在产生的那一刻就被丢掉了**，磁盘上（`audit_logs`）只有工具名与参数，
+`data` 里只有结果。所谓"模型就是爱多调一个工具吧"——**这句话当时是没有证据支撑的猜测**，
+因为唯一能证伪它的数据从未被保存。
+**为什么这是真 bug 而不只是"缺个日志"**：
+1. 本问题的修复方向**完全取决于理由**——若模型是"有意补充制度解释"（合理），应扩计划；
+   若是"把'解释状态'误判为独立意图"（越界），才该加范围约束。
+   没有理由，就无法区分这两种情况，只能选一个方向试。
+2. 它使**同类问题的每一轮排查都要重跑真实链路**，成本高且不可回看历史。
+3. 与既有教训同源：`ISSUE-20260914-GENERATION-TEMPERATURE-INSTABILITY` 的"**没排除随机性前不得判定 LLM 缺陷**"
+   是"先取证据再下结论"；本条是"**连取证据的通道都没有**"——比前者更前一步。
+**修复**：
+1. `qwen.py`：`request_tool_call` 返回 `reasoning`（`message.content`），**不参与控制流**，解析失败为零值，不影响主流程。
+2. `customer_model_tools.py`：`ToolRound` 增 `reasoning` 字段；新增 `ModelToolOutcome.decisions`
+   ——记录**每一轮模型的原始决策**（含**被拦下**的越界/重复调用，标注 `outcome=pending/executed/rejected_off_plan/rejected_duplicate/rejected_not_allowed`）。
+   与 `rounds` 的关键区别：`rounds` 只记**已执行**的调用，看不到"模型想调但被拦下"的动作。
+3. `_audit()` 落 `reasoning` 到 `audit_logs.detail`，线上可回看。
+4. `graph.py` 写入 `model_tool_decisions`；`graph_agent_runner.py` 把
+   `{rounds, decisions, stopped_reason}` 作为 `data.model_tool_trace` **随结果带出**
+   ——此前轨迹只存在图状态里，API 与排查脚本都看不到。仅模型工具轮跑过时才附加，不污染确定性路径。
+5. `inspect_query_dual.py` 打印 `decision[..] tool/outcome/args/reasoning`，一次运行即可判定性质。
+**验证**：新增 4 条测试（`tests/test_model_tool_scope_constraint.py`）：越界决策必须留下理由、
+理由必须落审计、**缺 `reasoning` 时不得影响控制流**（模型可能只回 tool_call 不带文本）、
+响应必须带出轨迹且**确定性路径不得被塞入空轨迹**。`tests 393 passed`（389 → 393）。
+**方法论教训**：**"模型就是爱这样"不是结论，是缺数据的症状。**
+在断言某个模型行为倾向之前，先确认该行为的**动机证据是否被保存**；
+若观测通道本身被丢弃，任何"这就是模型天性、改不好"的判断都是**不可证伪的猜测**，
+且极易滑向"加限制"这种掩盖而非解释的处置方式。正确顺序是：**先补观测 → 看真实理由 → 再定约束**。

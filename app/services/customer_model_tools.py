@@ -229,6 +229,7 @@ class ToolRound:
     error: str | None = None
     evidence_status: str | None = None
     citations: int = 0
+    reasoning: str = ""          # 模型自述的调用理由（审计/排查用，不参与控制流）
 
 
 @dataclass
@@ -239,6 +240,9 @@ class ModelToolOutcome:
     results: list[dict] = field(default_factory=list)   # 供上游组装的 TaskExecutionResult 形态
     stopped_reason: str = "no_tool_call"                # no_tool_call / budget_exhausted / done / model_unavailable
     tool_names: list[str] = field(default_factory=list)  # 实际调用过的工具（按序）
+    # 每轮模型的原始决策（含自述理由），供排查"为什么多调/调错工具"。
+    # 与 rounds 的区别：rounds 只记**已执行**的调用，decisions 也记**被拦下**的（越界/重复）。
+    decisions: list[dict] = field(default_factory=list)
 
     @property
     def called_any(self) -> bool:
@@ -286,7 +290,8 @@ class CustomerModelToolLoop:
 
     async def _audit(self, *, customer_id: str, conversation_id: str, round_index: int,
                      tool: str, arguments: dict, success: bool, error: str | None,
-                     evidence_status: str | None, citations: int) -> None:
+                     evidence_status: str | None, citations: int,
+                     reasoning: str | None = None) -> None:
         """每轮工具调用落审计。失败不影响主流程。"""
         try:
             from app.models.audit import AuditLog
@@ -301,6 +306,7 @@ class CustomerModelToolLoop:
                         "success": success, "error": error,
                         "evidence_status": evidence_status, "citations": citations,
                         "read_only": True, "selection": "model",
+                        "reasoning": reasoning or "",
                     }, ensure_ascii=False),
                 ))
                 await session.commit()
@@ -411,6 +417,14 @@ class CustomerModelToolLoop:
 
             tool_name = str(decision.get("name") or "").strip()
             arguments = decision.get("arguments") or {}
+            # 模型发起 tool_call 时同时给出的文本（"为什么调这个工具"）。
+            # 仅用于留痕：判断"模型多调一个工具"是**有意补充**还是**误判**，必须看它的自述理由，
+            # 否则只能凭结果反推（此前正是如此，导致同一现象反复猜测）。
+            reasoning = str(decision.get("reasoning") or "").strip()
+            outcome.decisions.append({
+                "round": round_index, "tool": tool_name, "arguments": arguments,
+                "reasoning": reasoning, "outcome": "pending",
+            })
 
             # 工具范围约束：模型只能调用**计划意图对应**的工具。
             # 为什么需要（ISSUE-20260914-MODEL-CALLS-OFFPLAN-TOOL）：
@@ -431,7 +445,7 @@ class CustomerModelToolLoop:
                 await self._audit(customer_id=customer_id, conversation_id=conversation_id,
                                   round_index=round_index, tool=tool_name, arguments=arguments,
                                   success=False, error="tool_out_of_plan_scope",
-                                  evidence_status=None, citations=0)
+                                  evidence_status=None, citations=0, reasoning=reasoning)
                 context_lines.append(
                     f"[{tool_name}] 该工具不在本次计划范围内（计划仅涉及：{'、'.join(planned_intents or [])}），"
                     "请改用计划内的工具或直接结束。"
@@ -441,6 +455,7 @@ class CustomerModelToolLoop:
                 # stopped_reason 默认值是 "no_tool_call"（非空），`or` 会永远保留默认值，
                 # 导致真实原因丢失（这个坑被新测试抓到）。
                 outcome.stopped_reason = "tool_out_of_plan_scope"
+                outcome.decisions[-1]["outcome"] = "rejected_off_plan"
                 break
 
             # 重复调用闸门：完全相同的 (工具, 参数) 重复调用在确定性工具上必然得到相同结果，
@@ -460,6 +475,7 @@ class CustomerModelToolLoop:
                     f"[{tool_name}] 该调用（参数={arguments}）本轮已执行过且结果相同，不再重复。"
                 )
                 outcome.stopped_reason = "duplicate_call_skipped"
+                outcome.decisions[-1]["outcome"] = "rejected_duplicate"
                 break
             seen_calls.add(call_key)
 
@@ -473,6 +489,7 @@ class CustomerModelToolLoop:
                                   success=False, error="tool_not_allowed",
                                   evidence_status=None, citations=0)
                 outcome.stopped_reason = "tool_not_allowed"
+                outcome.decisions[-1]["outcome"] = "rejected_not_allowed"
                 break
 
             # 客户身份由服务端注入，模型无法指定查谁（防越权）
@@ -496,14 +513,18 @@ class CustomerModelToolLoop:
                 success=result.success, error=result.error,
                 evidence_status=data.get("evidence_status"),
                 citations=len(data.get("citations") or []),
+                reasoning=reasoning,
             )
             outcome.rounds.append(round_record)
             outcome.tool_names.append(tool_name)
+            outcome.decisions[-1]["outcome"] = "executed"
+            outcome.decisions[-1]["success"] = result.success
+            outcome.decisions[-1]["error"] = result.error
             await self._audit(customer_id=customer_id, conversation_id=conversation_id,
                               round_index=round_index, tool=tool_name, arguments=arguments,
                               success=result.success, error=result.error,
                               evidence_status=round_record.evidence_status,
-                              citations=round_record.citations)
+                              citations=round_record.citations, reasoning=reasoning)
 
             if result.success:
                 # 意图标注：知识类工具的真实类别由模型传入的 intent 参数决定（company_info/policy/...），

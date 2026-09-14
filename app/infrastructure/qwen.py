@@ -409,9 +409,13 @@ class QwenProvider:
         """一次非流式补全，请模型决定是否调用某个已声明工具。
 
         返回 dict 或 None：
-          {"name": str, "arguments": dict}  模型要调的工具
-          None                              模型没有要调工具（将直接给文本）
+          {"name": str, "arguments": dict, "reasoning": str}  模型要调的工具
+          None                                                模型没有要调工具（将直接给文本）
         若解析失败/异常亦返回 None，交由上层降级为纯上下文回答。
+
+        reasoning：模型在发起 tool_call 时**同时给出的文本**（`message.content`）。
+        此前被丢弃，导致"模型为什么多调一个工具"完全无法从留痕判断——只能猜。
+        它不参与任何控制流，仅用于审计/排查，故解析失败也不影响主流程。
 
         timeout_seconds：工具轮的显式超时（默认取 qwen_tool_call_timeout_seconds）。
         必须比普通对话更短——工具轮是"辅助决策"，一次请求可能连续发生多轮，
@@ -438,7 +442,8 @@ class QwenProvider:
                     arguments = _parse_intent_json(message.tool_calls[0].function.arguments)
                 except Exception:  # noqa: BLE001 - 参数解析失败按无工具处理
                     return None
-                return {"name": message.tool_calls[0].function.name, "arguments": arguments or {}}
+                return {"name": message.tool_calls[0].function.name, "arguments": arguments or {},
+                        "reasoning": (getattr(message, "content", None) or "").strip()}
             # 没有 tool_call → 直接文本（content 一般也在 message.content）
             return None
         except Exception as exc:  # noqa: BLE001 - 工具轮失败降级为无工具
