@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 185 条真 bug 修复记录。
+- 共 186 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1608,4 +1608,27 @@ min_similarity 阈值 = 0.55
 2. RAG 判定改为**确定性可复现**（固定 embedding、固定 top_k、记录 `best_sim` 到审计以便事后归因）；
 3. **修正 `needs_handoff` 判定粒度**：单个 task 失败即整体转人工过于激进——已有可用答案时应返回"部分作答 + 提示"，而非同时给答案又转人工（自相矛盾的用户体验）。
 **验证**：容器内调用 `CustomerRagService.answer` 对原文/改写文本分别取 `best_sim`（见上）；`ambiguous_judge=None` 与 `thresholds` 亦同轮实测。
+
+### ISSUE-20260914-SUMMARIZE-DUPLICATE-FILLER
+- 日期：2026-09-14
+- 分类：Agent / 答案聚合 / 体验
+- 严重程度：P3
+- 状态：OPEN（已定位，未修）
+**问题**：多意图多 task 同时低置信失败时，`CustomerTaskExecutor.summarize` 把每个 task 的占位答案**原样拼接**，用户看到重复文案。实测复现（`你们公司的主营业务是什么`，两个 task 均 `needs_clarification`）：
+
+```
+answer = '当前资料不足。\n当前资料不足。\n下一步：当前资料不足，可以补充问题或转人工客服。'
+         ^^^^^^^^^^^^^^ 重复两次
+```
+**根因**：`summarize` 的聚合是无条件拼接——
+```python
+lines = [item.answer for item in results if item.answer]
+if clarification: lines.append(f"下一步：{clarification}")
+return status, clarification, "\n".join(lines) or "当前没有可返回的结果。"
+```
+每个低置信 task 的 `answer` 都是同一句兜底文案 `"当前资料不足。"`（`react_step_node` / `_bounded_react_knowledge` 的固定占位），多 task 时即出现 N 次重复。**未做去重，也未区分"实体答案"与"占位文案"。**
+**影响**：纯体验瑕疵，不改变 `overall_status`/`requires_handoff` 判定，**两条路径同受影响**（共用 `summarize`，故不是图与管线的差异项）。但在"多意图 + 全部低置信"这一常见场景下用户观感明显变差。
+**解法方向（未实施）**：① 聚合时按 answer 去重；② 占位文案不参与拼接（仅在无任何实体答案时统一给一次）；③ 引入 `TaskExecutionResult.is_placeholder` 标记以区分实体/兜底。
+**关联**：与 ISSUE-20260914-COMPLETED-STATUS-MASKED-BY-DROPPED-TASK 同族——**`summarize` 对多 task 的聚合语义过于粗糙**：既会让"丢 task"伪装成 `completed`，也会让占位文案重复拼接。建议一并重构聚合层。
+**验证**：直接调用 `CustomerTaskExecutor.summarize` 传入两个 `needs_clarification` + 相同占位 answer 的 task，复现上述重复串。
 
