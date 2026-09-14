@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 196 条真 bug 修复记录。
+- 共 198 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1843,6 +1843,36 @@ g.add_conditional_edges("model_tool_node", self._route_after_model_tool, {
 **根因**：知识类工具成功后结果**回灌**模型（这是为多意图覆盖所做的正确设计，见 `MODEL-TOOL-FORCED-EARLY-STOP`），但模型会因此认为"还需补充"而**再调一次同 intent、不同 query 的检索**。而结果收集处**按轮次追加**、未按 intent 去重，于是同一意图产出两个 task；下游 `summarize` 拼接出重复答案。
 **解决**：结果收集时按 `intent` 去重——若该 intent 已有成功结果，则**只更新已有条目**（答案取最新、data 合并），不追加新条目；`outcome.rounds` 仍保留每轮记账以供审计（调用次数不被抹掉）。
 **验证**：新增 4 个测试——同 intent 重复成功不追加（`rounds` 仍为 2 以保留审计）、去重时答案取最新、不同 intent 不被误合并、事实类工具同样去重。`tests 316 passed`。
+
+### ISSUE-20260914-MODEL-TOOL-MISROUTES-NON-RAG-INTENTS
+- 日期：2026-09-14
+- 分类：Agent / 模型工具轮 / 工具语义边界
+- 严重程度：P1
+**问题**：全量对照由 12/14 退化到 8/14，其中 `推荐适合我的产品` 图判 `needs_clarification` 而管线 `completed`：
+```
+graph answer = '产品推荐使用实时 Product 数据和适当性服务，不依赖当前缺失的产品 RAG 文档。'
+```
+这句是 `CustomerRagService.answer()` 对 `intent == "product_recommendation"` 的**短路返回**（`customer_rag_service.py:116`），**并非产品推荐结果**。
+**根因**：**工具语义边界被模型跨越**。`search_customer_knowledge` 的 schema 允许模型传任意 `intent` 参数（枚举里含 `product_recommendation`？实际枚举为 company_info/company_business/faq/workflow/policy/risk_public，但模型仍可能传其他值或系统未拦截），而**产品推荐在管线里由 `SuitabilityService`（实时 Product + 适当性）处理，根本不走 RAG**。我的模型工具轮把"选工具"完全交给模型，却**没有约束"哪些意图不能由该工具处理"**，于是模型用知识检索工具去答推荐类问题，拿到短路占位串当作答案。
+**同类风险**：`greeting`（"你好"）、`human_handoff`（"我想转人工客服"）、`business_operation` 也都有各自专用路径，不应交给 `search_customer_knowledge`。实测对照中这三条也确实出现差异。
+**解法方向（未实施）**：① 在 `search_customer_knowledge` 的 schema/enum 中**硬限制 intent 取值**只允许知识类（company_info/company_business/faq/workflow/policy/risk_public），并在工具执行层校验（与 `_ALLOWED_TOOL_NAMES` 同级的硬门禁）；② 对**非只读知识意图**（product_recommendation/greeting/human_handoff/business_operation）**不进入模型工具轮**，直接走原有确定性分支（`_route_after_plan` 增加意图级前置判断）；③ 或在工具返回 `answer_mode == "database_recommendation"` 等"非 RAG 短路"时拒绝作为答案采纳。**倾向 ①+②**：既封闭越界可能，又保住"模型自主选工具"的初衷（模型只在**知识类与事实类只读**工具间自主选择）。
+
+### ISSUE-20260914-MODEL-TOOL-LLM-CALL-AMPLIFICATION
+- 日期：2026-09-14
+- 分类：Agent / 模型工具轮 / 配额与延迟
+- 严重程度：P1
+**问题**：全量对照出现 `llm.usage model=qwen-plus status=failed duration_ms=95760`（**单次调用耗时 95.7 秒后失败**），且 `你好` 一条图返回 `'当前回答服务暂时不可用，已保留检索依据并建议转人工客服。'`（`generation_status=generation_failed`，见 `customer_rag_answer.py:95-96`）。**即 LLM 调用被拖垮/限流。**
+**根因**：**模型工具轮显著放大单请求的 LLM 调用次数**：
+```
+graph 路径（"我有没有风险限制"，2 个 task）：
+  1 意图分类(LLMIntentFallback) + 2~4 模型工具轮 + N 次答案生成  → 4~6 次
+pipeline 路径：
+  1 意图分类 + (可选 RAG judge) + N 次答案生成                    → 2~3 次
+```
+全量对照 = 14 条 × 2 路径 ≈ **28 个请求**，叠加后触发限流/超时；`request_tool_call` 未显式加超时（`qwen.py` 的 `chat_completions` 走 httpx 客户端超时），失败后又降级为占位文案，**使得对照结果不可信**（既有真实差异，也有资源耗尽的假差异）。
+**影响**：① 对照/评测不可复现（资源耗尽引入假 DIFF）；② **生产风险**：`--workers 4` 下并发用户会把 LLM 配额打满，`advisor_ask_agent.py:8` 记录的历史延迟问题会重现且更严重。
+**解法方向（未实施，需实测决定）**：① **限流/并发保护**：`request_tool_call` 加显式超时 + 全局信号量（参考 `llm_intent_fallback_max_concurrency` 的既有做法）；② **减少轮数**：明确"事实类工具成功后如无未覆盖意图即结束"，避免为"补充"而多调一轮（当前已按 intent 去重，但仍会多调一次）；③ **只在必要时启用模型工具轮**：如仅规则低置信/多意图时使用，简单 query 走确定性路径（可显著降低调用量）；④ **对照脚本限速**：跑对照时加间隔或降并发，避免自造限流。
+**验证**：以 `inspect_query_dual`/对照时的 `llm.usage` 日志统计单条 query 的 LLM 调用次数与耗时（`status=failed` 出现即资源不足）。
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 
