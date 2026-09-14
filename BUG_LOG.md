@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 194 条真 bug 修复记录。
+- 共 196 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1810,6 +1810,39 @@ graph stopped: 模型拿到事实工具结果后主动返回 None（不是被强
 2. **收窄 judge 介入区间**（`config/understanding.yaml` 新增 `judge_reject_similarity` / `judge_answer_similarity`，默认值等于原 `reject`/`answer` 以保持向后兼容；本次配置为 `0.35`/`0.55`）：judge 只管**低分区 0.35~0.55**（拦截明显无关引用），`0.55~0.65` 直接放行。**这样 `0.5559` 不再经过 judge，恢复 `sufficient`。**
 **验证**：新增 3 个测试——judge 上界必须窄于 answer 上界、高分区（0.5559）**不调用 judge** 且不转人工、低分区（0.45）仍调用 judge 并可拒答；**用"把 judge 带还原为完整 ambiguous 带"确认前两个会失败**。`tests 312 passed`。
 **影响**：judge 仍在生产生效（`customer_tools.py` 共享检索路径），但介入面收窄——保留"拦截明显无关"能力，去掉"误杀边缘相关"副作用。**若后续发现低分区误杀，可继续调 `judge_answer_similarity` 或回退 `judge_ambiguous: false`。**
+
+### ISSUE-20260914-MODEL-TOOL-SKIPS-ANSWER-GENERATION
+- 日期：2026-09-14
+- 分类：Agent / 模型工具轮 / 答案生成
+- 严重程度：P1
+**问题**：judge 修复后 `risk_public` 终于检索成功，但**图给出的答案是占位串**：
+```
+graph  task-2 answer = '可基于客服知识库引用生成回答。'      ← 占位，非真实答案
+pipeline task-2 answer = '根据您提出的问题…所有投资者均受法定和制度性风险限制约束…'  ← 真实生成
+```
+用户会看到"可基于客服知识库引用生成回答。"这种**系统内部提示语**，而非实际答案。
+**根因**：图的边把 `model_tool_node` **直连 `summarize_node`**，**跳过了 `generate_node`**：
+```python
+g.add_conditional_edges("model_tool_node", self._route_after_model_tool, {
+    "summarize_node": "summarize_node", "react_step_node": "react_step_node"})   # ← 缺 generate_node
+```
+`search_customer_knowledge` 返回的是 `CustomerRagService` 的 `message` 字段（"可基于客服知识库引用生成回答。"），**真正的 LLM 答案生成在 `CustomerRagAnswerService.generate`**（管线 `_bounded_react_knowledge` 第 144 行有调用）。模型工具轮没有接这一步，于是把占位串当成了最终答案。
+**解决**：`_route_after_model_tool` 改为返回 `generate_node`，图边也改为 `model_tool_node → generate_node → summarize_node`（与 `react_done_node → generate_node` 一致）。`generate_node` 已支持多 task（此前已修），对每个命中引用的结果各生成一次。
+**验证**：`model_tool_node` 出边确认为 `('model_tool_node','generate_node')`；全量 `tests 316 passed`。**容器内需再跑 `inspect_query_dual` 确认 answer 不再是占位串。**
+
+### ISSUE-20260914-MODEL-TOOL-DUPLICATE-INTENT-RESULT
+- 日期：2026-09-14
+- 分类：Agent / 模型工具轮 / 结果去重
+- 严重程度：P2
+**问题**：图出现**两个同 intent 的 task**：
+```
+[graph] task=model-tool-2 intent=risk_public   answer='可基于客服知识库引用生成回答。'
+[graph] task=model-tool-3 intent=risk_public   answer='可基于客服知识库引用生成回答。'
+判定: graph = [risk_restriction, risk_public, risk_public]   ← 比 pipeline 多一个
+```
+**根因**：知识类工具成功后结果**回灌**模型（这是为多意图覆盖所做的正确设计，见 `MODEL-TOOL-FORCED-EARLY-STOP`），但模型会因此认为"还需补充"而**再调一次同 intent、不同 query 的检索**。而结果收集处**按轮次追加**、未按 intent 去重，于是同一意图产出两个 task；下游 `summarize` 拼接出重复答案。
+**解决**：结果收集时按 `intent` 去重——若该 intent 已有成功结果，则**只更新已有条目**（答案取最新、data 合并），不追加新条目；`outcome.rounds` 仍保留每轮记账以供审计（调用次数不被抹掉）。
+**验证**：新增 4 个测试——同 intent 重复成功不追加（`rounds` 仍为 2 以保留审计）、去重时答案取最新、不同 intent 不被误合并、事实类工具同样去重。`tests 316 passed`。
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 

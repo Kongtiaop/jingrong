@@ -301,6 +301,69 @@ def test_knowledge_intents_share_single_tool_coverage():
     assert len(provider.calls) == 2, "同一工具已覆盖两个知识意图，不应再追问"
 
 
+# ---------- 重复调用同一 intent 应去重（回归） ----------
+# ISSUE-20260914-MODEL-TOOL-DUPLICATE-INTENT-RESULT：知识类工具成功后结果回灌，
+# 模型可能认为"还需补充"再调一次（同 intent 不同 query），产出两个同 intent 的 task，
+# 下游 summarize 拼接出重复答案（graph 实测出现两个 risk_public）。
+
+def test_duplicate_same_intent_is_deduplicated():
+    """同一 intent 重复成功时不追加新结果，只更新已有条目。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "search_customer_knowledge", "arguments": {"query": "风险限制制度", "intent": "risk_public"}},
+        {"name": "search_customer_knowledge", "arguments": {"query": "交易权限影响", "intent": "risk_public"}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="我有没有风险限制",
+                                   planned_intents=["risk_public"]))
+    intents = [r["intent"] for r in outcome.results]
+    assert intents == ["risk_public"], f"同 intent 应去重，实际 {intents}"
+    assert len(outcome.rounds) == 2, "两轮调用仍应各自记账（审计需要）"
+
+
+def test_duplicate_dedup_keeps_latest_answer():
+    """去重时以最新结果覆盖答案（后一次检索可能更充分）。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "search_customer_knowledge", "arguments": {"query": "q1", "intent": "policy"}},
+        {"name": "search_customer_knowledge", "arguments": {"query": "q2", "intent": "policy"}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q",
+                                   planned_intents=["policy"]))
+    assert len(outcome.results) == 1
+    assert outcome.results[0]["answer"] == "search_customer_knowledge 的结果"
+
+
+def test_different_intents_are_not_deduplicated():
+    """不同 intent 的正常多意图结果不应被误合并。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "search_customer_knowledge", "arguments": {"query": "a", "intent": "risk_public"}},
+        {"name": "search_customer_knowledge", "arguments": {"query": "b", "intent": "policy"}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q",
+                                   planned_intents=["risk_public", "policy"]))
+    assert {r["intent"] for r in outcome.results} == {"risk_public", "policy"}
+
+
+def test_fact_tool_duplicate_is_deduplicated():
+    """事实类工具重复调用同一 intent 也去重。"""
+    tools = FakeReadTools()
+    provider = FakeProvider([
+        {"name": "get_my_asset_summary", "arguments": {}},
+        {"name": "get_my_asset_summary", "arguments": {}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="查资产"))
+    assert len(outcome.results) == 1, "同 intent 重复调用应去重"
+
+
 def test_model_can_chain_knowledge_then_stop():
     """知识类工具可续调补充，模型不再调用时结束。"""
     tools = FakeReadTools()

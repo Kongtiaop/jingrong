@@ -385,8 +385,8 @@ class SupervisorGraph:
         return patch
 
     def _route_after_model_tool(self, state: AgentState) -> str:
-        """模型工具轮拿到结果 → 直接 summary；没拿到 → 回退确定性 ReAct。"""
-        return "summarize_node" if state.task_results else "react_step_node"
+        """模型工具轮拿到结果 → 先经 generate_node 生成答案；没拿到 → 回退确定性 ReAct。"""
+        return "generate_node" if state.task_results else "react_step_node"
 
     # ---- 只读 ReAct 循环（确定性兜底：工具名硬编码 + 固定模板改写） ----
     def _react_task_index(self, state: AgentState) -> int:
@@ -679,9 +679,12 @@ class SupervisorGraph:
             "execute_node": "execute_node", "react_step_node": "react_step_node",
             "model_tool_node": "model_tool_node",
         })
-        # 模型工具轮：拿到结果直接 summary；没拿到则回退确定性 ReAct（双保险）
+        # 模型工具轮：拿到结果先经 generate_node 生成答案，再 summary；没拿到则回退确定性 ReAct。
+        # 必须走 generate_node —— 否则 search_customer_knowledge 返回的只是 RAG 服务的
+        # message 占位串（"可基于客服知识库引用生成回答。"），用户拿到的是占位而非真实答案
+        # （ISSUE-20260914-MODEL-TOOL-SKIPS-ANSWER-GENERATION）。
         g.add_conditional_edges("model_tool_node", self._route_after_model_tool, {
-            "summarize_node": "summarize_node", "react_step_node": "react_step_node",
+            "generate_node": "generate_node", "react_step_node": "react_step_node",
         })
         g.add_conditional_edges("react_step_node", self._should_continue_react, {
             "react_step_node": "react_step_node", "react_done_node": "react_done_node",

@@ -424,6 +424,15 @@ class CustomerModelToolLoop:
                     str(intent) if tool_name == "search_customer_knowledge" and intent
                     else _EXPECTED_ROUTE.get(tool_name, tool_name)
                 )
+                # 去重：同一意图若已成功取到结果，后续重复调用（模型认为"还需补充"而再调一次）
+                # 不再追加新结果，只更新已有条目的引用数——否则会出现两个同 intent 的 task，
+                # 下游 summarize 会拼接出重复答案（ISSUE-20260914-MODEL-TOOL-DUPLICATE-INTENT-RESULT）。
+                existing = next((r for r in outcome.results if r["intent"] == intent_label), None)
+                if existing is not None:
+                    existing["answer"] = result.answer or existing["answer"]
+                    existing["data"] = {**existing["data"], **data}
+                    context_lines.append(f"[{tool_name}] {result.answer[:600]}")
+                    continue
                 outcome.results.append({
                     "task_id": f"model-tool-{round_index}",
                     "intent": intent_label,
