@@ -45,14 +45,23 @@ class FakeDatabase:
         raise RuntimeError("no audit in test")
 
 
-def _run(error, *, tool="search_customer_knowledge", arguments=None, answer="", data=None):
+def _run(error, *, tool="search_customer_knowledge", arguments=None, answer="", data=None,
+         planned_intents=None):
+    """构造一次失败的模型工具调用。
+
+    planned_intents 需与该工具匹配（新增的工具范围约束会拦截计划外工具）：
+    search_customer_knowledge ← 知识类意图；get_my_order_status ← order_status。
+    """
     decision = {"name": tool, "arguments": arguments or {"query": "q", "intent": "workflow"}}
+    if planned_intents is None:
+        planned_intents = (
+            ["order_status"] if tool == "get_my_order_status" else ["workflow"])
     loop = CustomerModelToolLoop(
         provider=ScriptedProvider([decision, None]),
         tools=FailingTools(error, answer=answer, data=data),
         database=FakeDatabase(), max_rounds=2)
     return asyncio.run(loop.run(customer_id="c1", conversation_id="v1",
-                                query="开户流程是怎样的", planned_intents=["workflow"]))
+                                query="开户流程是怎样的", planned_intents=planned_intents))
 
 
 @pytest.mark.parametrize("error", ["fact_not_found", "ambiguous_product", "low_confidence"])

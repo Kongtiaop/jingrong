@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 208 条真 bug 修复记录。
+- 共 210 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2095,6 +2095,41 @@ needs_clarification = error_code in {"fact_not_found", "ambiguous_product"}   # 
 1. **补齐映射**：`needs_clarification` 加入 `low_confidence`；澄清文案按错误类型区分（`fact_not_found`/`ambiguous_product` → "请补充更明确的查询对象或订单/产品信息。"；`low_confidence` → "当前资料不足，可以补充问题或转人工客服。"）。
 2. **常量去重**：`_FALLBACK_CLARIFICATION` 原只在 `graph.py` 定义，本模块又用到却未定义（运行到该分支会 `NameError`——**被新测试当场抓出**）。已在 `customer_model_tools.py` 定义同名常量并**用测试钉住与 `graph.py` 逐字一致**，避免同一语义两种文案。
 **验证**：新增 `tests/test_model_tool_failure_semantics.py` 共 7 个测试——三类可恢复错误都映射为 `needs_clarification`、`low_confidence` 用知识类文案、`fact_not_found` 用事实类文案、**非可恢复错误仍是 `failed`**（不过度放宽）、两处常量逐字一致。**用"把 low_confidence 退回 failed"确认测试会失败**。`tests 383 passed`。
+
+### ISSUE-20260914-MODEL-CALLS-OFFPLAN-TOOL
+- 日期：2026-09-14
+- 分类：Agent / 模型工具轮 / 范围约束
+- 严重程度：P1
+**问题**：`我的工单进展如何` **稳定复现**（两次探针完全一致）：
+```
+[graph] task=model-tool-1 intent=workorder_status          succeeded
+[graph] task=model-tool-2 intent=explain_workorder_status  needs_clarification (low_confidence)
+=> overall_status=partially_completed, requires_handoff=True
+answer = '您最近的工单 WO… 当前状态为 open。\n当前知识库没有足够依据，建议转人工客服…'
+```
+用户**已拿到工单状态**，却被回复"没有依据、已转人工"——**自相矛盾**。管线只查 `workorder_status`，`completed`、不转人工。
+**根因**：**模型多调了计划外工具**。计划只有 `workorder_status`，模型拿到状态后**自行决定**再调 `explain_workorder_status` 去"解释状态含义"，而该工具走知识检索、知识库无流程资料 → `low_confidence` → 额外 task 失败 → **污染整体状态并触发转人工**。
+**关键判断**：`explain_*` 这类工具**本应由规划器通过「多意图 + depends_on」触发**（`CustomerTaskExecutor._execute_one:243` 的条件是 `item.depends_on and item.intent in {workflow,faq,policy}`），**不该由模型临时决定**。用户只问状态、没问流程，这次扩展既非必需、又注定失败。
+**替代方案的权衡**：曾考虑"允许模型扩展，但越界调用的失败不污染状态"。**否决理由**：越界调用若**成功**，会产生计划外的额外开销与不可预测输出；且绕过了确定性规划器——规划结果才是"该覆盖哪些方面"的权威来源。
+**解决**：新增**工具范围约束**——模型只能调用 `planned_intents` 经 `_INTENT_TO_TOOL` 映射出的工具集（`_tools_for_intents()`）；越界调用**不执行**、记审计 `error="tool_out_of_plan_scope"`、`stopped_reason` 同值。**未传 `planned_intents` 时不约束**（保持向后兼容）。模型仍**完全自主**决定：用计划内哪个工具、传什么参数、是否续调、如何改写——只是不能越出计划范围。
+**验证**：新增 `tests/test_model_tool_scope_constraint.py` 共 6 个测试——越界工具被拦截（不执行、不产结果、留审计、`stopped_reason` 正确）、工单 query 只产出 1 个成功 task（与管线一致）、**多意图计划时两个计划内工具都可用**（不误伤正常多意图）、无计划时不约束、生成温度为 0。**用"移除范围约束"确认 2 个测试会失败**。`tests 389 passed`。
+**踩坑**：第一版写 `outcome.stopped_reason = outcome.stopped_reason or "tool_out_of_plan_scope"`，但 `ModelToolOutcome.stopped_reason` 的**默认值是 `"no_tool_call"`（非空）**，`or` 永远保留默认值 → 真实原因丢失。**被新测试当场抓出**，改为直接赋值。
+
+### ISSUE-20260914-GENERATION-TEMPERATURE-INSTABILITY
+- 日期：2026-09-14
+- 分类：RAG / 答案生成 / 可复现性与合规
+- 严重程度：P1
+**问题**：同一 query 两次生成出现**事实相反**的断言。`我有没有风险限制`：
+```
+第一次（全量对照）: '**是的，您有风险限制。**'              ← 断言受限
+第二次（探针）    : '我无法直接判断您个人是否设有风险限制'   ← 不确定
+```
+**关键事实**：`get_my_risk_restriction` 工具返回的是「**您的账户当前未显示风险限制**，但存在一条待处理风险记录」——**第一次的断言与事实相反**。
+**根因**：`CustomerRagAnswerService.generate()` 的 `temperature=0.1`（非 0）。该任务是"**基于引用复述事实**"，**不需要创作性随机**；0.1 的温度足以让模型偶发地把"未显示限制"写成"有风险限制"。
+**影响**：① **合规风险**——无依据时对客户账户状态下断言，可能引发客户误解/投诉；② **对照与评测不可复现**——本次排查中我一度据此判"图有合规问题"，实为坏样本，**浪费了一轮判断**。
+**解决**：`temperature` 0.1 → **0.0**。项目内已有先例（judge 调用即为 0.0），说明"事实复述类任务用 0 温度"已是共识。
+**验证**：新增测试断言 `generate()` 源码含 `temperature=0.0` 且不含 `temperature=0.1`（源码级钉住，防止回退）。`tests 389 passed`。
+**连带修正**：我在本条之前基于该坏样本做出的两个判断**已更正**——「图有合规问题」不成立；「我有没有风险限制 这条图错」应改为「图更准确」（其 `partially_answered` 标注正确反映了"答了但没答全"）。**教训：单次样本不足以判定 LLM 输出缺陷，必须先排除随机性。**
 
 > **已上升为架构决策**：本条与 `ISSUE-20260914-MODEL-TOOL-FORCED-EARLY-STOP` 的教训已写入 `docs/DECISIONS.md` 的「2026-09-14：只读查询采用"模型自主决策 + 规则兜底校验"分层；禁止用提示词代替规则保证」，作为**适用于本项目所有 Agent 能力的边界原则**（提示词不承担正确性/完整性保证；"少做了却仍报成功"必须有显式标记）。`docs/` 按 `.gitignore` 不入库，故该决策文档仅存本地。
 

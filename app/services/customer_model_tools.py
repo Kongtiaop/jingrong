@@ -177,6 +177,17 @@ _INTENT_TO_TOOL = {
 }
 
 
+def _tools_for_intents(planned_intents: list[str] | None) -> set[str]:
+    """计划意图所映射的工具集合（模型的**可调用范围**）。
+
+    用途：约束模型不得调用计划外的工具（见 ISSUE-20260914-MODEL-CALLS-OFFPLAN-TOOL）。
+    返回空集表示"无约束"（未传计划时不限制），保持向后兼容。
+    """
+    if not planned_intents:
+        return set()
+    return {tool for intent in planned_intents if (tool := _INTENT_TO_TOOL.get(intent))}
+
+
 def _uncovered_intents(planned_intents: list[str] | None,
                        results: list[dict]) -> list[str]:
     """计划中的意图里，哪些尚未被任何成功结果覆盖。
@@ -400,6 +411,37 @@ class CustomerModelToolLoop:
 
             tool_name = str(decision.get("name") or "").strip()
             arguments = decision.get("arguments") or {}
+
+            # 工具范围约束：模型只能调用**计划意图对应**的工具。
+            # 为什么需要（ISSUE-20260914-MODEL-CALLS-OFFPLAN-TOOL）：
+            # 实测"我的工单进展如何"（计划只有 workorder_status），模型拿到工单状态后
+            # **自行多调** `explain_workorder_status` 去"解释状态"，该调用失败
+            # （知识库无流程资料）→ 污染整体状态 → 用户明明已拿到工单状态，
+            # 却被回复"当前知识库没有足够依据，已转人工"（自相矛盾）。
+            # 差异 = 多一次调用 + 误转人工 + 答案自相矛盾。
+            # 关键认识：`explain_*` 这类工具本应由规划器通过**多意图 + depends_on** 触发
+            # （见 CustomerTaskExecutor._execute_one:243），不该由模型临时决定。
+            # 故此处约束"在计划范围内自主"——模型仍可自由选工具/改参数/决定续调，
+            # 但不能越出计划意图所映射的工具集。
+            allowed_tools = _tools_for_intents(planned_intents)
+            if allowed_tools and tool_name not in allowed_tools:
+                outcome.rounds.append(ToolRound(
+                    round_index=round_index, tool=tool_name, arguments=arguments,
+                    success=False, error="tool_out_of_plan_scope"))
+                await self._audit(customer_id=customer_id, conversation_id=conversation_id,
+                                  round_index=round_index, tool=tool_name, arguments=arguments,
+                                  success=False, error="tool_out_of_plan_scope",
+                                  evidence_status=None, citations=0)
+                context_lines.append(
+                    f"[{tool_name}] 该工具不在本次计划范围内（计划仅涉及：{'、'.join(planned_intents or [])}），"
+                    "请改用计划内的工具或直接结束。"
+                )
+                # 记录越界原因并结束循环。
+                # 注意不能写 `outcome.stopped_reason or "..."`：ModelToolOutcome 的
+                # stopped_reason 默认值是 "no_tool_call"（非空），`or` 会永远保留默认值，
+                # 导致真实原因丢失（这个坑被新测试抓到）。
+                outcome.stopped_reason = "tool_out_of_plan_scope"
+                break
 
             # 重复调用闸门：完全相同的 (工具, 参数) 重复调用在确定性工具上必然得到相同结果，
             # 继续下去只是浪费预算与配额。实测"我的订单 ORD-123456 状态"连续 4 轮传入完全相同的

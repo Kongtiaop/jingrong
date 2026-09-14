@@ -108,7 +108,12 @@ class CustomerRagAnswerService:
                 self.provider,
                 model=self.provider.settings.qwen_chat_model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
+                # temperature=0：本任务是"**基于引用复述事实**"，不需要创作性随机。
+                # 此前为 0.1，实测同一 query 两次生成出现**事实相反**的断言
+                # （"我有没有风险限制" 一次答"是的，您有风险限制"、一次答"无法判断"），
+                # 属金融场景不可接受的合规风险，也让对照/评测不可复现
+                # （ISSUE-20260914-GENERATION-TEMPERATURE-INSTABILITY）。
+                temperature=0.0,
             )
             text = (response.choices[0].message.content or "").strip()
             if not text:
