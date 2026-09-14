@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 186 条真 bug 修复记录。
+- 共 187 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1631,4 +1631,29 @@ return status, clarification, "\n".join(lines) or "当前没有可返回的结�
 **解法方向（未实施）**：① 聚合时按 answer 去重；② 占位文案不参与拼接（仅在无任何实体答案时统一给一次）；③ 引入 `TaskExecutionResult.is_placeholder` 标记以区分实体/兜底。
 **关联**：与 ISSUE-20260914-COMPLETED-STATUS-MASKED-BY-DROPPED-TASK 同族——**`summarize` 对多 task 的聚合语义过于粗糙**：既会让"丢 task"伪装成 `completed`，也会让占位文案重复拼接。建议一并重构聚合层。
 **验证**：直接调用 `CustomerTaskExecutor.summarize` 传入两个 `needs_clarification` + 相同占位 answer 的 task，复现上述重复串。
+
+### ISSUE-20260914-REACT-BUDGET-AND-PLACEHOLDER-DIVERGENCE
+- 日期：2026-09-14
+- 分类：Agent / 图与管线行为差异 / 可观测性
+- 严重程度：P3
+- 状态：OPEN（已定位，未修）
+**背景**：为定位 `你们公司的主营业务是什么` 的路径差异，新增 task 级明细探针 `scripts/inspect_query_dual.py`（原 `compare_graph_vs_pipeline.py` 只比对聚合字段，看不到"哪个 task 失败、为什么失败"）。探针输出**推翻了此前的假设**。
+**被推翻的假设**：曾推测"图丢掉了 `company_info` 已成功的答案、只有 `needs_handoff` 粒度过粗"。
+**实测事实**（同一 query、同一次运行）：
+
+| | pipeline | graph |
+|---|---|---|
+| task 集合与状态 | `company_info=needs_clarification`、`company_business=needs_clarification` | **完全相同** |
+| tool_calls | t1=2、t2=2 | t1=**4**、t2=**5** |
+| answer 占位文案 | `当前知识库没有足够依据，建议转人工客服或创建工单。`（`CustomerRagService` 的 handoff 文案）| `当前资料不足。`（`react_step_node` 硬编码占位）|
+
+即：**task 级完全一致，两个 task 都失败**，图**没有**丢答案。此前"图丢答案"的推断**错误**，已证伪。差异只剩两处**表面差异**：
+1. **ReAct 工具预算不同**：管线 `CustomerTaskExecutor.MAX_REACT_ITERATIONS=20`，图 `max_iterations=4`（`AGENT_GRAPH_MAX_ITERATIONS`）。图重试更多次（4/5 vs 2/2）——注意图的计数含跨 task 累计展示，但上限确实更低。**同一 query 下两条路径的检索尝试次数不同**，属编排参数未对齐。
+2. **兜底占位文案不同源**：管线直接用 RAG 的 handoff message，图用自己硬编码的 `"当前资料不足。"`。同一语义两种文案，导致 `answer` 字段字符串比对必然 DIFF，且用户体验不一致（管线文案更有指导性）。
+**另一项重要观察（不确定性仍在）**：该 query 在**对照运行**中是 `pipeline=partially_completed`，在**本次探针**中是 `pipeline=needs_clarification`——**同一 query、同一代码、同一容器，pipeline 结论两次不同**。印证 ISSUE-20260914-RAG-EVIDENCE-THRESHOLD-MARGIN 的边缘抖动（`best_sim≈0.5667` vs 阈值 `0.55`）：抖动发生在**管线侧**，说明问题**不限于图**，是 RAG 判定层本身不可复现。
+**解法方向（未实施）**：
+1. 对齐 ReAct 预算：图 `max_iterations` 与管线 `MAX_REACT_ITERATIONS` 取同一配置源，否则"图 vs 管线"对照本身不公平；
+2. 统一兜底占位文案：图复用 RAG 的 handoff message，避免同义不同文；
+3. 优先级最高的仍是 RAG 阈值抖动（见上条 ISSUE）——它让**任何**双跑对照都无法稳定复现，是评估可信度的根因。
+**价值**：本条的探针脚本是排查此类差异的**必要基础设施**——没有 task 级可见性，就会像本次一样凭聚合字段做出错误推断。
 
