@@ -108,6 +108,33 @@ async def main() -> int:
     svc = CustomerRagService(retriever, embedding_provider=embedding_provider)
     print(f"min_score={svc.min_score}  min_similarity={svc.min_similarity}  "
           f"thresholds={svc.thresholds}\n")
+
+    # ---- 嵌入口径 A/B（定位"跨环境判定翻转"）----
+    # 同一批 chunk、同一检索串，只换**门控嵌入用的查询**，看 best_sim 是否跨越阈值。
+    # 这能直接回答："拒答/作答的差别是嵌入口径造成的，还是知识库数据造成的。"
+    print("-" * 78)
+    print("嵌入口径 A/B（同一 intent=company_info）")
+    print("-" * 78)
+    probe_intent = "company_info"
+    probe_normalized = normalize_customer_query(args.query, probe_intent)
+    probe_scope = scope_for_customer_intent(probe_intent)
+    for label, text_to_embed in (("原始 query", args.query),
+                                 ("膨胀 normalized", probe_normalized)):
+        try:
+            vec = (await embedding_provider.embed([text_to_embed]))[0]
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [{label}] 嵌入失败：{type(exc).__name__}")
+            continue
+        hits = await retriever.search(query=probe_normalized, query_embedding=vec,
+                                      top_k=max(svc._config.get_top_k(), 5), scope=probe_scope)
+        sims = [float(h.vector_similarity) for h in hits if h.vector_similarity is not None]
+        best = max(sims) if sims else None
+        gate = ("放行(>=answer)" if best is not None and best >= svc.thresholds["answer"]
+                else "拒答(<reject)" if best is not None and best < svc.thresholds["reject"]
+                else "judge区间")
+        print(f"  [{label:<16}] best_sim={best if best else 0:.4f}  门控={gate}")
+        print(f"      嵌入口径串 = {text_to_embed!r}")
+    print()
     per_intent: dict[str, dict] = {}
     for intent in intents:
         # 走**真实检索路径**（与 service 同口径），拿到 chunk 集合与相似度
@@ -140,6 +167,9 @@ async def main() -> int:
         print(f"  similarities = {sims}")
         print(f"  chunk_ids    = {sorted(chunk_ids)}")
         print(f"  message({len(rag.message or '')} chars) = {(rag.message or '')[:110]!r}")
+        # service 自己的 top_k（动态取值，可能与脚本用的不同）——对齐后可排除"参数不同"这一解释
+        print(f"  service.top_k_for_query = {svc._config.get_top_k_for_query(args.query)}"
+              f"  get_top_k = {svc._config.get_top_k()}")
 
     print()
     print("=" * 78)

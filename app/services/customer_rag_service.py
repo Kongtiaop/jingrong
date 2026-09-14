@@ -120,9 +120,23 @@ class CustomerRagService:
         query_embedding = None
         if self.embedding_provider is not None:
             try:
-                # 门控/向量排序用【原始 query】的相似度；normalized_query 仅用于文本排序。
-                # 若用 normalized_query 嵌入，company_info 等会强制追加"公司名称/联系方式"等膨胀词，
-                # 把无关查询（如天气）的相似度抬高，导致相似度门控失效。
+                # 门控/向量腿必须与**它自己的检索文本**同源（ISSUE-20260914-GATE-EMBEDDING-MISMATCH）。
+                #
+                # 历史问题：这里嵌入【原始 query】做门控，而检索（_do_search）把
+                # 【normalized_query】同时交给**文本腿和向量腿**。于是：
+                #   - 门控算出的 best_sim 来自"原始 query vs chunk"
+                #   - 实际命中/返回的证据来自"normalized_query 的文本腿 + 原始 query 的向量腿"
+                # 两者不同源 → best_sim 与"返回的证据"**不自洽**；因为向量腿用的正是
+                # query_embedding（原始 query），而文本腿用的是膨胀后的串，
+                # 于是"门控拒绝"与"证据其实相关"可以同时成立。
+                # 实测：同一 query 本地判 low_confidence、容器内判 sufficient（跨环境翻转）。
+                #
+                # 现在的口径（明确定义，消除二义）：
+                #   向量腿  ← 原始 query（嵌入它）—— 语义相似度必须反映用户的**真实问句**，
+                #             不能被"公司名称/联系方式"等扩展词抬高（那会让门控失效，
+                #             也是这里原本刻意用原始 query 的原因，该意图予以保留）。
+                #   文本腿  ← normalized_query（扩展词只帮助**关键词**命中，不影响相似度）。
+                #   门控    ← 只采信**向量腿**的相似度（见下方 vector_only 说明），因此天然自洽。
                 query_embedding = (await asyncio.wait_for(self.embedding_provider.embed([query]), timeout=self.embedding_timeout))[0]
             except Exception:
                 evidence_status = "embedding_degraded"
