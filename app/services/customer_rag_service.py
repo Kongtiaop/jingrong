@@ -160,10 +160,16 @@ class CustomerRagService:
         # 中间带(ambiguous)用 LLM-judge 判证据充分性（无 judge 则退回 min_similarity 单阈值）。
         sims = [c.vector_similarity for c in useful if c.vector_similarity is not None]
         best_sim = max(sims) if sims else None
-        # ambiguous 带：若配置用 LLM-judge 且提供了 judge，则调用判证据充分性
+        # ambiguous 带：若配置用 LLM-judge 且提供了 judge，则调用判证据充分性。
+        # 注意 judge 只在其**子区间** [judge_reject, judge_answer) 内介入：
+        # judge 是 LLM 裁决、存在误判（实测把明知相关的制度引用判成 no），
+        # 故把高分区（如 0.55~0.65）直接放行，只让 judge 处理更边缘的低分区。
+        # 见 ISSUE-20260914-JUDGE-MISJUDGES-RELEVANT-EVIDENCE。
         judge_result = None
+        judge_lo = self.thresholds.get("judge_reject", self.thresholds["reject"])
+        judge_hi = self.thresholds.get("judge_answer", self.thresholds["answer"])
         if self.thresholds.get("judge_ambiguous") and self.ambiguous_judge is not None and best_sim is not None \
-                and self.thresholds["reject"] <= best_sim < self.thresholds["answer"]:
+                and judge_lo <= best_sim < judge_hi:
             try:
                 judge_result = await self.ambiguous_judge(query, [c.content for c in useful])
             except Exception:  # noqa: BLE001 - judge 失败不阻塞，按不通过处理

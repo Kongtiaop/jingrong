@@ -114,3 +114,84 @@ def test_judge_ambiguous_config_is_true_so_wiring_matters():
     svc = CustomerRagService(retriever=object(), embedding_provider=None)
     assert svc.thresholds.get("judge_ambiguous") is True, \
         "配置 judge_ambiguous 已改为非 true，需重新评估接线必要性"
+
+
+# ---- 回归：judge 曾误杀"相关但相似度低"的引用 ----
+# ISSUE-20260914-JUDGE-MISJUDGES-RELEVANT-EVIDENCE：实测 best_sim=0.5559 的检索，
+# 引用内容明确在讲"风险等级匹配/C4可买R5"（与问题高度相关），judge 却判 no，
+# 使该结果从 sufficient 翻转为 low_confidence。故收窄 judge 介入区间到低分区。
+#
+# 注意：config/understanding.yaml 在测试进程里默认未被加载（main.py lifespan 才 reload），
+# 故这些测试显式 reload，否则读到的是代码内置默认值（judge 带 = 完整 ambiguous 带）。
+
+def _reloaded_service(retriever, **kw):
+    from app.services.understanding_config import understanding_config
+    from app.services.customer_rag_service import CustomerRagService
+    understanding_config.reload()
+    return CustomerRagService(retriever, **kw)
+
+
+def test_judge_band_is_narrower_than_ambiguous_band():
+    """judge 只在低分区介入；高分区（judge_answer~answer）直接放行。"""
+    from app.services.understanding_config import understanding_config
+    understanding_config.reload()
+    t = understanding_config.get_rejection_thresholds()
+    assert t["judge_reject"] >= t["reject"], "judge 下界不应低于 reject 下界"
+    assert t["judge_answer"] <= t["answer"], "judge 上界不应高于 answer 上界"
+    assert t["judge_answer"] < t["answer"], \
+        "judge 上界必须窄于 answer 上界，否则高分区仍会被 judge 误杀"
+
+
+def test_high_band_score_bypasses_judge_entirely():
+    """best_sim 落在 [judge_answer, answer) 时不应调用 judge（曾在此误杀 0.5559）。"""
+    import asyncio
+
+    calls = []
+
+    async def spy_judge(query, contexts):
+        calls.append(query)
+        return False   # 故意总判 no：若被调用就会 reject
+
+    class FakeCitation:
+        def __init__(self, sim):
+            self.chunk_id = "c1"; self.document_id = "d1"; self.version_id = "v1"
+            self.content = "C4投资者购买R5产品需签风险揭示书，单只不超总资产10%"
+            self.score = 0.6; self.title_path = ""; self.page_number = None
+            self.metadata = {}; self.vector_similarity = sim
+
+    class FakeRetriever:
+        async def search(self, **kw):
+            return [FakeCitation(0.5559)]
+
+    svc = _reloaded_service(FakeRetriever(), embedding_provider=None,
+                            ambiguous_judge=spy_judge, min_score=0.0)
+    result = asyncio.run(svc.answer(query="客户存在待处理风险记录时是否影响交易权限", intent="risk_public"))
+    assert calls == [], f"0.5559 落在高分区，不应调用 judge（实际调用 {len(calls)} 次）"
+    assert result.handoff_required is False, "高分区应直接作答，不应因 judge 误判而转人工"
+
+
+def test_low_band_score_still_uses_judge():
+    """低分区（0.35~0.55）仍交给 judge 拦截明显无关引用。"""
+    import asyncio
+
+    calls = []
+
+    async def spy_judge(query, contexts):
+        calls.append(query)
+        return False
+
+    class FakeCitation:
+        def __init__(self, sim):
+            self.chunk_id = "c1"; self.document_id = "d1"; self.version_id = "v1"
+            self.content = "无关内容"; self.score = 0.4; self.title_path = ""
+            self.page_number = None; self.metadata = {}; self.vector_similarity = sim
+
+    class FakeRetriever:
+        async def search(self, **kw):
+            return [FakeCitation(0.45)]
+
+    svc = _reloaded_service(FakeRetriever(), embedding_provider=None,
+                            ambiguous_judge=spy_judge, min_score=0.0)
+    result = asyncio.run(svc.answer(query="无关问题", intent="risk_public"))
+    assert len(calls) == 1, "低分区应调用 judge"
+    assert result.handoff_required is True, "judge 判 no → 应拒答转人工"

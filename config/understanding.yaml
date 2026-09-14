@@ -38,6 +38,13 @@ retrieval:
   reject_similarity: 0.35   # 低于此 → 直接拒答转人工（明显无关，便宜，安全下限）
   answer_similarity: 0.65   # 高于此 → 直接作答（明显相关，便宜）
   judge_ambiguous: true     # ambiguous 带（0.35~0.65）是否用 LLM-judge 判证据充分性
+  # judge 介入的子区间 [judge_reject_similarity, judge_answer_similarity)。
+  # 收窄理由（ISSUE-20260914-JUDGE-MISJUDGES-RELEVANT-EVIDENCE）：judge 是 LLM 裁决，
+  # 实测把"讲风险等级匹配/C4 可买 R5"这类**明显相关的制度引用**判成 no（误杀），
+  # 使 best_sim=0.5559 的改写从 sufficient 翻成 low_confidence。
+  # 现让 judge 只管低分区 0.35~0.55（拦截明显无关），0.55~0.65 直接放行。
+  judge_reject_similarity: 0.35
+  judge_answer_similarity: 0.55
 
 # 切片参数（结构感知切块，字节验证效果好；改配置即改切片，不用改代码）
 chunking:

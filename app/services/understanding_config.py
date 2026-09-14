@@ -221,12 +221,23 @@ class UnderstandingConfig:
         return float(self._data.get("retrieval", {}).get("min_similarity", 0.55))
 
     def get_rejection_thresholds(self) -> dict:
-        """分层决策阈值：reject(低于此直接拒)/answer(高于此直接答)/judge_ambiguous(中间带是否用 LLM-judge)。"""
+        """分层决策阈值：reject(低于此直接拒)/answer(高于此直接答)/judge_ambiguous(中间带是否用 LLM-judge)。
+
+        judge_reject/judge_answer：**judge 介入的子区间**（默认沿用完整 ambiguous 带，向后兼容）。
+        设置该子区间的理由（ISSUE-20260914-JUDGE-MISJUDGES-RELEVANT-EVIDENCE）：
+        judge 是"LLM 裁决"，本身有误判风险——实测它把明知相关的制度引用判成 no。
+        把 judge 限定在**低分区**（如 0.35~0.55），高分区（0.55~0.65）直接放行，
+        既保留"拦截明显无关引用"的能力，又避免误杀边缘相关引用。
+        """
         r = self._data.get("retrieval", {}) or {}
+        reject = float(r.get("reject_similarity", 0.35))
+        answer = float(r.get("answer_similarity", 0.65))
         return {
-            "reject": float(r.get("reject_similarity", 0.35)),
-            "answer": float(r.get("answer_similarity", 0.65)),
+            "reject": reject,
+            "answer": answer,
             "judge_ambiguous": bool(r.get("judge_ambiguous", True)),
+            "judge_reject": float(r.get("judge_reject_similarity", reject)),
+            "judge_answer": float(r.get("judge_answer_similarity", answer)),
         }
 
     def get_chunking(self) -> dict:

@@ -24,15 +24,28 @@ def build_answerability_judge(provider: QwenProvider):
     """构造"能否从引用作答"的 LLM-judge（分层门控的 ambiguous 带用）。
 
     返回 async judge(query, contexts) -> bool：基于引用能否回答用户问题。
+
+    判定标准经过一次实测修正（ISSUE-20260914-JUDGE-MISJUDGES-RELEVANT-EVIDENCE）：
+    原提示词要求"引用**足以回答**"才 yes，但 `query` 传进来的是**检索用的改写文本**
+    （可能已被模型收窄成某个子问题），而引用是按用户原始意图召回的。实测：
+      - query='客户存在待处理风险记录时，是否影响交易权限？...' + 引用讲"风险等级匹配/C4可买R5"
+        → judge 严格按字面判 no，**误杀**了本可用于回答"我有没有风险限制"的依据；
+      - 同样内容的引用换成另一次改写 → judge 判 yes。**同一批引用判定不一致**。
+    故放宽为"引用是否包含与问题相关的制度依据"，避免因改写措辞差异而误杀。
     """
     async def judge(query: str, contexts: list[str]) -> bool:
         if provider._client is None:
             return False
         evidence = "\n\n".join(f"[引用 {index}] {content}" for index, content in enumerate(contexts, 1))
         prompt = (
-            "你是财富管理客服助手。基于以下检索引用，判断能否回答用户的问题。\n"
-            "如果引用足以回答，回答 yes；如果引用与问题无关或不足，回答 no。\n\n"
-            f"用户问题：{query}\n\n检索引用：\n{evidence}\n\n只回答 yes 或 no。"
+            "你是财富管理客服助手。以下检索引用来自公司制度/客服知识库。\n"
+            "请判断：**这些引用是否包含与用户问题相关的依据**（可用于组织回答该问题的素材）。\n\n"
+            "判定要点：\n"
+            "- 只要引用涉及该问题所属的制度、规则、流程、产品要素等，即回答 yes；\n"
+            "- 检索问题可能只是用户疑虑的某一个侧面，只要引用对理解该主题有帮助就算相关；\n"
+            "- 只有当引用与该问题**完全无关**（如问风险限制却召回理财产品收益率）时才回答 no；\n"
+            "- 宁可从宽：信息不完整但方向相关 → yes。\n\n"
+            f"检索问题：{query}\n\n检索引用：\n{evidence}\n\n只回答 yes 或 no。"
         )
         try:
             response = await _call_chat(
