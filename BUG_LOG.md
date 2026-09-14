@@ -1508,7 +1508,12 @@ Schema 缓存 key 如果不绑定权限上下文，用户 A 可能命中用户 B
 2. **纯偏好短路**：管线对"只自述偏好、未要求推荐/购买"的消息走 `pure_preference_statement()`，先落记忆并回复确认、不直接推产品清单（`customer_agent_execution.py:327-337`）；图无此分支。
 **根因**：接线补副作用时补齐了澄清计数、转人工建单、短时记忆回写、情景记忆入队共 4 项，**遗漏了偏好链路这 2 项**。
 **影响**：用户说"我偏好稳健"时，图不会写入长时记忆 → 后续会话/推荐无法复用该偏好；同一句话两条路径答复策略也不同（管线先确认、图直接推荐）。**因此"图优于管线"仅成立于意图识别维度**，完整看是"意图识别更稳、偏好链路缺失"。
-**解决**：**未做（切流前置项）**。需在图的 `intent_plan_node`（或新增 `preference_node`）补齐 `extract_preference_statement` + `remember` + `pure_preference_statement` 短路，补齐后方可与管线谈等价替换。
+**解决**：**已完成**。在 `intent_plan_node` 补齐两条链路：
+1. **偏好持久化**：`extract_preference_statement()` 抽取自述偏好 → `CustomerMemoryService.remember()` 写长时记忆 + `SharedMemoryService.remember(scope="shared", memory_type="observation")` 供投顾/推荐等其它 Agent 复用。与管线一致地加 `state.is_customer` 守卫——**staff/advisor 代客分析不得短路、不得把员工自述当客户偏好落记忆**。
+2. **纯偏好短路**：复用 `pure_preference_statement()`（与管线**同一个函数**，保证判定等价），命中时置 `preference_short_circuit=True` 并由新增条件边 `intent_plan_node → persist_node` **跳过 route/execute**（不执行任何任务、不推产品清单）；`persist_node` 对短路分支单独写短时记忆——**`clarification_count` 归零**、清空 `pending_intent_plan`/`handoff`，避免把"确认偏好"误记成一次失败澄清而累积到转人工。
+   新增 `AgentState.preference_short_circuit` / `preference_recorded` 字段。
+**踩坑记录**：① 初版把 shared 写入与私有写入放在**同一个 try** 内，私有失败不会连带跳过 shared，但契约失败会——已拆成两个 try；② 初版短路条件漏了 `is_customer` 守卫，导致员工代客分析被误短路（回归测试抓到后修复）。
+**验证**：新增 6 个回归测试（偏好落库、短路不执行、计数归零、带请求标记不短路、shared 观察写入、员工不短路不落客户记忆）；用"撤销 is_customer 守卫"确认测试会失败。`tests 273 passed`。**注**：`pure_preference_statement` 的 `比较` 标记会误命中"我比较保守"（"比较"当"比较产品"）——属**既有**问题且图如实继承，保证等价，不在本次范围。
 **验证**：`grep -c "pure_preference_statement\|extract_preference_statement" app/agents/graph.py` → 0；管线对应命中见上述行号。
 
 ### ISSUE-20260914-COMPARE-SCRIPT-STATEFUL-RERUN

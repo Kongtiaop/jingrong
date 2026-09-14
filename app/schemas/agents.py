@@ -49,6 +49,9 @@ class AgentState(BaseModel):
     customer_service_session_status: str | None = None
     # persist_node 的落库结果（供 runner 审计/断言）
     persisted: bool = False
+    # 偏好链路（与管线对齐）：intent_plan_node 写入，短路时直接跳 persist_node
+    preference_short_circuit: bool = False             # 纯偏好自述 → 只确认不推荐
+    preference_recorded: dict = Field(default_factory=dict)  # 本轮落库的偏好 {key, value}
 
 
 class AgentResult(BaseModel):

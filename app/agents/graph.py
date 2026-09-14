@@ -5,8 +5,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app.schemas.agents import AgentState
-from app.services.customer_intent import CustomerIntentPlanner, IntentPlan, IntentTask, execution_mode_for_intent
-from app.services.customer_agent_execution import route_for_plan
+from app.services.customer_intent import (
+    CustomerIntentPlanner,
+    IntentPlan,
+    IntentTask,
+    execution_mode_for_intent,
+    extract_preference_statement,
+)
+from app.services.customer_agent_execution import pure_preference_statement, route_for_plan
 from app.services.customer_rag_service import CustomerRagResult
 from app.services.customer_task_executor import CustomerTaskExecutor, TaskExecutionResult
 from app.services.knowledge_retrieval import KnowledgeCitation
@@ -194,6 +200,52 @@ class SupervisorGraph:
                 conversation_context = ""
 
         active_product = _active_product_from_short_term(short_term) or facts.get("active_product") or state.active_product
+
+        # ---- 偏好链路（与管线对齐）----
+        # 管线在规划**之前**做两件事，图此前缺失（ISSUE-20260914-GRAPH-MISSING-PREFERENCE-CHAIN）：
+        # ① 用户自述偏好 → 落长时记忆（低风险、可撤销）
+        # ② 纯偏好自述（未要求推荐/购买/筛选）→ 短路：只确认、不自动推产品清单
+        preference = extract_preference_statement(state.user_message)
+        pref_patch: dict[str, Any] = {}
+        if preference and memory is not None and state.is_customer:
+            pref_key, pref_value = preference
+            try:
+                await memory.remember(
+                    customer_id=state.customer_id or "", key=pref_key, value=pref_value,
+                    memory_type="conversation_fact", source="customer_stated",
+                    conversation_id=state.conversation_id)
+            except Exception:  # noqa: BLE001 - 记忆写入失败不阻塞主流程
+                pass
+            # 共享记忆语义层：客服观察写入 shared 作用域，供投顾/推荐等其它 Agent 复用。
+            # 与私有写入分开 try：契约写入失败不应连带跳过 shared 观察。
+            try:
+                from app.services.shared_memory_service import SharedMemoryService
+                await SharedMemoryService(self.database, self.redis_client).remember(
+                    customer_id=state.customer_id or "", agent_type="customer_service",
+                    key=pref_key, value=pref_value, memory_type="observation", scope="shared",
+                    source="customer_stated", conversation_id=state.conversation_id,
+                    actor_user_id=state.customer_id)
+            except Exception:  # noqa: BLE001 - 共享写入失败不阻塞主流程
+                pass
+            pref_patch["preference_recorded"] = {"key": pref_key, "value": pref_value}
+
+        # 纯偏好短路：仅当不是澄清补答（pending 为空）且为真实客户时才短路，与管线一致。
+        # is_customer=False（staff/advisor 代客分析）不得短路——员工的自述不是客户偏好。
+        if (state.is_customer and not pending.get("tasks")
+                and pure_preference_statement(state.user_message, preference)):
+            pref_patch.update({
+                "preference_short_circuit": True,
+                "plan": {},
+                "route": "customer_recommendation",
+                "selected_agents": ["CustomerRecommendationCapability"],
+                "task_results": [],
+                "clarification": None,
+                "overall_status": "needs_clarification",
+                "final_response": f"好的，我已记下您的偏好：{preference[1]}。需要我按这个偏好为您推荐合适的产品吗？",
+                "active_product": active_product or "",
+            })
+            return pref_patch
+
         plan = self._plan(combined, active_product)
         return {
             "plan": _plan_to_dict(plan),
@@ -432,6 +484,25 @@ class SupervisorGraph:
             }
 
         try:
+            if state.preference_short_circuit:
+                # 纯偏好短路：与管线早退分支写同样的状态——清空本轮 task/澄清/工单，
+                # 计数归零，避免把「只确认偏好」当成一次失败澄清而累积澄清次数。
+                await memory.save_short_term(
+                    customer_id=state.customer_id or "", conversation_id=state.conversation_id,
+                    state={
+                        "conversation_id": state.conversation_id,
+                        "original_query": state.user_message,
+                        "latest_query": state.user_message,
+                        "task_results": [],
+                        "plan_execution_modes": [],
+                        "clarification": None,
+                        "missing_parameter": False,
+                        "clarification_count": 0,
+                        "pending_intent_plan": {},
+                        "handoff": None,
+                        "active_product": active_product or "",
+                    })
+                return {"persisted": True, "clarification": None}
             await memory.save_short_term(
                 customer_id=state.customer_id or "", conversation_id=state.conversation_id,
                 state={
@@ -490,6 +561,12 @@ class SupervisorGraph:
         return "react_done_node" if state.react_result else "react_step_node"
 
     # ---- 条件路由 ----
+    def _route_after_intent_plan(self, state: AgentState) -> str:
+        """纯偏好自述短路时直接落库收尾，跳过 route/execute（与管线早退行为一致）。"""
+        if state.preference_short_circuit:
+            return "persist_node"
+        return "route_node"
+
     def _route_after_plan(self, state: AgentState) -> str:
         """按意图类型与澄清状态决定下一节点：read-only ReAct / 确定性执行 / clarify / handoff。"""
         if state.plan.get("clarification"):
@@ -518,7 +595,10 @@ class SupervisorGraph:
         g.add_node("persist_node", self.persist_node)
 
         g.add_edge(START, "intent_plan_node")
-        g.add_edge("intent_plan_node", "route_node")
+        # 纯偏好自述短路 → 直接 persist；其余走正常编排
+        g.add_conditional_edges("intent_plan_node", self._route_after_intent_plan, {
+            "persist_node": "persist_node", "route_node": "route_node",
+        })
         g.add_conditional_edges("route_node", self._route_after_plan, {
             "clarify_node": "clarify_node", "handoff_node": "handoff_node",
             "execute_node": "execute_node", "react_step_node": "react_step_node",

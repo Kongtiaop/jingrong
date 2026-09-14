@@ -127,6 +127,170 @@ class FakeKnowledgeTool:
                   "citations": [{"chunk_id": f"{intent}-c1", "content": f"{intent} 内容"}]})
 
 
+# ---------- 偏好链路（切流前置项：图此前完全缺失） ----------
+# ISSUE-20260914-GRAPH-MISSING-PREFERENCE-CHAIN：管线有「偏好持久化 + 纯偏好短路」两条链路，
+# 图此前都没有（grep pure_preference/extract_preference_statement in graph.py → 0）。
+# 缺这两条时切流会造成功能退化：用户说"我偏好稳健"不会写入长时记忆，后续推荐无法复用。
+
+
+class PreferenceRecorder:
+    """记录 remember / save_short_term 调用，验证偏好链路副作用。"""
+
+    def __init__(self):
+        self.remembered = []
+        self.saved = []
+
+    async def load_short_term(self, *, customer_id, conversation_id):
+        return {}
+
+    async def save_short_term(self, *, customer_id, conversation_id, state):
+        self.saved.append(state)
+
+    async def load_long_term(self, *, customer_id, keys=None):
+        return []
+
+    async def remember(self, **kw):
+        self.remembered.append(kw)
+
+
+class SimpleDatabase:
+    """最小 database：仅为让 SharedMemoryService 构造成功。
+
+    偏好短路路径不应触达业务 session（session_factory 会抛错以暴露误用）。
+    """
+
+    def session_factory(self):
+        raise RuntimeError("偏好短路路径不应触达 DB session")
+
+
+def _pref_graph(memory):
+    """构造带偏好链路的图（database 用最小替身）。"""
+    supervisor = SupervisorGraph(database=SimpleDatabase())
+    supervisor._memory = lambda: memory
+    return supervisor.build()
+
+
+def test_preference_is_persisted_to_long_term_memory():
+    """用户自述偏好必须落长时记忆（含 shared 作用域），供后续会话/其它 Agent 复用。"""
+    memory = PreferenceRecorder()
+    graph = _pref_graph(memory)
+    asyncio.run(graph.ainvoke(_state(user_message="我偏好稳健型")))
+
+    keys = [r.get("key") for r in memory.remembered]
+    assert "risk_preference" in keys, f"偏好未落库: {keys}"
+    entry = next(r for r in memory.remembered if r.get("key") == "risk_preference")
+    assert entry["value"] == "balanced"
+    assert entry["source"] == "customer_stated"
+
+
+def test_pure_preference_short_circuits_without_execution():
+    """纯偏好自述 → 只确认、不推荐产品清单；route 为推荐但 results 为空。"""
+    memory = PreferenceRecorder()
+    graph = _pref_graph(memory)
+    final = asyncio.run(graph.ainvoke(_state(user_message="我偏好稳健型")))
+
+    assert final["preference_short_circuit"] is True
+    assert final["overall_status"] == "needs_clarification"
+    assert final["route"] == "customer_recommendation"
+    assert final["selected_agents"] == ["CustomerRecommendationCapability"]
+    assert final["task_results"] == [], "短路不应执行任何任务"
+    assert "已记下您的偏好" in final["final_response"]
+
+
+def test_pure_preference_resets_clarification_count():
+    """短路是"确认"而非"失败澄清"，计数必须归零，否则会累积到误转人工。"""
+    memory = PreferenceRecorder()
+    graph = _pref_graph(memory)
+    asyncio.run(graph.ainvoke(_state(user_message="我偏好稳健型", clarification_count=1)))
+    assert memory.saved, "短路也要回写短时记忆"
+    assert memory.saved[-1]["clarification_count"] == 0
+    assert memory.saved[-1]["pending_intent_plan"] == {}
+    assert memory.saved[-1]["handoff"] is None
+
+
+def test_preference_with_request_marker_does_not_short_circuit():
+    """"我偏好稳健，推荐个产品"含请求标记 → 不短路，走正常推荐编排。"""
+    memory = PreferenceRecorder()
+
+    class RecommendPlanner:
+        def plan(self, query, context=None):
+            return IntentPlan(normalized_query=query, tasks=[IntentTask(
+                "t1", "product_recommendation", "suitability", query, confidence=.96)])
+
+    class FakeRecommendExecutor:
+        async def execute(self, *, customer_id, plan):
+            return [TaskExecutionResult(t.task_id, t.intent, "succeeded",
+                                        answer="推荐结果", data={}) for t in plan.tasks]
+
+    supervisor = SupervisorGraph(planner=RecommendPlanner(), executor=FakeRecommendExecutor(),
+                                 database=SimpleDatabase())
+    supervisor._memory = lambda: memory
+    final = asyncio.run(supervisor.build().ainvoke(_state(user_message="我偏好稳健，推荐个产品")))
+
+    assert final.get("preference_short_circuit") is not True
+    assert final["task_results"], "应正常执行推荐任务"
+
+
+def test_preference_shared_observation_written_for_other_agents():
+    """偏好同时写入 shared 作用域观察，供投顾/推荐等其它 Agent 复用。
+
+    注意：graph.py 内是**函数局部** `from ... import SharedMemoryService`，
+    因此必须 patch 源模块 app.services.shared_memory_service，patch graph 模块属性无效。
+    """
+    import app.services.shared_memory_service as sms_mod
+    memory = PreferenceRecorder()
+    shared_calls: list = []
+    original = sms_mod.SharedMemoryService
+
+    class RecordingShared:
+        def __init__(self, database, redis_client=None):
+            pass
+
+        async def recall(self, **kw):
+            return []
+
+        async def remember(self, **kw):
+            shared_calls.append(kw)
+
+    sms_mod.SharedMemoryService = RecordingShared
+    try:
+        supervisor = SupervisorGraph(database=SimpleDatabase())
+        supervisor._memory = lambda: memory
+        asyncio.run(supervisor.build().ainvoke(_state(user_message="我喜欢稳健的产品")))
+    finally:
+        sms_mod.SharedMemoryService = original
+
+    assert shared_calls, "应写入 shared 作用域观察"
+    assert shared_calls[0]["scope"] == "shared"
+    assert shared_calls[0]["key"] == "product_preference"
+
+
+def test_staff_call_does_not_short_circuit_or_write_customer_memory():
+    """staff/advisor 分析不得把员工当客户落记忆（is_customer=False 时跳过偏好链路）。"""
+    memory = PreferenceRecorder()
+
+    class ClearPlanner:
+        def plan(self, query, context=None):
+            return IntentPlan(normalized_query=query, tasks=[IntentTask(
+                "t1", "asset_summary", "business_fact", query, confidence=.9)])
+
+    class FakeExecutor:
+        async def execute(self, *, customer_id, plan):
+            return [TaskExecutionResult(t.task_id, t.intent, "succeeded", answer="ok", data={})
+                    for t in plan.tasks]
+
+    supervisor = SupervisorGraph(planner=ClearPlanner(), executor=FakeExecutor(),
+                                 database=SimpleDatabase())
+    supervisor._memory = lambda: memory
+    final = asyncio.run(supervisor.build().ainvoke(
+        _state(user_message="我偏好稳健型", is_customer=False)))
+
+    assert final.get("preference_short_circuit") is not True
+    pref_writes = [r for r in memory.remembered
+                   if r.get("key") in {"risk_preference", "product_preference"}]
+    assert not pref_writes, "员工调用不应写入客户偏好记忆"
+
+
 # ---------- 多意图：ReAct 路径不得丢 task（真实回归 bug） ----------
 
 def test_react_loop_covers_all_knowledge_tasks():
