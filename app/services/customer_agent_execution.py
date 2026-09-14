@@ -141,12 +141,26 @@ class CustomerAgentExecutionService:
 
     @staticmethod
     def _structured_from_rule_plan(plan) -> StructuredIntent:
+        """规则 plan → 结构化意图。
+
+        primary_intent 保留规划器的**原始意图**（asset_summary / workorder_status / ...），
+        不只放模板。模板是粗粒度桶（16 意图压成 4），一旦只带模板往下走，意图信息就在
+        这一步丢失，后续无论如何保护都无法恢复（历史 bug：asset_summary → T1 → 被降级成 faq）。
+        """
         task = plan.tasks[0] if plan.tasks else None
         template = "T0_UNKNOWN"
         if task:
             mapping = {"product_recommendation": "T2_PRODUCT_RECOMMENDATION", "business_operation": "T4_PURCHASE_DRAFT", "human_handoff": "T7_HUMAN_HANDOFF"}
             template = mapping.get(task.intent, "T1_INFORMATION_QUERY")
-        return StructuredIntent(template=template, primary_intent=task.intent if task else "unknown", confidence=task.confidence if task else 0.1, requires_clarification=bool(plan.clarification), missing_required_fields=[], source="rule")
+        return StructuredIntent(
+            template=template,
+            primary_intent=task.intent if task else "unknown",
+            secondary_intents=[t.intent for t in plan.tasks[1:]],
+            confidence=task.confidence if task else 0.1,
+            requires_clarification=bool(plan.clarification),
+            missing_required_fields=[],
+            source="rule",
+        )
 
     def _fallback_allowlist(self) -> set[str]:
         return {value.strip() for value in self.settings.llm_intent_fallback_allowlist.split(",") if value.strip()}
@@ -160,13 +174,41 @@ class CustomerAgentExecutionService:
         """
         return bool(self.settings.llm_intent_fallback_enabled)
 
+    # 可查真实业务数据的事实类意图：route=="business_fact"。
+    # 这些意图由确定性 planner 从明确业务词（订单/工单/资产/持仓/风险限制/在售）识别，
+    # 背后有 CustomerReadTools 的真实查询。绝不能被 T1 信息查询兜底降级成 FAQ ——
+    # 否则"查一下我的持仓"会答"资料不足，建议转人工"，而数据就在库里。
+    BUSINESS_FACT_INTENTS = frozenset({
+        "workorder_status", "order_status", "risk_restriction",
+        "asset_summary", "product_status",
+    })
+
+    @classmethod
+    def _is_business_fact_plan(cls, plan) -> bool:
+        """plan 是否全部由事实类意图构成（决定能否被信息查询兜底覆盖）。"""
+        tasks = getattr(plan, "tasks", None) or []
+        return bool(tasks) and all(t.intent in cls.BUSINESS_FACT_INTENTS for t in tasks)
+
     def _apply_structured_intent(self, plan, intent: StructuredIntent):
         """Allow only explicitly approved, read/plan-only fallback changes.
 
         Transaction and draft templates never come from the model: their route remains
         deterministic and later submission still requires verified customer confirmation.
+
+        关键约束（修复历史降级 bug）：
+        1. source=="rule" 表示 resolver 让规则胜出（高置信/受保护），此时**原样返回 plan**，
+           绝不用模板重建——模板是有损的，重建会把 asset_summary 之类压成 faq。
+        2. business_fact 路由的意图（资产/订单/工单/风险限制/产品状态）属于"可查真实数据的
+           事实类"查询，不允许被 T1_INFORMATION_QUERY 兜底降级成 FAQ；否则用户问"我的持仓"
+           会得到"资料不足，建议转人工"，而数据就在库里。
         """
         if intent.template not in self._fallback_allowlist() or intent.requires_clarification:
+            return plan
+        # 规则已胜出（resolver 高置信保护或约束合并）→ 不改动 plan
+        if intent.source == "rule":
+            return plan
+        # 事实类意图不允许被信息查询兜底覆盖
+        if intent.template == "T1_INFORMATION_QUERY" and self._is_business_fact_plan(plan):
             return plan
         query = plan.tasks[0].query if plan.tasks else plan.normalized_query
         if intent.template == "T2_PRODUCT_RECOMMENDATION":
