@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 174 条真 bug 修复记录。
+- 共 179 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -1462,4 +1462,52 @@ Schema 缓存 key 如果不绑定权限上下文，用户 A 可能命中用户 B
 **根因**：`docker-compose.yml`（`name: wealth-manager`）与 `docker-compose.p0.yml`（`name: wealth-p0`）**硬编码了相同的 `container_name: wealth-postgres` / `wealth-redis`**，而 `container_name` 是**全局唯一**、不受 project name 隔离 → 两套 compose 互相抢名字。同时两者**卷名不同**（`docker-compose.yml` 用前缀默认卷 `wealth-manager_wealth_pgdata`；`docker-compose.p0.yml` 用 `name: wealth_pgdata` 固定卷名），因此混用时还可能连到**空卷**看到空库。此前本地曾混跑两套 compose，留下 `wealth-p0-*` 与 `wealth-postgres`/`wealth-redis` 残留容器（均已 Exited）。
 **解决**：清掉残留容器后统一用 `docker compose -f docker-compose.p0.yml up -d`（数据在固定卷 `wealth_pgdata`，`docker inspect wealth-postgres` 确认挂载即此卷；删容器不丢数据）。根治方向（未做）：去掉 `docker-compose.p0.yml` 的 `container_name`，改用自动命名（`wealth-p0-postgres-1`，与 CI 已有的 `wealth-p0-api-1` 风格一致），使两套 compose 可并存互不干扰。
 **验证**：`docker compose -f docker-compose.p0.yml ps` 全部 11 个服务 Up，postgres/redis 均 healthy，API 8010 端口 health=ok。
+
+### ISSUE-20260914-INTENT-TEMPLATE-LOSSY-CHANNEL
+- 日期：2026-09-14
+- 分类：Agent / 意图识别 / 架构
+**问题**：承接 ISSUE-20260914-INTENT-FALLBACK-FACT-DOWNGRADE 的**根因分析**——为什么"加了 LLM 判断长尾，精准度反而更低"。实测发现：**即使 LLM 判对了意图，结果一样会被毁掉**。修复前同一条链路对 `LLM primary_intent=asset_summary` 的输出是 `faq`。
+**根因**：三层叠加的有损链路。
+1. **输出带宽瓶颈**：LLM 输出的 `template` 只有 **11 个值**（T0–T10），而系统有 **16 种意图**。`asset_summary`/`workorder_status`/`risk_restriction`/`greeting`/`company_info` **5 种完全不同的业务意图全部塌缩成同一个 `T1_INFORMATION_QUERY`**。模型区分得再准，输出时也被压扁。
+2. **下游拿模板当身份用**：`_apply_structured_intent` 只看 `template` 分支；T1 分支把 `primary_intent` 塞进只允许 6 个公开知识意图的 `public_intents` 白名单，**不在里面就 `else "faq"` 强制降级**。`asset_summary` 不在白名单 → 变 `faq`。**这是"静默降级"：把未知当已知处理，不报错、不澄清。**
+3. **few-shot 在教模型犯错**：统计 system prompt 的 39 个 few-shot，template 分布为 `T1`×10、`T6`×8、`T2`×5、`T4`×5、`T5`×4、`T8`×4、`T3`×2、`T7`×1；其中多个示例**明确示范 `{"primary_intent":"asset_summary","template":"T1_INFORMATION_QUERY"}`**（如"我不赎回，就查下收益""我的钱还能提出来不"）——前门教模型"事实类意图配 T1"，后门看到 T1 就按信息查询处理。
+**完整链路**：长尾 query（"查一下我的持仓"）→ 规则识别正确（asset_summary, 0.92）→ **LLM 也识别正确**（asset_summary）→ 但输出压成 `T1` → 下游按 T1 走信息查询分支、白名单不认 asset_summary → 强制改写 `faq` → 用户得到"资料不足，建议转人工"，而数据就在库里。**规则能答对、LLM 也能判对，是中间的模板翻译层把答案毁了。** 这解释了为何关掉 LLM 兜底一致率反而上升（4/14 → 7/14）：关掉即绕开这条有损链路，规则的真实意图得以直达执行。
+**解决**：已修（见 ISSUE-20260914-INTENT-FALLBACK-FACT-DOWNGRADE / INTENT-T1-MULTI-INTENT-COLLAPSE）：`source=="rule"` 时原样返回 plan 绕开模板回写；事实类意图禁止被 T1 覆盖。**根因未除，待办三项**：① 让 `primary_intent` 成为一等公民、`template` 仅作辅助提示，不再用 template 决定分支；② 改 prompt few-shot，事实类意图不再示范配 `T1`（需重新评测意图识别准确率）；③ **去掉 `public_intents` 白名单的 `else "faq"` 默认分支**——改为保留原意图或要求澄清，消除静默降级（纯代码改动、风险最低，建议优先）。
+**验证**：实测 `LLM primary_intent=asset_summary` + `template=T1_INFORMATION_QUERY` → 修复前输出 `faq`、修复后输出 `asset_summary`。
+
+### ISSUE-20260914-INTENT-T1-MULTI-INTENT-COLLAPSE
+- 日期：2026-09-14
+- 分类：Agent / 意图识别 / 线上缺陷
+**问题**：双跑对照（`LLM_INTENT_FALLBACK_ENABLED=true`）中"你们公司的主营业务是什么"：planner 产出 `['company_info','company_business']` **2 个 task**，而管线实际 `task_intents=['company_info']` **只剩 1 个**，用户少拿一路答案。
+**根因**：`_apply_structured_intent` 的 `T1_INFORMATION_QUERY` 分支**重建 plan 且只保留 `primary_intent`**（`return IntentPlan(..., tasks=[task])`），多意图 task 被直接丢弃。实测该 query 原始 2 个 task 经此分支后变成 `['faq']`（不仅丢一个，连 `company_info` 也没了）。与 ISSUE-20260914-INTENT-FALLBACK-FACT-DOWNGRADE 同源：**用有损的模板桶回写 plan**。
+**解决**：T1 分支增加保全条件——当规则已识别多个只读知识 task 且全部属于 `public_intents` 时**原样返回 plan**，不重建。单 task 的 unknown 查询仍可被兜底成 `faq`（保住模型兜底能力）。
+**验证**：`原始 ['company_info','company_business'] → 应用后 ['company_info','company_business']`。新增回归测试 `test_multi_knowledge_intent_not_collapsed_by_t1_fallback` 与 `test_t1_fallback_still_applies_to_single_unknown_query`；`tests 267 passed`。
+
+### ISSUE-20260914-REACT-SEEN-SIGNATURE-CROSS-TASK
+- 日期：2026-09-14
+- 分类：Agent / LangGraph / 多意图
+**问题**：图侧只读 ReAct 循环的早停哈希 `seen_signatures` **跨 task 共用**，而多意图 task 常共用同一句 query（"公司业务"同时命中 `company_info` + `company_business`，两个 task 的 `query` 文本完全相同）→ `_result_signature` 相同 → 第二个 task 立刻被判 `repeated=True`（"结果重复、无进展"）而**提前早停**。
+**根因**：早停机制（`hashlib.sha256` 对 citations+evidence_status+answer 做规范化哈希，重复即判定进入局部最优）是为**单 task 内多轮改写**设计的，未考虑多 task 场景；`seen_signatures` 作为扁平列表在 task 之间共享，语义上把"换个意图再检索"误判成"同一轮无进展"。
+**解决**：早停哈希**按 task 隔离**——`AgentState` 新增 `seen_signatures_by_task: dict`（`{task_index: [sig,...]}`），`react_step_node` 用当前 task index 取独立集合判重；`state.seen_signatures` 保留扁平列表供审计。
+**验证**：新增回归测试 `test_same_query_across_tasks_does_not_false_early_stop`（断言两 task 均 succeeded、`overall_status=completed`、`needs_handoff=False`）与 `test_per_task_signatures_tracked_separately`（断言 `seen_signatures_by_task` 键为 `{"0","1"}`）。
+**说明**：本条是排查 `partially_completed` 差异时的**预防性修复**——真实观测到的那次 `partially_completed` 主因是 `company_business` 检索确实弱（`low_confidence`），非哈希误判；但共用哈希确为隐患，一并修掉。
+
+### ISSUE-20260914-COMPLETED-STATUS-MASKED-BY-DROPPED-TASK
+- 日期：2026-09-14
+- 分类：Agent / 可观测性 / 状态机
+**问题**：双跑对照中"你们公司的主营业务是什么"出现**反直觉现象**：管线报 `completed`，图报 `partially_completed`，看起来图更差。实际相反——管线是**因为丢了一个 task** 才显得"全都成功"。
+**根因**：`CustomerTaskExecutor.summarize` 的判定依赖 task 数量——`succeeded == len(results)` → `completed`。管线被 ISSUE-20260914-INTENT-T1-MULTI-INTENT-COLLAPSE 丢掉 `company_business` 后只剩 1 个 task 且成功，于是得到 `completed`；图保留 2 个 task，其中 `company_business` 检索弱（`low_confidence`）→ `partially_completed`。**即"少做一件事"反而让状态更好看，`overall_status` 无法区分"做完了"与"少做了"。**
+**验证**：实测 `summarize([succeeded, needs_clarification]) = partially_completed`（管线自身的函数）；修复多意图丢 task 后两边输入一致，输出必然一致。
+**影响与建议**：若监控/告警依赖 `overall_status`，存在**掩盖真实退化**的风险——丢 task 的批次会伪装成完全成功。建议补一个独立指标（如 `planned_task_count` vs `executed_task_count`）用于比对，或让 `summarize` 感知"计划 task 数"而非仅看 results 长度。**本条为观察记录，尚未实施改动。**
+
+### ISSUE-20260914-GRAPH-MISSING-PREFERENCE-CHAIN
+- 日期：2026-09-14
+- 分类：Agent / LangGraph / 功能等价性
+**问题**：梳理"确定性管线 vs LangGraph 图"差异时发现，**图缺少管线的两条偏好链路**，切流会造成功能退化（非等价替换）：
+1. **偏好持久化**：管线用 `extract_preference_statement()` 从用户自述抽取偏好并 `remember()` 写长时记忆（`customer_agent_execution.py:307-313`）；图**无此调用**（`graph.py` 中 `preference` 仅出现在 `LONG_TERM_READ_KEYS` 读取白名单，无写入路径）。
+2. **纯偏好短路**：管线对"只自述偏好、未要求推荐/购买"的消息走 `pure_preference_statement()`，先落记忆并回复确认、不直接推产品清单（`customer_agent_execution.py:327-337`）；图无此分支。
+**根因**：接线补副作用时补齐了澄清计数、转人工建单、短时记忆回写、情景记忆入队共 4 项，**遗漏了偏好链路这 2 项**。
+**影响**：用户说"我偏好稳健"时，图不会写入长时记忆 → 后续会话/推荐无法复用该偏好；同一句话两条路径答复策略也不同（管线先确认、图直接推荐）。**因此"图优于管线"仅成立于意图识别维度**，完整看是"意图识别更稳、偏好链路缺失"。
+**解决**：**未做（切流前置项）**。需在图的 `intent_plan_node`（或新增 `preference_node`）补齐 `extract_preference_statement` + `remember` + `pure_preference_statement` 短路，补齐后方可与管线谈等价替换。
+**验证**：`grep -c "pure_preference_statement\|extract_preference_statement" app/agents/graph.py` → 0；管线对应命中见上述行号。
 
