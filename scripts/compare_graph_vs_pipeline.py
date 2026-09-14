@@ -9,8 +9,10 @@
 输出差异表与通过率。**有差异即为切流阻塞项**，需先定位是编排差异还是业务差异。
 
 用法：
-  PYTHONPATH=. python scripts/compare_graph_vs_pipeline.py
-  PYTHONPATH=. python scripts/compare_graph_vs_pipeline.py --customer <user_id> --checkpoint
+  python scripts/compare_graph_vs_pipeline.py
+  python scripts/compare_graph_vs_pipeline.py --customer <user_id> --checkpoint
+
+注：脚本会自动把仓库根目录加入 sys.path，因此本地与容器内（/app）都无需再设 PYTHONPATH。
 """
 from __future__ import annotations
 
@@ -18,6 +20,13 @@ import argparse
 import asyncio
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# `python scripts/x.py` 只会把 scripts/ 放进 sys.path，导致 `import app` 失败。
+# 这里显式补上仓库根目录，本地与容器内均可直接运行。
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 # 覆盖客户侧典型意图：事实查询 / 知识问答 / 澄清 / 转人工 / 交易草稿 / 推荐
 DEFAULT_QUERIES: list[str] = [
