@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 212 条真 bug 修复记录。
+- 共 214 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2211,3 +2211,72 @@ task_intents: pipeline = ['company_info', 'company_business']
 任何"别漏"的保证必须建立在**必然执行**的收尾路径上（循环外统一收尾），
 否则它会以"代码里有、实际不生效"的形态长期潜伏——
 比"没有兜底"更危险，因为它会让人误以为已经安全。
+
+### ISSUE-20260914-MULTI-KNOWLEDGE-INTENT-NO-INCREMENT
+- 日期：2026-09-14
+- 分类：RAG / 意图规划 / 信息增量
+- 严重程度：P2（不是错误答案，而是**架构冗余**：拆 task 无信息增量）
+**问题**：`你们公司的主营业务是什么` 规划出 company_info + company_business 两个 task，
+两条路径都产出两个 task。但两次答案内容**高度重复**（都在讲"基金销售 + 保险经纪"）。
+于是必须查清：拆 task 到底带来了什么？
+**查证方法**（真实数据，非模拟）：新增 `scripts/diagnose_multi_intent_value.py`，
+按 **service 的真实口径**复现检索（门控/向量排序用**原始 query** 嵌入，
+文本排序用 `normalized_query`），并输出 chunk 级重叠与答案相似度。
+**实测结论**：
+```
+intent 只影响两件事：
+  ① normalize_customer_query 的关键词扩展
+     company_info     → 追加 "公司名称 公司介绍 联系方式 客户数量"
+     company_business → 追加 "公司业务 公司服务 服务范围 客户"
+  ② scope —— 但公开知识类意图的 scope **完全相同**
+     KnowledgeScope(categories=('company_info','company_business','faq',
+                                'workflow','policy','risk_public'), ...)  ← 两个 intent 逐字相同
+检索结果：
+  company_info     chunk_ids = [4a40b4c1…, 77a23af6…, 93738fbe…, caf20d8d…, e0f73a21…]
+  company_business chunk_ids = [4a40b4c1…, 77a23af6…, 93738fbe…, caf20d8d…, e0f73a21…]
+  Jaccard 重叠 = 1.000   各自独有 = 0 / 0   共有 = 5
+  similarities 完全相同 = [0.5046, 0.4901, 0.4794, 0.4677, 0.4486]
+```
+**结论**：两个意图在**同一套 scope 下、用同一条基础问句**检索，
+只有尾部几个扩展词不同——命中的是**同一批 5 个 chunk**，各自独有 **0** 条。
+即 **company_info / company_business 的拆分不带来任何信息增量**，
+拆 task 只是把同一份资料复述两遍。
+**影响**：
+1. 我们上一轮"补齐 task 数"（`ISSUE-20260914-COVERAGE-BACKSTOP-SKIPPED-ON-BUDGET`）在**正确性**上没错
+   （计划里有两个意图就该都执行），但在**收益**上要重新评估——补上的是一份重复证据。
+2. 规划器把 company_info/company_business 拆成两个 task 的**依据需要复核**：
+   若二者共享同一 scope 且共享同一基础 query，则它们**不是两个可独立检索的意图**。
+**待决**（涉及产品语义，未自行决定）：是合并为一个 task，还是保留拆分但让二者检索**不同 scope/不同扩展词**。
+在决定前不应改动，因为"合并"会改变对外可见的 task 数量与答案结构。
+
+### ISSUE-20260914-JUDGE-BAND-REJECTS-RELEVANT-EVIDENCE
+- 日期：2026-09-14
+- 分类：RAG 证据门控
+- 严重程度：P1（**拒答本可作答的问题**）
+**现象**：`你们公司的主营业务是什么` 检索**成功命中 5 条公司资料**
+（相似度 0.5046 / 0.4901 / 0.4794 / 0.4677 / 0.4486，内容确实是公司业务介绍），
+但 RAG 判定 `low_confidence` → `handoff_required=True` → 回答"当前知识库没有足够依据，建议转人工客服"。
+**根因**：`best_sim = 0.5046` 落在 **judge 区间 `[judge_reject=0.35, judge_answer=0.65)`**，
+于是调用 LLM-judge 裁决；实测 **judge 返回 `False`**（判为不可作答）→ 拒答。
+**为什么这是 bug 而不是保守设计**：
+1. 命中的 chunk **内容就是公司业务介绍**（`# XX科技有限公司 企业信息` / `## 一、公司基本信息`），
+   对"你们公司的主营业务是什么"是**直接相关**的，judge 判 `no` 是**误判**。
+2. 更关键：同一批 chunk 在**容器内实测却是 `sufficient`**（管线与图两边都答出来了）。
+   同一 query、同一知识库，本地判拒答、容器判可答 —— **判定结果不可复现**。
+**为什么不可复现（重要）**：`CustomerRagService.answer` 的**门控嵌入用原始 query**，
+而**检索用 `normalized_query`**（见其实现注释：这是刻意设计，防止扩展词抬高无关查询相似度）。
+于是"门控算的相似度"与"检索命中的证据"**来自两个不同的嵌入**，
+两者之间的边界很窄（本例 0.5046 vs 阈值区间），任何一侧微小变动都会翻转结论。
+叠加 judge 是 LLM 调用（即便 temperature=0，仍受模型版本/服务端影响），
+最终表现为**同一 query 的作答能力在两个环境间不稳定**。
+**关键认识**：`judge_ambiguous` 这条链路现在的语义是
+"**用 LLM 裁决来修正一个本身就不稳定的相似度带**"——它把一个数值抖动问题
+变成了"数值抖动 + LLM 误判"的复合问题，**误差是叠加而不是抵消**。
+**待决**（未自行修改阈值，因为阈值调整需要基于批量数据而非单条样本）：
+- 方向 A：让门控与检索用**同一个嵌入**（消除两侧口径差），使 `best_sim` 与命中的证据自洽；
+- 方向 B：judge 区间收窄或改为"judge 只在**无任何 chunk 命中**时介入"，即先信检索结果；
+- 方向 C：接受拒答但**提高召回**（扩展检索的 `top_k` / 放低 `min_score`），让 best_sim 抬出 judge 带。
+**方法论教训**：**同一 query 在两个环境的判定不一致时，先怀疑"两侧用了不同的输入"，而不是"模型不稳定"。**
+本例的门控嵌入与检索嵌入不同源，是这种不一致的结构性来源。
+**验证工具**：`scripts/diagnose_multi_intent_value.py` 已打印
+`min_score / min_similarity / thresholds / best_sim / 门控归属`，可直接定位落在哪个带。
