@@ -34,10 +34,40 @@ class CustomerRagResult:
     message: str
 
 
+# 意图是否收窄到自身类目（ISSUE-20260914-INTENT-EXPANSION-DOES-NOT-DIVERGE-RETRIEVAL）。
+#
+# 背景：此前所有公开知识意图共用同一个 6 类目 scope，导致不同意图检索**同一批文档**，
+# 意图之间无区分；而"改嵌入源"虽能分化，却会把相似度整体抬高（实测 6 组里 5 组虚高）
+# 从而**绕过门控**（0.6366 -> 0.6828，从不放行变为直接放行）—— 不可接受。
+# 收窄 scope 则不同：分化来自"检索范围不同"，门控仍用原始 query，相似度一位不变。
+#
+# 收窄的可行性由实验决定（experiment_scope_narrowing_all_intents.py 实测）：
+#   company_info      语料 49  收窄后 命中=5  best 与现状完全相同  -> 可收窄
+#   company_business  语料 40  收窄后 命中=5  best 与现状完全相同  -> 可收窄
+#   faq               语料 21  收窄后 命中=5  best 与现状完全相同  -> 可收窄
+#   workflow          语料  0  收窄后 **命中=0**（检索为空）        -> 不可收窄！
+#   risk_public       语料  0  收窄后 **命中=0**（检索为空）        -> 不可收窄！
+# 故**按意图分别设定**，而非一刀切全收窄——否则 workflow / risk_public 会直接答不出。
+#
+# 另：三个可收窄意图的"现状 best"与"收窄 best"逐位相等，
+# 说明收窄**不改变哪条证据胜出**，只是移除了不该参与的候选，故是安全变更。
+_NARROWABLE_INTENTS = frozenset({"company_info", "company_business", "faq"})
+
+
 def scope_for_customer_intent(intent: CustomerKnowledgeIntent) -> KnowledgeScope:
     if intent == "product_recommendation":
         return KnowledgeScope(categories=())
-    return KnowledgeScope.public_customer()
+    base = KnowledgeScope.public_customer()
+    if intent in _NARROWABLE_INTENTS:
+        # 收窄到自身类目：拿到意图区分度，且不影响门控相似度。
+        # 保留 base 的 permission_levels，避免把权限收窄（那是另一回事）。
+        return KnowledgeScope(
+            knowledge_base_ids=base.knowledge_base_ids,
+            categories=(intent,),
+            permission_levels=base.permission_levels,
+        )
+    # workflow / risk_public 等语料为空的意图保持全开，避免收窄后检索为空。
+    return base
 
 
 def greeting_message(query: str) -> str | None:
