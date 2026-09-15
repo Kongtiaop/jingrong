@@ -8,3 +8,9 @@ uploads
 docs
 tests
 *.md
+# 例外：客户可见语料是 .md，但镜像内必须存在（scripts/import_customer_corpus.py 要读它）。
+# Docker 的忽略规则按顺序匹配，后面的 `!` 可以重新包含被前面排除的路径。
+# 注意必须写 `!knowledge_corpus` 与 `!knowledge_corpus/**` 两条：
+# 仅写前者无法让目录内的文件重新生效。
+!knowledge_corpus
+!knowledge_corpus/**

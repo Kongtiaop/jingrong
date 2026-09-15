@@ -13,6 +13,9 @@ COPY app ./app
 COPY workers ./workers
 COPY scripts ./scripts
 COPY migrations ./migrations
+# 客户可见语料：供 scripts/import_customer_corpus.py 在容器内导入知识库。
+# 必须显式 COPY —— 此前漏掉，导致脚本在容器内报"文件不存在"（compose 未挂载该目录）。
+COPY knowledge_corpus ./knowledge_corpus
 COPY alembic.ini ./
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -119,6 +119,15 @@ async def main() -> int:
         if problems:
             print()
             print("校验未通过，**未写入任何数据**。请先修正上述问题。")
+            if all("文件不存在" in p for p in problems):
+                # 这些文件都在仓库里，容器内缺失只可能是**镜像没带上**：
+                # Dockerfile.api 需要 `COPY knowledge_corpus`，且 .dockerignore 的 `*.md`
+                # 会把它排除掉（必须配 `!knowledge_corpus/**` 例外）。
+                print()
+                print("提示：语料文件在仓库中存在但容器内没有 —— 说明**镜像未包含该目录**。")
+                print("  检查 Dockerfile.api 是否 `COPY knowledge_corpus ./knowledge_corpus`，")
+                print("  以及 .dockerignore 是否用 `!knowledge_corpus/**` 放行了 `*.md`。")
+                print("  改完后需重新 build：docker compose -f docker-compose.p0.yml build api")
             await database.dispose()
             return 2
 
