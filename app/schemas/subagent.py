@@ -32,3 +32,41 @@ class SubagentMergeResult(BaseModel):
     results: list[SubagentResult] = Field(default_factory=list)
     overall_status: str = ""  # succeeded / partial / failed
     answer: str = ""
+    # 本次 fan-out 的决策元数据（由 run_read_only_fanout 回填）：
+    # 让响应/审计能直接回答"这次到底并行了没有、为什么"，无需反查审计表。
+    fanout_mode: str = ""     # parallel / serial
+    fanout_reason: str = ""   # 模型自述理由
+    fanout_source: str = ""   # model / fallback_serial / disabled
+
+
+class FanoutDecision(BaseModel):
+    """模型对「这一个问题要不要拆、能不能并行」的自主决策（只读查询专用）。
+
+    为什么单独建模而不是直接给 executor：executor 只认 `SubagentTask`，
+    而这里要保留**决策依据**（mode/reason/depends_on），否则事后无法回答
+    "模型为什么没并行"——此前多次踩坑证明：**丢失决策留痕 = 只能靠猜**。
+    """
+
+    mode: str = "parallel"                  # parallel / serial
+    tasks: list[SubagentTask] = Field(default_factory=list)
+    reason: str = ""                        # 模型自述理由（审计用，不参与控制流）
+    # 每个子任务（按下标）依赖的前序子任务下标；非空即代表存在依赖，必须串行
+    depends_on: list[list[int]] = Field(default_factory=list)
+    source: str = "model"                   # model / fallback_serial / disabled
+
+    @property
+    def has_dependency(self) -> bool:
+        return any(deps for deps in self.depends_on)
+
+    @property
+    def effective_mode(self) -> str:
+        """实际执行模式：**有依赖一律串行**，不采信模型自报的 mode。
+
+        为什么（硬约束而非提示词）：提示词要求模型"有依赖就填 serial"，
+        但实测模型在"先查风险限制再解释"用例上**正确填了 depends_on 却把 mode 写成 parallel**。
+        若只信 mode，就会把有依赖的子任务并发跑，后者拿不到前者的事实 → 结果错误。
+        故以 `depends_on` 为准（结构性证据 > 模型自述）。
+        """
+        if self.has_dependency:
+            return "serial"
+        return "parallel" if self.mode == "parallel" else "serial"

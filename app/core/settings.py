@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     agent_model_tool_selection_enabled: bool = False
     # 模型工具循环的最大轮数（防无限轮）；过大会拉高延迟，建议 2~4。
     agent_model_tool_max_rounds: int = 4
+    # 受控只读子代理并行：由模型按任务复杂度判断"要不要拆成多个只读子任务、能不能并行"。
+    # 关闭时 `run_read_only_fanout` 退化为**串行单任务**（等价于今天的行为，行为不变）。
+    # 只影响只读查询；资金/订单/风控结论/写操作永不进此层。
+    agent_subagent_fanout_enabled: bool = False
 
     jwt_secret: str = Field(default="change-me-in-development-please-rotate-32", repr=False)
     jwt_algorithm: str = "HS256"

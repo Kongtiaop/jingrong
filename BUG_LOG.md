@@ -3407,3 +3407,160 @@ C1/C4 真实轨迹均 4 轮、budget_exhausted：
 **当同一个功能需要反复打补丁才能不破坏既有测试时，应停下来质疑方案本身，而不是继续补。**
 本次三版补丁分别打破了三类不同的既有约束，这是"方案与结构不契合"的强信号。
 正确动作是**回退并重新选落点**，而非在一个不合适的层级上持续叠加条件分支。
+
+---
+
+### ISSUE-20260915-SUBAGENT-ENVELOPE-NOT-UNWRAPPED
+- 日期：2026-09-15
+- 标题：只读子代理并行接线后**每次决策都静默降级为串行**（工具调用包装体未剥壳）
+
+**现象**：接线 `run_read_only_fanout` 后，用真实 Qwen 跑 3 个用例，
+**三次全部** `source=fallback_serial`、子任务数恒为 1。
+但输出**看起来完全正常**：`overall_status=succeeded`、有融合答案、无异常日志。
+
+**定位过程（关键：不猜，直接看返回）**：
+1. 先怀疑模型不具备判断力 —— 于是写了独立探针 `dispatch_read_tasks` 单工具，
+   直接打 LLM：**8 个用例命中 7 个**，唯一未命中是"最简单用例模型返回 None",
+   而非判断错误。**模型侧被排除**。
+2. 再怀疑接线错误 —— 在诊断脚本里同时打印"直接调 `request_tool_call` 的原始返回"
+   与"`planner.plan` 的结果"：
+   - 原始返回：`{'name': 'dispatch_read_tasks', 'arguments': {'mode': 'parallel', 'tasks': [...]}}` ✅
+   - `plan()` 结果：`source=fallback_serial`, tasks=1 ❌
+   同一个调用，外层正确、内层错误 → 问题在**解析层**。
+3. 用最小用例复现：`parse_fanout_decision(raw)` 里 `raw.get("tasks")` → `None`，
+   而 `raw["arguments"]["tasks"]` 才是真实参数。
+
+**根因**：`QwenProvider.request_tool_call` 返回的是**包装体**
+`{"name", "arguments", "reasoning"}`，而工具的真实参数在 `arguments` 内层。
+`parse_fanout_decision` 初版只认裸参数，`plan()` 又把包装体直接传入
+→ `tasks` 恒为 `None` → `tasks=[]` → 走 `fallback_serial` 分支。
+**每一次决策都静默降级，模型根本没被采纳。**
+
+**为什么这个 bug 特别危险（本条目最重要的部分）**：
+- 它是**静默**的：不报错、不抛异常、日志无异常，输出形态与正常路径**一模一样**；
+- 它是**看起来合理**的：降级路径本身是设计好的兜底（"模型不可用 → 串行单任务"），
+  所以"每次都降级"表现得像"模型这次又没调工具"，而非故障；
+- **全套 454 个既有测试都没抓到**——因为 fake provider 直接返回**裸 dict**，
+  绕过了真实 provider 的包装体。测试与真实调用形态不一致 = 测了个假路径。
+
+**修复**：`parse_fanout_decision` 开头统一剥壳（两形态都支持）：
+```python
+if isinstance(args.get("arguments"), dict):
+    args = args["arguments"]
+```
+并**修正测试 fake 的形状**，让它返回与真实 provider 一致的包装体
+（`{"name","arguments","reasoning"}`），使这类 bug 今后无法再逃过测试。
+
+**验证**：
+- 新增回归用例 `test_parse_unwraps_tool_call_envelope` / `test_parse_envelope_and_bare_arguments_agree`；
+- **反向验证测试有效性**：临时删掉剥壳代码 → 5 个用例失败；恢复 → 全过。
+  （证明测试真的覆盖了该缺陷，而非"恰好通过"）
+- 真实端到端 3 用例全部 `source=model`：并行 2 子任务 / 串行 2 子任务(带依赖) / 单任务 1 子任务。
+
+**方法论教训（第三类"静默降级"缺陷，与前两次同源）**：
+1. **测试 fake 的形状必须与真实依赖一致**。fake 返回裸 dict、真实返回包装体，
+   等于测试了一条生产上不存在的路径 —— 这类"测试通过但功能全废"最危险。
+2. **兜底路径要有"被触发了"的可见信号**。降级本身是对的，但"降级率 100%"
+   必须能被一眼看出。本模块的 `source` 字段正是为此存在，
+   且已加进测试断言（`assert res.fanout_source == "model"`）。
+3. **"模型不行"与"代码没接上"必须能被区分**。区分方法：先做**独立探针**直接打 LLM
+   （排除模型侧），再对比"原始返回 vs 处理结果"（定位代码侧）。
+   本次靠这两步在 3 次工具调用内定位完毕，没有靠猜。
+
+---
+
+### ISSUE-20260915-SUBAGENT-TIMEOUT-KILLS-KNOWLEDGE-TASK
+- 日期：2026-09-15
+- 标题：子代理超时预算 8s 与"检索+生成"真实耗时(11.5s)不匹配，知识类子任务被静默丢弃
+
+**现象**：并行 2 子任务时，资产子任务 `success`，知识子任务 `partial` 且 **summary 为空**；
+`overall_status` 降为 `partial`。表观看像"检索/模型故障"。
+
+**定位**：分别测"直接调 runner"与"经 executor 调 runner"：
+- 直接调 `runner(task)`：`status=success`，耗时 **11485ms**，答案完整；
+- 经 `SubagentExecutor`：`status=partial`，`error='subagent_timeout'`，耗时 **8015ms**。
+即 runner 本身没问题，是 `per_task_timeout_s=8.0` 把它砍了。
+
+**根因**：`SubagentExecutor` 初版 `per_task_timeout_s=8.0` 是按"**一次工具调用**"设计的，
+但接线后知识类子任务的真实工作量 = **检索(向量+BM25 双路) + 一次答案生成 LLM 调用**
+= 实测 11.5s。阈值与工作量的差距不是"偶尔超时"，而是**必然超时**。
+且超时后子任务结果被降级为空，**用户少一路答案却只看到"部分未完成"**。
+
+**修复**：
+- 默认值改为 `DEFAULT_PER_TASK_TIMEOUT_S = 20.0`（最慢子任务 + 余量），
+  `DEFAULT_GLOBAL_TIMEOUT_S = 45.0`（必须 ≥ 单任务超时，否则串行时最后一个必被砍）；
+- 两者都可由 `run_parallel_read_only` 参数覆盖（便于按环境调参，而非写死）；
+- 新增 3 个用例锁死不变式：单任务超时 ≥15s、全局 ≥ 单任务、可覆盖。
+
+**验证**：真实端到端 3 用例全部 `succeeded`，知识类子任务返回**真实内容**
+（如"XX科技是持牌综合金融服务机构（引用2第5条）…"），不再是占位串或空摘要。
+
+**顺带修复的第二个缺陷（同源）**：`ReadOnlySubagentRunner` 初版**不接 answer_generator**，
+而 `CustomerReadTools` 对知识类返回的是 `answer="可基于客服知识库引用生成回答。"`
+（**占位串**）+ 真实 `citations`。不接生成 → 融合答案里知识类子任务永远只有那句占位串，
+`status=success` 看着正常、**实际没有任何内容**。现已接入 `CustomerRagAnswerService.generate`，
+并加 3 个用例（生成成功 / 无 generator 退回原文案 / 生成失败不拖垮子任务）。
+
+**方法论教训**：
+**"状态对、内容空"比"报错"危险得多**。`partial`/`success` 这类状态字段只能说明流程走完，
+不能证明产出了内容。凡是有"占位串"设计的接口，接线时必须确认
+**占位串是否已被真实内容替换**，否则会得到一个"永远成功、永远无内容"的路径。
+
+---
+
+### ISSUE-20260915-SUBAGENT-SERIAL-ORDER-NOT-GUARANTEED
+- 日期：2026-09-15
+- 标题：串行模式只限流不排序，有依赖的子任务拿不到前序事实
+
+**现象（读码发现，非线上）**：`SubagentExecutor` 用
+`asyncio.gather` + `Semaphore(max_concurrent)`。串行模式下 `max_concurrent=1`
+只保证"一次跑一个"，**不保证谁先跑**——按 `gather` 协程创建顺序抢信号量。
+而模型返回的子任务列表**可能倒序**（实测模型把"解释风险制度"排在"查风险限制"之前，
+并用 `depends_on=[0]` 表达依赖）。
+
+**后果**：若依赖任务排在后面，后序子任务先执行 → 拿不到前序事实 → 退化为
+"模型碰巧记住才正确"，**正是分层修复前 graph 的旧缺陷**（同一类问题在不同层的重演）。
+
+**修复**：
+- 新增 `order_subtasks_by_dependency()`：按 `depends_on` 拓扑排序，
+  并把依赖**下标重新映射为 task_id**（排序后下标会错位，这是最易写错的一步）；
+- 串行模式下先排序再下发；执行前把**该任务直接依赖的**前序结论拼成 `prior_facts` 注入
+  （只给依赖的那部分，不是所有已完成任务的结论）；
+- **并行模式不注入**：并行子任务按定义互不依赖，注入"别人的结果"会引入非确定性
+  （谁先跑完谁先进上下文 → 结果不可复现），已加用例锁死该行为。
+
+**验证**：`test_serial_dependency_order_is_respected_and_facts_flow_forward` 用
+**倒序**输入 + 记录型 runner，断言"依赖任务先执行"且"后序任务确实收到前序结论"；
+`test_order_subtasks_handles_cycle_without_dropping_tasks` 保证循环依赖不丢任务。
+真实端到端串行用例中，sub-2 收到的前序事实为"您的风险承受能力等级为 C3"，
+并据此正确解释了 **C3** 的制度依据（即"用事实套规则"成为机制而非运气）。
+
+---
+
+### ISSUE-20260915-SUBAGENT-FANOUT-PERF-MEASURED
+- 日期：2026-09-15
+- 标题：受控子代理并行的实测延迟收益（设计文档 §10 验收项）
+
+**背景**：设计文档 §10 要求"可并行场景总延迟显著低于串行（有量化对比数据）"。
+此前 P0 步骤 3（接入 1-2 个只读场景）未完成，故无任何实测数据。
+
+**测量方法**：3 个**相互独立**的知识检索子任务（含向量+BM25 双路，真实工作量），
+同一 runner，分别以 `max_concurrent=1`（串行）与 `=3`（并行）执行，各取 3 轮最优值。
+**先踩过一个坑**：最初用资产/订单类查询测，耗时仅 0~15ms（无实际工作量），
+测不出并发差异（甚至出现除零）—— **基准测试必须用有真实耗时的工作负载**。
+
+**实测结果**：
+| 模式 | 耗时 |
+|---|---|
+| 串行 max_concurrent=1 | 8969 ms |
+| 并行 max_concurrent=3 | 2469 ms |
+| **收益** | **降低 72.5%（3.63x 加速）** |
+
+**结论**：并行收益显著，且与子任务数近似线性（3 个独立任务 → 接近 3x），
+说明后端（DB 连接池/Qwen 配额）在此并发度下**不是瓶颈**。
+并发上限仍由 `Semaphore` 受控（生产默认 2），不会无限放大。
+
+**边界重申**：本层**只读**。资金/订单/风控结论/任何写操作永不进此层——
+capability 白名单是 enum（模型物理上无法编造写能力），executor 侧有第二道校验，
+且已加端到端用例 `test_fanout_never_exposes_write_capabilities_end_to_end`
+验证"模型返回 create_order/transfer_money 时不会发生任何一次对应调用"。

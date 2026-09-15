@@ -191,6 +191,89 @@ async def main() -> int:
         print(f"  [{flag}] 客户{str(cust):<5} vs 产品{prod:<4} -> {got} (期望 {expect})")
     print(f"  缺失等级 risk_rank(None)={risk_rank(None)}（应为 0，区分'缺失'与'最低等级'）")
 
+    # ---- G. 只读子代理并行（模型自主判断是否并行）----
+    print()
+    print(_line("="))
+    print("G. 只读子代理并行：模型拆分/并行决策 + 真实执行")
+    print(_line("="))
+    from app.schemas.subagent import SubagentTask
+    from app.services.customer_agent_execution import CustomerAgentExecutionService
+    from app.services.customer_rag_answer import CustomerRagAnswerService
+    from app.services.customer_tools import CustomerReadTools
+    from app.services.subagent_planner import ReadOnlyFanoutPlanner
+    from app.services.subagent_runner import ReadOnlySubagentRunner, capability_to_tool
+    from app.services.subagent_executor import READ_ONLY_CAPABILITIES
+
+    # G1. 白名单里每个 capability 都必须有真实映射（否则"接线"是假的）
+    unmapped = [c for c in READ_ONLY_CAPABILITIES if capability_to_tool(c) is None]
+    if unmapped:
+        ok = False
+    print(f"  [{'OK ' if not unmapped else '**差**'}] 白名单 {len(READ_ONLY_CAPABILITIES)} 个 capability "
+          f"未映射={unmapped}")
+
+    # G2. 模型决策（真 LLM）：并行 vs 串行必须能被区分
+    svc = CustomerAgentExecutionService.__new__(CustomerAgentExecutionService)
+    svc.database = db; svc.redis_client = None; svc.settings = settings
+    svc.intent_fallback = None
+    fanout_cases = [
+        ("帮我看看我的资产总览，还有你们公司主营业务是什么", "parallel"),
+        ("先查我的风险限制情况，再解释对应的风险制度依据", "serial"),
+    ]
+    for query, want_mode in fanout_cases:
+        d = await ReadOnlyFanoutPlanner(provider=provider, database=db).plan(
+            customer_id=CUSTOMERS["risk_c3_demo"], conversation_id="probe-fanout", query=query)
+        good = (d.source == "model") and (d.effective_mode == want_mode)
+        if not good:
+            ok = False
+        print(f"  [{'OK ' if good else '**差**'}] {query[:26]:<28} want={want_mode:<9}"
+              f"got={d.effective_mode}/{d.source} tasks={len(d.tasks)}")
+
+    # G3. 端到端真实执行：必须产出真实内容（不是占位串、不是空摘要）
+    # **显式传 enabled=True**：生产默认该开关为 false（保守），而本节要验证的是
+    # "模型决策 + 并行执行"这条路径本身可用，故必须显式启用，
+    # 否则会得到 source=disabled 的单任务结果 —— 那不是缺陷，是开关在工作。
+    runner = ReadOnlySubagentRunner(
+        tools=CustomerReadTools(db), answer_generator=CustomerRagAnswerService(provider))
+    res = await svc.run_read_only_fanout(
+        customer_id=CUSTOMERS["risk_c3_demo"], conversation_id="probe-fanout",
+        query="帮我看看我的资产总览，还有你们公司主营业务是什么",
+        planner=ReadOnlyFanoutPlanner(provider=provider, database=db), runner=runner,
+        enabled=True)
+    statuses = [(r.task_id, r.status) for r in res.results]
+    all_ok = res.overall_status == "succeeded" and len(res.results) >= 2
+    has_content = all(len((r.summary or "").strip()) > 20 for r in res.results)
+    if not (all_ok and has_content):
+        ok = False
+    print(f"  [{'OK ' if all_ok else '**差**'}] 端到端 status={res.overall_status} "
+          f"mode={res.fanout_mode} source={res.fanout_source} {statuses}")
+    print(f"  [{'OK ' if has_content else '**差**'}] 每个子任务都有实质内容（非占位串/空摘要）")
+
+    # G3b. 开关关闭时必须退化为串行单任务且**不调用模型**
+    res_off = await svc.run_read_only_fanout(
+        customer_id=CUSTOMERS["risk_c3_demo"], conversation_id="probe-fanout",
+        query="帮我看看我的资产总览，还有你们公司主营业务是什么",
+        planner=ReadOnlyFanoutPlanner(provider=provider, database=db),
+        runner=ReadOnlySubagentRunner(tools=CustomerReadTools(db)), enabled=False)
+    off_ok = res_off.fanout_source == "disabled" and len(res_off.results) == 1
+    if not off_ok:
+        ok = False
+    print(f"  [{'OK ' if off_ok else '**差**'}] 开关关闭 → source={res_off.fanout_source} "
+          f"tasks={len(res_off.results)}（应为 disabled/1，且不调用模型）")
+
+    # G4. 写操作绝不可达（模型返回写能力时不得发生任何对应调用）
+    from app.services.subagent_planner import parse_fanout_decision
+    d = parse_fanout_decision(
+        {"mode": "parallel", "tasks": [
+            {"capability": "customer_asset_summary", "query": "资产"},
+            {"capability": "create_order", "query": "下单"},
+            {"capability": "transfer_money", "query": "转账"}]},
+        fallback_query="q")
+    caps = [t.read_only_capability for t in d.tasks]
+    safe = caps == ["customer_asset_summary"]
+    if not safe:
+        ok = False
+    print(f"  [{'OK ' if safe else '**差**'}] 写操作能力被拒（保留={caps}）")
+
     print()
     print(_line("="))
     print(f"回归结果：{'全部通过' if ok else '**存在失败项，见上方 ** 标记**'}")

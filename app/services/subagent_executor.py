@@ -40,13 +40,24 @@ async def _noop_audit(_task: SubagentTask, _result: SubagentResult, _dur: float)
 
 
 class SubagentExecutor:
+    # 每子任务超时默认值。
+    # **为什么不是 8.0**（初版值，实测踩坑）：知识类子任务的耗时 = 检索(含向量+BM25 双路)
+    # **+ 一次答案生成 LLM 调用**，实测单测用例耗时 11.5s。
+    # 8.0 会把这类子任务一律判为 `subagent_timeout`，且**结果被丢掉**——
+    # 表现为"资产子任务成功、知识子任务 partial 且摘要为空"，看着像模型/检索故障，
+    # 实际是超时阈值与真实工作量不匹配。
+    # 现在按"最慢一类子任务 + 余量"取值；单次工具查询（资产/订单等）远快于此，不受影响。
+    DEFAULT_PER_TASK_TIMEOUT_S = 20.0
+    # 全局超时：必须 ≥ 单任务超时，否则多子任务串行时最后一个必被砍。
+    DEFAULT_GLOBAL_TIMEOUT_S = 45.0
+
     def __init__(
         self,
         *,
         runner: SubagentRunner | None = None,
         max_concurrent: int = 2,
-        per_task_timeout_s: float = 8.0,
-        global_timeout_s: float = 20.0,
+        per_task_timeout_s: float = DEFAULT_PER_TASK_TIMEOUT_S,
+        global_timeout_s: float = DEFAULT_GLOBAL_TIMEOUT_S,
         audit: AuditCallback | None = None,
     ) -> None:
         self.runner = runner

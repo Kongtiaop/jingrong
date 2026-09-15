@@ -257,14 +257,21 @@ class CustomerAgentExecutionService:
         subtasks: list[SubagentTask],
         runner=None,
         max_concurrent: int = 2,
+        per_task_timeout_s: float | None = None,
+        global_timeout_s: float | None = None,
     ) -> SubagentMergeResult:
         """受控只读子代理并行入口：对一组可并行的只读子任务做真实 fan-out → 并行执行 → 确定性融合。
 
         只读能力白名单、并发信号量、每子代理/全局超时、失败降级都在 SubagentExecutor 内部强制。
         资金/订单/风控结论/任何写操作绝不进此层（调用方只传只读子任务）。
-        runner：真实路径由接线方提供把 SubagentTask.read_only_capability 映射到只读工具/子代理的
-        处理器；单元测试注入 fake。审计统一写 AuditLog(action="subagent.ran")，不含私有推理链。
+        runner：缺省用**真实的** `ReadOnlySubagentRunner`（capability → CustomerReadTools）。
+        单元测试仍可注入 fake。审计统一写 AuditLog(action="subagent.ran")，不含私有推理链。
         """
+        if runner is None:
+            # 真实接线：此前 runner 只能由调用方注入，生产路径**从未**提供过，
+            # 导致子代理层虽已实现但零调用方（等于没接线）。现在缺省即真实 runner。
+            runner = self._default_read_only_runner()
+
         async def _audit(task: SubagentTask, result: SubagentResult, dur: float) -> None:
             try:
                 async with self.database.session_factory() as session:
@@ -282,8 +289,137 @@ class CustomerAgentExecutionService:
             except Exception:  # noqa: BLE001 - 审计失败不影响主流程
                 pass
 
-        executor = SubagentExecutor(runner=runner, max_concurrent=max_concurrent, audit=_audit)
+        executor = SubagentExecutor(
+            runner=runner, max_concurrent=max_concurrent, audit=_audit,
+            per_task_timeout_s=per_task_timeout_s or SubagentExecutor.DEFAULT_PER_TASK_TIMEOUT_S,
+            global_timeout_s=global_timeout_s or SubagentExecutor.DEFAULT_GLOBAL_TIMEOUT_S,
+        )
         return await executor.execute(subtasks)
+
+    def _default_read_only_runner(self):
+        """构造真实的只读 runner（capability → 只读工具 + 答案生成）。
+
+        单独成方法的原因：`run_parallel_read_only` 与 `run_read_only_fanout`
+        （需要先包装再传入）都要用它。若各自内联一份，很容易只改一处、
+        导致另一条路径少了 answer_generator 或依赖包装 —— 而这类缺失是静默的。
+        """
+        from app.services.customer_tools import CustomerReadTools
+        from app.services.subagent_runner import ReadOnlySubagentRunner
+        from app.services.customer_rag_answer import CustomerRagAnswerService
+        return ReadOnlySubagentRunner(
+            tools=CustomerReadTools(self.database),
+            # 必须带上 answer_generator：知识类子任务的工具返回是**引用+占位串**，
+            # 不接生成会输出"可基于客服知识库引用生成回答。"这种没有内容的答案。
+            answer_generator=CustomerRagAnswerService(QwenProvider(self.settings)),
+        )
+
+    @staticmethod
+    def _wrap_runner_with_prior_facts(runner, decision) -> Any:
+        """串行模式下，把前序子任务的结论作为 `prior_facts` 传给后序子任务。
+
+        **为什么必须包一层**：`SubagentExecutor` 只按 `Semaphore(1)` 限流，
+        **不保证执行顺序** —— `asyncio.gather` 按传入顺序创建协程，信号量先到先得，
+        所以"依赖的前序任务"未必先跑完。若不在此处显式排依赖顺序，
+        后序子任务会拿到空上下文，退化成"模型运气好才正确"（正是分层修复前的旧缺陷）。
+
+        做法：按 `depends_on` 拓扑排序，并为每个 task 记录它依赖的 task_id 集合；
+        每个子任务执行前，从已完成的结论里取自己依赖的那部分拼成 `prior_facts`。
+        """
+        from app.services.subagent_planner import order_subtasks_by_dependency
+
+        ordered, deps_of = order_subtasks_by_dependency(
+            decision.tasks, decision.depends_on)
+        facts: dict[str, str] = {}
+        lock = asyncio.Lock()
+
+        async def _wrapped(task: SubagentTask) -> SubagentResult:
+            async with lock:
+                prior = "\n".join(
+                    facts[dep] for dep in deps_of.get(task.task_id, []) if facts.get(dep))
+            # 只把**本任务依赖的**前序结论给它，不是所有已完成任务的结论。
+            context = ("\n\n【前序查询结果（请基于这些事实作答，不要臆造）】\n" + prior) if prior else ""
+            result = await runner(task, context)
+            if isinstance(result, SubagentResult) and result.status == "success":
+                async with lock:
+                    facts[task.task_id] = f"[{result.task_id}] {result.summary}"
+            return result
+
+        return _wrapped
+
+    async def run_read_only_fanout(
+        self,
+        *,
+        customer_id: str,
+        conversation_id: str,
+        query: str,
+        planner=None,
+        runner=None,
+        enabled: bool | None = None,
+    ) -> SubagentMergeResult:
+        """**模型自主决定是否并行**的只读查询入口（P0-3 接线）。
+
+        流程：
+          1. `ReadOnlyFanoutPlanner` 请模型判断：这个问题要拆几个只读子任务？能不能并行？
+          2. 按 `decision.effective_mode` 决定并发上限——
+             **并行=2（受控并发），串行=1**，串行时不浪费并发额度也不打乱依赖顺序。
+          3. `run_parallel_read_only` 执行 + 审计 + 确定性融合。
+
+        `enabled`：是否启用**模型决策**。缺省读 `AGENT_SUBAGENT_FANOUT_ENABLED`。
+        关闭时**不调用模型决策**，直接退化为串行单任务（等价于今天的行为）——
+        这样开关是真的控制行为，而不是一个没人读的摆设。
+        注意：**无论开关与否，本入口都只做只读**。
+
+        边界：本方法**只读**。它不产生产品推荐/资金/风控结论，只把各只读子任务的
+        事实汇总。任何写操作不在 capability 白名单内（executor 第二道校验）。
+        """
+        from app.services.subagent_planner import (
+            ReadOnlyFanoutPlanner, order_subtasks_by_dependency, parse_fanout_decision,
+        )
+        if enabled is None:
+            enabled = bool(getattr(self.settings, "agent_subagent_fanout_enabled", False))
+        if not enabled:
+            # 开关关闭 → 不请模型决策，直接单任务串行（行为与接线前一致）。
+            decision = parse_fanout_decision(None, fallback_query=query, method="disabled")
+        else:
+            if planner is None:
+                planner = ReadOnlyFanoutPlanner(
+                    provider=QwenProvider(self.settings), database=self.database)
+            decision = await planner.plan(
+                customer_id=customer_id, conversation_id=conversation_id, query=query)
+        # 给每个子任务注入 customer_id（服务端注入，模型无法指定查谁 —— 防越权读他人数据）
+        subtasks = [
+            task.model_copy(update={
+                "scope_json": {**(task.scope_json or {}), "customer_id": customer_id},
+                "budget_json": {**(task.budget_json or {}), "mode": decision.effective_mode},
+            })
+            for task in decision.tasks
+        ]
+        # 串行（有依赖）时必须**按依赖顺序**下发：executor 用 gather 创建协程，
+        # 顺序即提交顺序，而串行只保证"一次一个"、不保证"谁先"。不排序会让
+        # 后序子任务拿到空的前序上下文（退化成"碰巧正确"）。
+        if decision.effective_mode == "serial" and len(subtasks) > 1:
+            subtasks, _ = order_subtasks_by_dependency(subtasks, decision.depends_on)
+        max_concurrent = 2 if decision.effective_mode == "parallel" else 1
+        # 串行（有依赖）时，把**前序子任务已取得的事实**注入后序子任务的生成提示。
+        # 为什么只给串行：并行子任务之间按定义互不依赖，注入"别人的结果"既无意义
+        # 也会引入非确定性（谁先跑完谁先进上下文，结果不可复现）。
+        # 且事实**只进生成、不进检索**（见 ISSUE-20260914-DEP-CONTEXT-POLLUTES-RETRIEVAL）。
+        #
+        # 注意 runner 为 None 时必须**先建出默认 runner 再包装**：否则包装被跳过，
+        # `run_parallel_read_only` 内部又自建一个未包装的 runner → 依赖上下文**静默丢失**。
+        # （这类"两个地方各自缺省、拼起来缺一块"的缺陷很难从输出看出来，故显式建默认值。）
+        if decision.effective_mode == "serial" and len(subtasks) > 1:
+            if runner is None:
+                runner = self._default_read_only_runner()
+            runner = self._wrap_runner_with_prior_facts(runner, decision)
+        result = await self.run_parallel_read_only(
+            customer_id=customer_id, conversation_id=conversation_id,
+            subtasks=subtasks, runner=runner, max_concurrent=max_concurrent)
+        # 把决策元数据带回给调用方，便于响应/审计里直接读出"这次是否并行、为什么"。
+        result.fanout_mode = decision.effective_mode
+        result.fanout_reason = decision.reason
+        result.fanout_source = decision.source
+        return result
 
     async def execute(self, *, customer_id: str, conversation_id: str, query: str) -> CustomerTaskExecutionResponse:
         planner = CustomerIntentPlanner()

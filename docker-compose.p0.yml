@@ -89,6 +89,9 @@ services:
       # 资金/风控仍走确定性路径（写操作不在工具集中）。默认关 → 回退确定性 ReAct。
       AGENT_MODEL_TOOL_SELECTION_ENABLED: ${AGENT_MODEL_TOOL_SELECTION_ENABLED:-false}
       AGENT_MODEL_TOOL_MAX_ROUNDS: ${AGENT_MODEL_TOOL_MAX_ROUNDS:-4}
+      # 受控只读子代理并行：模型按任务复杂度判断"要不要拆、能不能并行"。
+      # 只影响只读查询；资金/订单/风控结论/写操作永不进此层。默认关 → 行为不变。
+      AGENT_SUBAGENT_FANOUT_ENABLED: ${AGENT_SUBAGENT_FANOUT_ENABLED:-false}
       # LLM 资源保护：SDK 重试次数 / 在途并发上限 / 工具轮超时
       QWEN_MAX_RETRIES: ${QWEN_MAX_RETRIES:-1}
       QWEN_MAX_CONCURRENCY: ${QWEN_MAX_CONCURRENCY:-8}
