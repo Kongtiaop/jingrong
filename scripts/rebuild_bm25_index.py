@@ -124,6 +124,15 @@ async def main() -> int:
         else:
             # 先建**临时**索引验证新语法能否成功，成功后再删除旧索引并改名替换。
             # 这样即使 CREATE 语法不对，也**不会**把现有索引弄坏。
+            #
+            # 定义依据（ISSUE-20260914-PGSEARCH-BM25-KEY-FIELD-BLOCKS-INSERT）：
+            #   在独立临时表上实测 4 种候选定义，**只有 A 能写入**：
+            #     A bm25 (id, content) WITH (key_field='id')  建索引✓ 写入✓  <== 采用
+            #     B bm25 (content)    WITH (key_field='id')  建索引✓ 写入✗  <== 库里现有的（坏）
+            #     C bm25 (id, content) 无 WITH               建索引✗
+            #     D bm25 (content)    无 WITH                建索引✗
+            #   关键：**key_field 指名的列必须出现在字段列表中**，
+            #   只写在 WITH 里不够 —— 这正是现有索引不可写的原因。
             print("  将执行（安全替换，先建临时索引，成功后再替换）：")
             print(f"    1) CREATE INDEX {INDEX}__new ON knowledge_chunk USING bm25 (id, content)")
             print(f"         WITH (key_field = 'id');")
