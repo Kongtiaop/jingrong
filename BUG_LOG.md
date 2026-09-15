@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 218 条真 bug 修复记录。
+- 共 219 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2462,3 +2462,50 @@ business          public      False     False     0
 **方法论**：本次是"**逐层对账**"的胜利——从"类目没生效"→"收窄不可行"→"权限不匹配"→
 "孤儿内容 + 测试残留"，每一步都用真实数据推进，没有停在第一个看似合理的解释上。
 若在第一层就动手改 `category` 传参，会引入 40% 答不出率并掩盖真正的权限问题。
+
+### ISSUE-20260914-PGSEARCH-BM25-KEY-FIELD-BLOCKS-INSERT
+- 日期：2026-09-14
+- 分类：RAG / 检索基础设施（**P0：所有知识库写入失败**）
+- 严重程度：P0
+**现象**：在 ParadeDB 容器内导入客户语料时，`INSERT INTO knowledge_chunk` 报
+```
+asyncpg.exceptions.InternalServerError: No key field defined.
+```
+**影响面远超本次导入**：最小写入（仅 id/document_id/version_id/chunk_index/content 等几列、
+不带 embedding）**同样失败**，裸 INSERT（无 RETURNING）也失败 ——
+即**该表上任何写入都不行**，包括后台 worker 与上传接口的文档入库路径。
+**诊断过程（三次推断，前两次被数据推翻，记录以避免重复走弯路）**：
+1. *推断一*：配置为 tsvector、BM25 索引是遗留物，不用的索引在阻拦写入。
+   **证伪**：`FULLTEXT_BACKEND = pg_search`，索引确实在用。
+2. *推断二*：索引由旧版 DDL 创建，与 0.25.6 元数据不兼容。
+   **证伪**：`reloptions = ['key_field=id']` 定义正确，且 BM25 **查询可用**
+   （`content @@@ '公司'` 命中）——若 key_field 无法解析，查询同样会失败。
+3. *最终定位*：**读写不对称**——读侧正常、写侧失败。索引元数据与运行中的
+   扩展版本不一致（索引经扩展升级后未重建），导致写路径无法解析 key_field。
+**环境事实**：
+```
+pg_search 0.25.6 / vector 0.8.5 / PostgreSQL 16（paradedb/paradedb:pg16 镜像）
+索引: CREATE INDEX idx_knowledge_chunk_content_bm25 ON knowledge_chunk
+        USING bm25 (content) WITH (key_field=id)
+reloptions: ['key_field=id']
+查询: 正常        写入: 失败（裸 INSERT 亦失败）
+```
+**处置**：用户决定**保留 BM25**（不用 tsvector 回退）。新增
+`scripts/rebuild_bm25_index.py`，安全重建：
+- 默认 dry-run；`--apply` 才执行 DDL
+- 提供 `--reindex-only`（REINDEX，最轻量，优先尝试）
+- `--apply` 走**先建临时索引 → 写入探测 → 成功才替换旧索引**的顺序，
+  任一步失败即中止且**不删除原索引**，避免把检索能力一起弄坏
+- 重建前后各做一次读写探测，用**结果**证明修好（而非假设）
+**方法论教训（本轮最有价值的一条）**：
+  **"写入失败"不等于"索引坏了"。** 本次读侧一直正常，仅写侧失败 ——
+  若按"索引损坏"直接 DROP+CREATE，属于用重型操作去修一个尚未定性的问题。
+  正确顺序是**先做读写分离探测**（`diagnose_bm25_index_health.py` 与
+  `diagnose_pg_search_insert_forms.py` 的作用），把"整个索引不可用"与
+  "仅写入路径不可用"区分开，再决定用 REINDEX 还是重建。
+  另外：两次推断都是"听起来合理"的解释，但都被一个**具体探测**推翻——
+  在基础设施问题上，可执行的探测比推理更可靠。
+**附带发现**：`scripts/enable_pg_search_bm25.sql` 的建索引语句**整体被注释**，
+仓库内 migrations 与 docker/postgres/init 都没有创建 BM25 索引；
+即该索引是**手工创建**的、未纳入版本管理 —— 这也是它与扩展版本脱节、
+且无人察觉的原因。建议后续把建索引 SQL 纳入 migration 或初始化脚本。
