@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 238 条真 bug 修复记录。
+- 共 239 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2905,6 +2905,50 @@ C1 与 C4 的真实轨迹均为 4 轮、`stopped_reason=budget_exhausted`：
 让模型再决定一次既浪费轮次、又引入"忘记调用/调错参数"的风险（C4 的失败正属后者）。
 **注意**：本轮改动**未触及 graph**（graph 仍为影子路径未切流），
 故该缺口不影响当前 pipeline 的正确性；但**切流前必须解决**，否则 C4 类问题会直接暴露。
+
+### ISSUE-20260914-GRAPH-DEPENDS-ON-FIXED-BY-LAYERING
+- 日期：2026-09-14
+- 分类：Agent 编排 / 图与管线一致性
+- 严重程度：P1（修复）
+**承接** `ISSUE-20260914-GRAPH-MODEL-TOOL-IGNORES-DEPENDS-ON`（缺口定位）与
+`ISSUE-20260914-GRAPH-PREEXEC-FACT-INTENTS-ATTEMPT-REVERTED`（错误落点的回退）。
+**修复落点改为正确的位置**：不在 `CustomerModelToolLoop` 内做"确定性工具预执行"
+（那与"模型自主调度"的职责边界冲突，且与既有测试假设不兼容，已回退），
+而是**在 `SupervisorGraph.model_tool_node` 按 `depends_on` 分层**。
+
+实现要点：
+1. `_task_layers(tasks)`：按 `depends_on` 拓扑分层，同层并行、层间串行。
+   循环依赖/悬空依赖时把剩余 task 一并放入最后一层 —— **宁可退化为并行也不丢 task**
+   （并有测试固定"不丢 task"）。
+2. 逐层调用模型循环，`planned_intents` 只传**本层**意图（此前传全部）。
+   这样 `depends_on` 第一次真正参与了调度。
+3. 层间传递：把之前各层已产出的答案经 **`prior_facts`** 传给下一层
+   （`run()` 新增参数），文案与 `CustomerTaskExecutor._dependency_context` 一致。
+4. **事实与检索串严格分离**：`prior_facts` 只进入提示块，`query` 始终保持用户原问句。
+   这是对 `ISSUE-20260914-DEP-CONTEXT-POLLUTES-RETRIEVAL` 教训的直接应用 ——
+   把事实拼进 query 会被当作检索内容，实测 best_sim 0.4643→0.3753。
+5. 单层失败不拖垮整体；某层无任何结果则停止后续层（后续层依赖的正是这些事实）。
+
+**实测验证（假 loop 捕获各层参数，端到端）**：
+```
+层1: planned_intents=['risk_restriction']  query='我有没有风险限制'  prior_facts=(空)
+层2: planned_intents=['risk_public']       query='我有没有风险限制'  prior_facts='【前序查询结果…】
+                                                                     [risk_restriction] …等级为 **C4**。'
+```
+即：**第 2 层拿到了第 1 层的 C4，且 query 未被污染** —— C4 用例的失败条件已消除。
+分层结果（真实规划器）：
+```
+"我有没有风险限制"          -> 2 层（risk_restriction -> risk_public）
+"我的订单 … 处理流程"       -> 2 层（order_status -> workflow）
+"你们公司的主营业务是什么"   -> 1 层（两个知识意图无依赖，保持并行）
+```
+**与 pipeline 的对照**：此前 pipeline 正确、graph 错误；现在 graph 也按依赖串行并传递事实，
+两条路径的**机制**对齐（此前只有 pipeline 有传递）。
+**新增测试** `tests/test_graph_task_layering.py`（7 条）：分层顺序、无依赖单层、
+循环依赖不丢 task、第 2 层收到 C4、事实不污染 query、单层无前序事实、各层结果合并。
+`tests 442 passed`（原 435 + 7），**既有测试零改动** —— 印证"落点选对后不再需要打补丁"。
+**方法论印证**：上一轮在同一功能上连打三版补丁都打破既有约束，回退并换落点后
+**一次通过且无需改任何既有测试**。这正是"补丁打不动时应质疑方案本身"的正面例证。
 
 ### ISSUE-20260914-GRAPH-PREEXEC-FACT-INTENTS-ATTEMPT-REVERTED
 - 日期：2026-09-14

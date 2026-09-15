@@ -363,19 +363,34 @@ class CustomerModelToolLoop:
         return filled_any
 
     async def run(self, *, customer_id: str, conversation_id: str, query: str,
-                  planned_intents: list[str] | None = None) -> ModelToolOutcome:
+                  planned_intents: list[str] | None = None,
+                  prior_facts: str = "") -> ModelToolOutcome:
         """让模型自主选工具并循环，直到模型不再调用或预算用尽。
 
         planned_intents：规则规划器已识别出的意图列表（可选）。作为**提示**告知模型
         "这个问题需要覆盖哪些方面"，避免多意图 query 只查到一半就被模型判定"够了"。
         它不是硬约束——模型仍可自主决定调什么、调几次。
+
+        prior_facts：**前序层已取得的事实**（如客户风险等级 C4），由调用方
+        （`graph.model_tool_node` 按 depends_on 分层时）传入。
+        **与 query 严格分离**：
+          - query 仍是用户原问句，作为**检索串**（拼进它会污染检索——
+            实测 best_sim 0.4643→0.3753，见 ISSUE-20260914-DEP-CONTEXT-POLLUTES-RETRIEVAL）；
+          - prior_facts 只进入**提示块**，指导模型"基于这些事实作答/改写查询"。
+        这样既保证模型看得到事实，又不影响检索质量。
         """
         outcome = ModelToolOutcome()
         context_lines: list[str] = []
         seen_calls: set[str] = set()   # 已执行过的 (工具, 参数) 组合，用于重复调用闸门
         planned_block = ""
+        if prior_facts:
+            # 明确要求模型把已查到的事实**带进后续检索**：C4 用例的失败正是
+            # 模型改写 query 时没带上已查到的等级，导致检索回的制度文本不含 C4。
+            planned_block += ("\n\n" + prior_facts
+                              + "\n（改写检索查询时请结合上述已知事实，"
+                                "例如带上具体的等级/单号，使检索结果与本人情况相关。）")
         if planned_intents:
-            planned_block = (
+            planned_block += (
                 "\n\n该问题经规则分析需要覆盖以下方面（请确保都取得依据后再结束）：\n"
                 + "\n".join(f"- {item}" for item in planned_intents)
             )

@@ -357,6 +357,16 @@ class SupervisorGraph:
         与 `react_step_node` 的区别：工具名、参数、改写、是否续调**全部由模型决定**，
         而非硬编码 `search_customer_knowledge` + 2 条固定改写模板。
         安全：模型只能从只读白名单里选（写操作进不来），customer_id 由服务端注入。
+
+        **按 `depends_on` 分层执行**（ISSUE-20260914-GRAPH-MODEL-TOOL-IGNORES-DEPENDS-ON）：
+        此前把 `plan.tasks` 压成**一串意图名**一次性交给模型循环，导致 `depends_on`
+        完全不可见 —— 依赖既不参与调度，前序答案也不会传给后序 task。
+        后果实测：`我有没有风险限制`（C4 客户）pipeline 正确答出"可投资 R1-R4"，
+        而 graph 因模型改写检索 query 时没带上已查到的 C4，输出"未包含您的具体类型"。
+        即结果取决于模型是否**碰巧记住**前序事实，而非机制保证。
+
+        现按依赖分层：同层并行、层间串行，并把已完成层的答案作为**事实上下文**
+        传给下一层的查询与生成，使"用事实（客户等级）套规则（制度）"成为必然而非运气。
         """
         if self.model_tool_loop_factory is None:
             raise RuntimeError("model_tool_node 需要注入 model_tool_loop_factory")
@@ -366,27 +376,97 @@ class SupervisorGraph:
         except Exception:  # noqa: BLE001
             max_rounds = 4
 
-        loop = self.model_tool_loop_factory(max_rounds=max_rounds)
         plan = _rebuild_plan(state.plan)
-        outcome = await loop.run(
-            customer_id=state.customer_id or "",
-            conversation_id=state.conversation_id,
-            query=state.combined_query or state.user_message,
-            # 把规则规划出的意图作为提示传给模型，避免多意图 query 只覆盖一半
-            planned_intents=[t.intent for t in plan.tasks],
-        )
+        base_query = state.combined_query or state.user_message
+
+        merged_rounds: list[dict] = []
+        merged_names: list[str] = []
+        merged_decisions: list[dict] = []
+        merged_results: list[dict] = []
+        stop_reasons: list[str] = []
+
+        for layer in self._task_layers(plan.tasks):
+            planned_intents = [t.intent for t in layer]
+            # 把**之前各层**已产出的事实作为上下文（语义与文案与 pipeline
+            # `CustomerTaskExecutor._dependency_context` 一致）。
+            # **注意必须与 query 分离传入**：query 是检索串，拼进事实会污染检索
+            # （实测 best_sim 0.4643→0.3753，见 ISSUE-20260914-DEP-CONTEXT-POLLUTES-RETRIEVAL）。
+            dep_context = self._facts_context(merged_results)
+
+            loop = self.model_tool_loop_factory(max_rounds=max_rounds)
+            try:
+                outcome = await loop.run(
+                    customer_id=state.customer_id or "",
+                    conversation_id=state.conversation_id,
+                    query=base_query,
+                    planned_intents=planned_intents,
+                    prior_facts=dep_context,
+                )
+            except Exception as exc:  # noqa: BLE001 - 单层失败不拖垮整体
+                logger.warning("model_tool.layer_failed intents=%s err=%s",
+                               planned_intents, type(exc).__name__)
+                continue
+
+            merged_rounds.extend(r.__dict__ for r in outcome.rounds)
+            merged_names.extend(outcome.tool_names)
+            merged_decisions.extend(outcome.decisions)
+            merged_results.extend(outcome.results)
+            stop_reasons.append(outcome.stopped_reason)
+            # 若本层未产出任何结果（如模型未调用），停止后续层——
+            # 后续层依赖的正是这些事实，没有事实就无从"套规则"。
+            if not outcome.results:
+                break
+
         patch: dict[str, Any] = {
-            "model_tool_rounds": [r.__dict__ for r in outcome.rounds],
-            "model_tool_names": list(outcome.tool_names),
-            "model_tool_stopped_reason": outcome.stopped_reason,
-            # 模型的原始决策序列（含自述理由与被拦下的越界/重复调用）。
-            # 与 rounds 的差别：rounds 只记已执行的，decisions 记"模型想做什么"，
-            # 是排查"为什么多调一个工具"的唯一直接证据。
-            "model_tool_decisions": list(outcome.decisions),
+            "model_tool_rounds": merged_rounds,
+            "model_tool_names": merged_names,
+            "model_tool_stopped_reason": ",".join(stop_reasons) or "no_tool_call",
+            "model_tool_decisions": merged_decisions,
         }
-        if outcome.results:
-            patch["task_results"] = outcome.results
+        if merged_results:
+            patch["task_results"] = merged_results
         return patch
+
+    @staticmethod
+    def _facts_context(results: list[dict]) -> str:
+        """把已完成 task 的答案拼成"前序事实"上下文。
+
+        文案与 `CustomerTaskExecutor._dependency_context` **逐字一致**，
+        避免同一语义出现两种说法（该模块已有同类教训）。
+        """
+        blocks: list[str] = []
+        for item in results:
+            answer = str(item.get("answer") or "").strip()
+            if not answer:
+                continue
+            blocks.append(f"[{item.get('intent') or 'unknown'}] {answer}")
+        if not blocks:
+            return ""
+        return ("\n\n【前序查询结果（请基于这些事实作答，不要臆造）】\n"
+                + "\n".join(blocks))
+
+    @staticmethod
+    def _task_layers(tasks: list[Any]) -> list[list[Any]]:
+        """按 `depends_on` 把 tasks 拓扑分层：同层可并行、层间串行。
+
+        - 依赖已满足的 task 归入当前层；
+        - 检测到**循环依赖**或依赖缺失时，把剩余 task 一并放入最后一层，
+          保证不丢 task（宁可顺序退化为并行，也不静默丢弃）。
+        """
+        remaining = list(tasks)
+        done: set[str] = set()
+        layers: list[list[Any]] = []
+        while remaining:
+            ready = [t for t in remaining
+                     if all(dep in done for dep in (getattr(t, "depends_on", None) or []))]
+            if not ready:
+                # 存在循环依赖/指向不存在的 task —— 全部置于最后一层，避免死循环
+                layers.append(remaining)
+                break
+            layers.append(ready)
+            done.update(t.task_id for t in ready)
+            remaining = [t for t in remaining if t not in ready]
+        return layers
 
     def _route_after_model_tool(self, state: AgentState) -> str:
         """模型工具轮拿到结果 → 先经 generate_node 生成答案；没拿到 → 回退确定性 ReAct。"""
