@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 219 条真 bug 修复记录。
+- 共 220 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2549,3 +2549,53 @@ DROP+CREATE **一起撤销**，脚本却报告"写入探测成功" —— **假�
 仓库内 migrations 与 docker/postgres/init 都没有创建 BM25 索引；
 即该索引是**手工创建**的、未纳入版本管理 —— 这也是它与扩展版本脱节、
 且无人察觉的原因。建议后续把建索引 SQL 纳入 migration 或初始化脚本。
+
+### ISSUE-20260914-INTENT-EXPANSION-DOES-NOT-DIVERGE-RETRIEVAL
+- 日期：2026-09-14
+- 分类：RAG / 意图规划 / 检索
+- 严重程度：P3（**不是 bug，是"冗余设计"**：机制正常但无实际区分力）
+**现象**：语料结构问题修复后重跑，`company_info` 与 `company_business` 两个 intent 的
+检索结果**仍逐字节相同**（chunk_ids、similarities、命中类目分布全部一致，Jaccard=1.000）：
+```
+[company_info]     best=0.6366  chunk_ids=[0231b635…, 32ac72d4…, 6d860602…, a528cff4…, d77866fc…]
+[company_business] best=0.6366  chunk_ids=[0231b635…, 32ac72d4…, 6d860602…, a528cff4…, d77866fc…]
+两条 similarities 也完全相同 = [0.6366, 0.5482, 0.5317, 0.5244, 0.5122]
+命中类目分布 = {'company_business': 2, 'company_info': 2, 'faq': 1}（两者相同）
+```
+**注意：这与修复前的"相同"性质完全不同。** 修复前是因为 `company_business` 权限为 staff
+（0 命中、两路都退回到 company_info）；现在是**四类语料都可见、确实召回了混合类目**，
+只是两个 intent 召回了**同一批**。
+**根因（逐层定位，非推断）**：
+1. 两个 intent 的唯一差异在 `normalize_customer_query` 的**尾部扩展词**：
+```
+company_info     → "…公司名称 公司介绍 联系方式 客户数量"
+company_business → "…公司业务 公司服务 服务范围 客户"
+```
+2. 但 `CustomerRagService` 的**向量腿嵌入的是原始 query**（`embed([query])`），
+   不是 normalized —— 故**向量腿对两个 intent 必然完全相同**。
+3. 文本腿（pg_search BM25）虽有差异，但拆词后**共同前缀占绝大多数**：
+```
+共同词 = 贵公 公司 司主 主营 营业 业业 业务（7 个，占 q1 全部词的 64%）
+q1 独有 = 公司名称 公司介绍 联系方式 客户数量
+q2 独有 = 公司业务 公司服务 服务范围 客户
+```
+   差异词都是**两类文档中都大量出现的通用业务词**，不足以改变 BM25 排序。
+4. 于是"向量腿完全相同 + 文本腿排序趋同" → 融合结果相同。
+**结论**：这不是故障，而是**意图设计层面的冗余**——
+针对"你们公司的主营业务是什么"这类问题，company_info 与 company_business
+在**当前语料**下并不构成两个可区分的检索意图。
+（此前一度判为"无信息增量"，后被证伪；现在有了明确机制解释：
+ 不是"语料不足"，也不是"类目没生效"，而是**这两个意图的检索特征本就高度重合**。）
+**此前绕过的弯路（记录）**：
+  - 曾判"拆 task 无信息增量"（单样本，已撤回）
+  - 曾判"类目没生效导致不分区"（当时确实存在，但修复后仍相同，故非本现象之因）
+  - 曾推测"中文下文本腿为空导致扩展词失效" —— **证伪**：
+    `FULLTEXT_BACKEND=pg_search` 走 `_rank_text_pg_search`（有中文 bigram 拆词），
+    文本腿非空。该推断错在只看了 tsvector 分支的注释就下结论。
+**待决（产品语义，未自行改）**：是否应把 company_info / company_business 合并为一个意图，
+或让二者检索**不同 scope**（如 company_business 限定 category），
+或接受现状（两个 task 产出相同证据，靠生成层给出不同侧重）。
+本轮不改代码：这属于意图体系设计，需产品判断。
+**顺带确认（本轮修复已生效的证据）**：语料四类全部 pl=public
+（company_info 49 / company_business 40 / policy 24 / faq 21），
+六个检索探针全部 `sufficient`，`company_business` 由 0 命中变为 0.6366。
