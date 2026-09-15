@@ -1,5 +1,40 @@
 # Bug 修复记录
 
+## 长链排查索引
+
+本文记录了一次**跨 8 层缺陷**的完整排查。起始症状：
+`你们公司的主营业务是什么` 两个 task 的答案重复。
+最终发现该症状由**八层相互独立的缺陷**叠加而成，跨语料、索引、检索、意图、
+编排、数据、生成七个层面。**单修任何一层都不足以解决**。
+
+完整叙述（含中途弯路、被证伪的推断、方法论总结）见
+`docs/长链排查全记录-八层缺陷.md`（`docs/` 不入库，故此处保留索引供追溯）。
+
+| 层 | 缺陷 | 主要条目 |
+|---|---|---|
+| 1 语料 | 权限 `staff` 导致孤儿数据；`faq` 是测试残留；类目名错配 | `CATEGORY-PERMISSION-CORPUS-MISMATCH`、`CATEGORY-NARROWING-UNVIABLE`、`INTENT-CATEGORY-FILTER-NEVER-APPLIED` |
+| 2 镜像 | Dockerfile 缺 COPY + `.dockerignore` 的 `*.md` 排除语料 | `CORPUS-MISSING-FROM-IMAGE` |
+| 3 索引 | BM25 索引 `key_field` 未入字段列表 → **所有写入失败** | `PGSEARCH-BM25-KEY-FIELD-BLOCKS-INSERT` |
+| 4 检索 | 各意图共用 scope → 检索同一批文档（且收窄须按意图分别决定） | `INTENT-EXPANSION-DOES-NOT-DIVERGE-RETRIEVAL` |
+| 5 意图 | `policy` 唯一触发词是"政策" → 24 个 chunk 完全问不到；扩展后又过度触发 | `POLICY-INTENT-NEVER-TRIGGERED`、`POLICY-TRIGGER-OVERBROAD` |
+| 6 数据 | `risk_restriction` 不读风险等级；状态机缺"一致性"维度 | `RISK-LEVEL-NOT-READ`、`STATUS-MACHINE-LACKS-CONSISTENCY-DIMENSION`、`NO-TASK-ANSWER-PASSING` |
+| 7 编排 | graph 不遵守 `depends_on`、事实不传递；分层后又引入三个缺陷 | `GRAPH-MODEL-TOOL-IGNORES-DEPENDS-ON`、`GRAPH-DEPENDS-ON-FIXED-BY-LAYERING`、`AGENT-STATE-SILENTLY-DROPS-UNDECLARED-KEYS`、`GRAPH-PREEXEC-FACT-INTENTS-ATTEMPT-REVERTED` |
+| 8 生成 | 制度 task 编造个人事实；事实到不了生成阶段 | `RULE-TASK-ASSERTS-PERSONAL-FACT`、`GRAPH-GENERATION-MISSING-PRIOR-FACTS` |
+
+**跨层配套修复**（非某一层独有，但由本次排查引出）：
+- `DEP-CONTEXT-POLLUTES-RETRIEVAL` —— 检索串与生成提示必须分离
+- `RISK-RANK-RULES-DIVERGED` —— 等级比对口径收敛为单一实现
+- `FAILURE-HINT-ENCOURAGES-RETRY` / `FAILURE-HINT-RETRY-FIX` —— 失败提示不再鼓励无效重试
+- `ORDER-NO-PATTERN-MISSES-REAL-FORMAT` —— 单号正则漏识别真实格式
+- `COVERAGE-BACKSTOP-SKIPPED-ON-BUDGET` —— 覆盖兜底须在所有退出路径生效
+- `MODEL-DECISION-REASONING-DISCARDED` —— 模型自述理由此前被丢弃，导致根因不可观测
+
+**方法论要点**（详见 `docs/DECISIONS.md`）：
+先补观测再诊断；能跑的探测优于推理；单样本不下机制性结论；
+打补丁打不动时质疑方案本身；"节点返回了某键" ≠ "状态里能读到该键"。
+
+---
+
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
 - 共 239 条真 bug 修复记录。
@@ -2949,6 +2984,233 @@ C1 与 C4 的真实轨迹均为 4 轮、`stopped_reason=budget_exhausted`：
 `tests 442 passed`（原 435 + 7），**既有测试零改动** —— 印证"落点选对后不再需要打补丁"。
 **方法论印证**：上一轮在同一功能上连打三版补丁都打破既有约束，回退并换落点后
 **一次通过且无需改任何既有测试**。这正是"补丁打不动时应质疑方案本身"的正面例证。
+
+### ISSUE-20260914-RISK-LEVEL-NOT-READ
+- 日期：2026-09-14
+- 分类：RAG / 风险数据
+- 严重程度：P1（制度 task 拿不到等级 → 只能编造个人事实）
+**现象**：`我有没有风险限制` 的答案自相矛盾——"您的账户当前未显示风险限制"
+与"是的，您有风险限制"并存，而 `overall_status` 报 `completed`。
+**根因**：`CustomerQueryRouter._risk_restriction` 只读
+`account.risk_restriction_status`（二进制 `none`/`restricted`），
+**从不读** `customer_risk_assessment.risk_level`（C1–C5）。
+于是下游 `risk_public`（制度说明）拿不到客户等级，却要回答"我有没有限制"，
+只能编造。二者是**两个不同概念**：前者是"账户是否被风控冻结"，
+后者是"你的风险承受等级"，用户问"我有没有风险限制"时两者都相关。
+**修复**：补读风险等级，并按测评状态区分措辞：
+`active`（已定级）/ `provisional`（未完成正式测评，结果可能调整）/ 缺失。
+**验证**：实测 `risk_c1~c5_demo` 五个客户等级全部正确读出。
+**记录缺口**：本条目在代码注释中被引用多时，但此前**未在本文留下独立条目**
+（提交信息引用了不存在的 ID），现补录。
+
+### ISSUE-20260914-RULE-TASK-ASSERTS-PERSONAL-FACT
+- 日期：2026-09-14
+- 分类：生成 / 合规
+- 严重程度：P1（对客户账户状态做无依据断言）
+**现象**（C4 客户，graph）：
+```
+您的账户当前未显示风险限制，……      <- 事实（另一 task 查库所得）
+是的，您有风险限制。                 <- 制度 task 顺着问句断言  ✗ 自相矛盾
+若您是 C2… 若您是 C4…               <- 举假设例子却不提客户真实等级
+```
+**根因**：`policy` / `risk_public` 检索的是**制度文本**，**无从知道客户个人状态**，
+但其 query 是用户原问句（"我有没有风险限制"），模型便顺着问句断言个人事实。
+**关键判断：不靠改写检索 query 解决**。实测把"我有没有风险限制"改成
+"风险限制的制度规定"，best_sim 从 **0.5820 掉到 0.5242**（跌破 sufficient）——
+改写丢掉了原问句的语境词。故只在**生成提示**加角色约束，检索串保持不变。
+**修复**：`customer_rag_answer.generate()` 对 `_RULE_INTENTS = {policy, risk_public}`
+追加角色约束：只陈述制度如何规定、**绝不要**用"您有/您没有…"断言个人事实、
+**不要**用"若您是 C2…"假设例子替代结论。
+**验证**：实测"是的，您有风险限制"消失，语气由个人断言改为制度陈述。
+新增 `tests/test_rule_task_role_constraint.py`（4 条）。
+
+### ISSUE-20260914-DEP-CONTEXT-POLLUTES-RETRIEVAL
+- 日期：2026-09-14
+- 分类：RAG / 检索
+- 严重程度：P1（**我自己引入的回归**）
+**现象**：实现 task 答案传递（`_dependency_context`）后，把前序事实**拼进了
+`item.query`**。但 `query` 在知识类 task 里是**检索串**——
+`_bounded_react_knowledge` 取 `item.query.strip()` 后直接传给
+`search_customer_knowledge`。于是"【前序查询结果（请基于这些事实作答，不要臆造）】"
+这段**指令文本本身被送去知识库检索**。
+**实测影响**：`'工单的处理政策是什么'` 的 best_sim **0.4643 → 0.3753**
+（-19%，逼近 `reject=0.35`）；检索串长度 10 → 82。
+**影响面**：不止新增的 `risk_public`，**既有的 `workflow`/`faq`/`policy` 依赖场景
+同样中招**（枚举出 6 个 (task,依赖) 组合），即对既有行为的回归。
+**修复**：新增 `IntentTask.dependency_context` **独立字段**——
+检索用 `query`（纯问句），生成用 `gen_query = query + dependency_context`。职责分离。
+**教训**：**检索串与生成提示必须分离**。这是本议题反复出现的一类错误的两面：
+既要防止"不该加的加进检索串"（本条），也要防止"该保留的从检索串里拿掉"
+（见 `RULE-TASK-ASSERTS-PERSONAL-FACT` 里否决的改写方案）。
+
+### ISSUE-20260914-GRAPH-GENERATION-MISSING-PRIOR-FACTS
+- 日期：2026-09-14
+- 分类：Agent 编排 / 生成
+- 严重程度：P1（事实传到了提示层、却没到生成层）
+**现象**：graph 的制度 task 通篇讲通用规则（"C1投资者仅可购买R1产品…"），
+**完全没提客户真实等级 C4**，还自认"资料未完全覆盖"（`partially_answered`）。
+而 pipeline 同场景正确："C4 等级客户可直接购买 R1 至 R4"。
+**根因**：分层事实只进了 `model_tool_node` 的**提示层**（`prior_facts`，
+用于指导选工具/改写 query），而 `generate_node` 对所有 task 一律用
+`state.react_query or state.user_message`，**看不到**前一层查到的事实。
+pipeline 之所以对，是因为 `_bounded_react_knowledge` 会把
+`item.dependency_context` 附到生成 query 上；graph 侧此前没有对应处理。
+（另确认：`CustomerModelToolLoop` **完全不调用答案生成器**，
+只返回原始工具结果，生成发生在后面的 `generate_node` —— 故事实必须**跨节点传递**。）
+**修复**：
+- `_tag_layer_results` 把本层 `prior_facts` 写入每条结果的 `data.prior_facts`。
+  **放 `data` 而非 AgentState 顶层键**：`task_results` 是自由形态的 dict 列表，
+  其内部键不会被 LangGraph 过滤（吸取 `AGENT-STATE-SILENTLY-DROPS-UNDECLARED-KEYS` 的教训）。
+- `generate_node` 读取并并入**生成** query。**只影响生成、不影响检索**。
+**验证**：实测 `risk_public` 的生成 query 变为
+`'我有没有风险限制\n\n【前序查询结果…】\n[risk_restriction] …等级为 **C4**。'`；
+端到端 graph 输出"C4 进取型投资者可购买 R1 至 R4（引用 1 第35条）"，
+`overall_status` 由 `partially_answered` 变为 `completed`（与 pipeline 一致）。
+
+### ISSUE-20260914-AGENT-STATE-SILENTLY-DROPS-UNDECLARED-KEYS
+- 日期：2026-09-14
+- 分类：LangGraph / 状态管理
+- 严重程度：P1（**静默失效，不报错不告警**）
+**现象**：分层执行后，`L1` 只有 1 次真实调用却显示 `rounds=5`，
+且两个 task 的 decision 序列**完全相同** —— 说明它们都拿到了"合并后的整体轨迹"，
+按层附加逻辑没生效。task_id 前缀与停止原因标注均已生效，仅轨迹仍混叠。
+**根因**：`model_tool_layer_traces` **未在 `AgentState` 中声明**。
+LangGraph 只把 State **已声明字段**并入状态，**未声明的顶层键被静默丢弃**。
+于是 runner 的 `by_layer` 恒为空，每个 task 都走 fallback。
+**为何单元测试没抓到（关键教训）**：既有测试是"直接调用 `model_tool_node`
+并把返回的 patch **手工合并**进响应"，**绕过了真实图的状态归并** ——
+而状态的归并规则（哪些键保留）正是被测对象。所以键"看起来"存在、测试通过，
+线上链路里却已被丢弃。
+> **"节点返回了某键" ≠ "状态里能读到该键"。**
+**修复与加固**：
+- `AgentState` 增加该字段。
+- 新增"用**真实 StateGraph** 跑一遍并断言键仍在最终状态"的测试。
+- 新增"节点返回的每个键都必须已在 AgentState 声明"的防复发断言。
+- **验证测试能失败**：删掉该字段后 2 failed，恢复后通过。
+**同时暴露的工程教训**：这个"轨迹混叠"缺陷我**修了两次**——
+第一次改了 runner 逻辑并加测试（通过但实际无效），第二次才发现真因。
+原因是**验证手段与被验证链路不一致**，与"本地跑得好、容器里不行"同类。
+
+### ISSUE-20260914-POLICY-TRIGGER-OVERBROAD
+- 日期：2026-09-14
+- 分类：意图识别
+- 严重程度：P2（误分类导致正确答案丢失）
+**背景**：修复 `POLICY-INTENT-NEVER-TRIGGERED` 时按"该意图承载的内容"扩展触发词，
+但**第一版**加了裸词 `"规定"`，导致**过度触发**：
+```
+"开户有什么规定" -> ['policy']    <- 用户问的是【流程】！
+```
+用户缺"流程"二字使 `workflow` 未触发，而 policy 被"规定"拉走。
+这属**误分类**，比"多一个 task"更糟——**正确答案丢失**。
+**第二版**收紧为限定搭配（监管规定/管理规定/法律法规/制度规定），
+又**过度收紧**：`"投资有什么规定"` 退化成 `['unknown']`、`"公司有什么规定"` 丢掉 policy。
+**第三版（最终）**：
+- policy 补制度域搭配：投资规定 / 投资有什么规定 / 有什么规定 / 规定有哪些
+- workflow 补齐流程类说法：开户 / 办理 / 申请 / 需要什么材料 / 需要哪些材料
+结果：
+```
+"开户有什么规定" -> ['policy', 'workflow']   同时命中（收集式匹配，正确）
+"投资有什么规定" -> ['policy']
+"赎回有什么规定" -> ['business_operation', 'policy']
+```
+**教训**：触发词是**精确度与召回率的权衡**，往往一次改不到位，
+需要**双向验证**：既验"该命中的命中"，也验"不该命中的不命中"。
+新增 6 条测试（3 参数化 + 3 断言）固定该平衡。
+
+### ISSUE-20260914-RISK-RANK-RULES-DIVERGED
+- 日期：2026-09-14
+- 分类：架构 / 一致性
+- 严重程度：P2（多处口径分叉，有安全语义差异）
+**现象**：同一套"风险等级排名 + 比较"在 **4 处各写一遍，且默认值已经不一致**：
+```
+suitability_service.py   LEVEL / _level()    缺失默认 1
+trading_service.py       内联 dict           缺失默认 1（下单硬门禁）
+api/admin.py             内联 dict           **缺失默认 0**（据此统计 missing_risk）
+api/profile.py           内联 risk_order     产品缺失 99 / 上限缺失 0（fail-closed）
+```
+**风险**：将来在回答侧再写一份（如"你能买什么"的推导），会出现
+"回答说能买、下单却被拒"这类口径不一致。
+**修复**：收敛到 `suitability_service` 的 `risk_rank()` / `is_suitable()` 作为唯一权威实现；
+其余位置改为引用。`risk_rank` 对缺失/未知返回 **0**（区别于历史 `_level` 的默认 1），
+使调用方能区分"缺失"与"最低等级"——这是 admin 统计 `missing_risk`
+与门禁拒绝都需要的语义。
+**保留 `profile` 的 fail-closed 语义**：原为产品缺失→99、上限缺失→0，
+转换时若误用 `risk_rank(p) or 1` 会变成 fail-open（**放行未知产品**），属安全回归。
+故保留 `or 99` 并加测试固定。
+**验证**：全仓已无重复的内联等级字典（仅剩权威定义一处）；
+新增 7 条测试，含"不得再内联字典"与"fail-closed 不得被改成 or 1"的断言。
+
+### ISSUE-20260914-NO-TASK-ANSWER-PASSING
+- 日期：2026-09-14
+- 分类：Agent 编排
+- 严重程度：P1（"用事实套规则"在系统里做不了）
+**现象**：`depends_on` 此前只做**执行顺序门控**
+（`ready = all(dep in results for dep in item.depends_on)`），
+最多在 `workflow/faq/policy` 分支读一下依赖的 `intent` 用来选工具名，
+**从不把前序 task 的答案传下去**。
+**后果**：像"用客户风险等级（事实）套制度规则（知识）"这类**必须依赖前序结论**的任务
+无法实现——制度 task 拿不到等级，只能空谈规则甚至编造
+（见 `RISK-LEVEL-NOT-READ`、`RULE-TASK-ASSERTS-PERSONAL-FACT`）。
+**与既有硬编码写法的区别**：`business_operation` 分支确实用了前序内容，
+但那是"遍历 results 按 intent 找"的**隐式耦合**，与 `depends_on` 声明无关。
+**修复**：新增 `CustomerTaskExecutor._dependency_context()`，
+按 `depends_on` **显式声明**注入前序答案：
+```
+【前序查询结果（请基于这些事实作答，不要臆造）】
+[risk_restriction] 您的账户当前未显示风险限制。您的风险承受能力等级为 **C4**。
+```
+规划器同时为 `risk_public` 声明依赖 `risk_restriction`。
+**配套教训**：传递时**必须与检索串分离**——初版把它拼进 `query` 导致检索质量下降
+（见 `DEP-CONTEXT-POLLUTES-RETRIEVAL`）。
+
+### ISSUE-20260914-TOOL-FAILURE-DROPPED
+- 日期：2026-09-14
+- 分类：Agent 工具循环
+- 严重程度：P2（失败语义丢失，导致误转人工）
+**现象**：旧实现下，工具调用失败时**不产出 task 结果**，只把失败原因回灌给模型。
+**后果**：`outcome.results` 为空 → `_route_after_model_tool` 判定"没拿到结果"
+→ 回退到确定性 ReAct（对 `order_status` 却走知识检索）→ 检索不到 →
+`low_confidence` → **误转人工**。
+实测：`我的订单 ORD-123456 状态` 的 graph `requires_handoff=True`，而 pipeline 为 `False`。
+**修复**：失败结果**保留为 task 结果**，语义与管线对齐：
+`fact_not_found` / `ambiguous_product` / `low_confidence` → `needs_clarification`
+（附"请补充更明确的查询对象或订单/产品信息"），其他 → `failed`。
+**验证**：`tests/test_customer_model_tools.py` 有对应断言（失败结果须保留、
+状态须为 `needs_clarification`、不得标 `succeeded`）。
+
+### ISSUE-20260914-GATE-EMBEDDING-MISMATCH
+- 日期：2026-09-14
+- 分类：RAG 证据门控
+- 严重程度：P2（口径二义，跨环境判定翻转）
+**现象**：同一 query 在本地判 `low_confidence`、容器内判 `sufficient`，
+一度怀疑是镜像/数据不一致。
+**根因（排查后澄清）**：`CustomerRagService.answer` 中
+**门控相似度取自向量腿**（`query_embedding` 来自**原始 query**），
+而**检索串**用的是 `normalized_query`（含意图扩展词）。
+即门控与"实际返回的证据"来自**两条不同的口径**，边界很窄，微小差异即翻转。
+**实测澄清（重要）**：本地与容器的 `best_sim` 实际一致（0.5045 vs 0.5046，仅浮点噪声），
+真正的差异来自**知识库数据不同**（本地 5433 vs 容器库），而非代码。
+**处置**：在 `customer_rag_service.py` 明确注释了三条口径
+（向量腿用原始 query / 文本腿用 normalized / 门控只采信向量腿），
+消除"门控到底算哪个串"的二义。
+**教训**：**同一 query 在两个环境判定不一致时，先怀疑"两侧输入不同"，
+而不是"模型不稳定"。** 本例两侧输入确实不同（库不同），代码口径也确有二义。
+
+### ISSUE-20260914-MODEL-REWRITE-WORSE-THAN-TEMPLATE
+- 日期：2026-09-14
+- 分类：Agent 工具循环 / 方法论
+- 严重程度：P3（**结论已被部分推翻**，保留作反面案例）
+**原始结论**：曾判断"模型自主改写 query 不如原有的 2 条固定模板"，
+据此倾向保留硬编码模板。
+**证伪**：后续用 `scripts/compare_rewrite_effectiveness.py` 扩大样本后发现，
+**问题式改写实际上是成功的**，原判断源于**单样本**观察（且当时未排除生成随机性）。
+**保留原因**：这是本议题上"单样本下机制性结论"的典型错误之一
+（另两次：误判"多知识意图拆分无增量"、误判"图有合规问题"），
+三次的共同形态都是**用一个样本的差异去推断机制**。
+**教训**：**模型改写是否更差，必须用多样本对比**；
+且应先排除随机性（如温度）再判定 LLM 输出缺陷。
+
+### ISSUE-20260914-GRAPH-PREEXEC-FACT-INTENTS-ATTEMPT-REVERTED
 
 ### ISSUE-20260914-GRAPH-PREEXEC-FACT-INTENTS-ATTEMPT-REVERTED
 - 日期：2026-09-14

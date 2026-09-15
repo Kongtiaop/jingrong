@@ -575,7 +575,7 @@ class CustomerModelToolLoop:
                 # 失败也要把**具体原因 + 已试过的参数**回灌，否则模型只能重复同样的调用。
                 # 实测："我的订单 ORD-123456 状态" 模型 4 轮都传同一 query、4 次全失败，
                 # stopped_reason=budget_exhausted 且无任何结果
-                # （ISSUE-20260914-TOOL-FAILURE-NOT-FED-BACK）。
+                # （ISSUE-20260914-TOOL-FAILURE-NOT-FEED-BACK）。
                 # 失败反馈必须**结构化且不误导**。教训（ISSUE-20260914-FAILURE-HINT-MISLEADS-TOOL-SWITCH）：
                 # 旧文案"请换一个更明确的查询对象，或不要再重复相同参数"被模型理解成"换个工具试试"，
                 # 于是实测链路变成：order → workorder → knowledge → knowledge，
