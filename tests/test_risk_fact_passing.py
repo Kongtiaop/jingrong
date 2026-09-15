@@ -76,3 +76,35 @@ def test_intent_task_is_replaceable():
     new = replace(item, query="q + 上下文")
     assert new.query == "q + 上下文"
     assert item.query == "q", "replace 不应修改原对象"
+
+
+def test_dependency_context_must_not_enter_retrieval_query():
+    """事实上下文必须走独立字段，**绝不能拼进 query**。
+
+    ISSUE-20260914-DEP-CONTEXT-POLLUTES-RETRIEVAL
+
+    `query` 在知识类 task 里是**检索串**（直接传给 search_customer_knowledge）。
+    初版把指令块拼进 `item.query`，导致"【前序查询结果（请基于这些事实作答，不要臆造）】"
+    这段**指令文本本身被送去知识库检索**，实测 best_sim 从 0.4643 降到 0.3753
+    （逼近 reject=0.35），检索质量明显下降。
+    本测试固定：事实块只能存在于 `dependency_context` 字段。
+    """
+    # 1) 字段存在且默认空
+    item = IntentTask("t1", "risk_public", "rag_explanation", "我有没有风险限制")
+    assert item.dependency_context == "", "默认应为空，避免无依赖时污染生成提示"
+
+    # 2) 执行器应注入到 dependency_context，而不是 query
+    import inspect
+
+    from app.services.customer_task_executor import CustomerTaskExecutor as E
+    src = inspect.getsource(E._execute_one)
+    assert "dependency_context=dep_context" in src, \
+        "应把依赖上下文写入 dependency_context 字段"
+    assert 'query=f"{item.query}{dep_context}"' not in src, \
+        "不得再把依赖上下文拼进 query —— 那会被当作检索串送进知识库"
+
+    # 3) 生成阶段才使用它
+    react_src = inspect.getsource(E._bounded_react_knowledge)
+    assert "dependency_context" in react_src, \
+        "生成阶段应使用 dependency_context（否则事实传了却没用）"
+    assert "gen_query" in react_src, "应构造独立的生成用 query，不改检索串"

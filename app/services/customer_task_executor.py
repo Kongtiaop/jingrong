@@ -141,7 +141,12 @@ class CustomerTaskExecutor:
                         handoff_required=False,
                         message=result.answer,
                     )
-                    generated = await CustomerRagAnswerService(QwenProvider(get_settings())).generate(query=item.query, result=rag_result, conversation_summary=self.conversation_summary)
+                    # 生成阶段才附上前序事实：query 保持纯问句（检索已用它完成），
+                    # 事实块只影响"如何作答"，不影响"检索什么"。
+                    gen_query = item.query
+                    if item.dependency_context:
+                        gen_query = f"{item.query}{item.dependency_context}"
+                    generated = await CustomerRagAnswerService(QwenProvider(get_settings())).generate(query=gen_query, result=rag_result, conversation_summary=self.conversation_summary)
                     return TaskExecutionResult(
                         item.task_id,
                         item.intent,
@@ -221,10 +226,19 @@ class CustomerTaskExecutor:
             # 把前序事实作为上下文传给知识/制度类 task。
             # 这是"用事实套规则"得以成立的前提：制度 task 必须拿到客户真实等级，
             # 否则它只能空谈规则（实测会编出"是的，您有风险限制"这种错误断言）。
+            #
+            # **必须放进独立字段，不能拼进 query**（ISSUE-20260914-DEP-CONTEXT-POLLUTES-RETRIEVAL）：
+            # `query` 在本方法是**检索串**（见 _bounded_react_knowledge 第 105/114 行
+            # `query=item.query.strip()` → 直接传给 search_customer_knowledge）。
+            # 初版把指令块拼进 item.query，导致"【前序查询结果（请基于这些事实作答，不要臆造）】"
+            # 这段**指令文本本身被送去知识库检索**，实测把 best_sim 从 0.4643 拉到 0.3753
+            # （逼近 reject=0.35 阈值），检索质量明显下降。
+            # 现在：`query` 保持纯问句用于检索，事实块放 `dependency_context`
+            # 仅供**生成阶段**使用（见下方 generate(query=...) 处）。
             dep_context = self._dependency_context(item, results)
             if dep_context:
                 from dataclasses import replace as _replace
-                item = _replace(item, query=f"{item.query}{dep_context}")
+                item = _replace(item, dependency_context=dep_context)
             return await self._bounded_react_knowledge(customer_id=customer_id, item=item)
         if item.intent == "business_operation":
             is_purchase = any(marker in item.query for marker in ("申购", "购买", "买入", "下单"))

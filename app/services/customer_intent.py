@@ -23,6 +23,14 @@ class IntentTask:
     confidence: float = 0.0
     status: str = "planned"
     execution_mode: str = "controlled_workflow"
+    # 前序任务的事实上下文，**仅供生成阶段使用、绝不可混入检索串**。
+    # 为什么单独一个字段（而不是拼进 query）：
+    #   `query` 在知识类 task 里是**检索串**（直接传给 search_customer_knowledge），
+    #   把"【前序查询结果…不要臆造】"这类**指令文本**拼进去会被当作检索内容，
+    #   实测把 best_sim 从 0.4643 拉到 0.3753（逼近 reject 阈值）。
+    #   故检索用 query（纯问句），生成时再把本字段附加到提示里。
+    # 见 ISSUE-20260914-DEP-CONTEXT-POLLUTES-RETRIEVAL。
+    dependency_context: str = ""
 
 @dataclass(frozen=True)
 class IntentPlan:
