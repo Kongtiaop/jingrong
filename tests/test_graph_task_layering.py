@@ -36,14 +36,18 @@ class _RecordingLoop:
             "query": query,
         })
         out = ModelToolOutcome()
-        for intent in (planned_intents or []):
+        for i, intent in enumerate(planned_intents or [], start=1):
             answer = ("您的风险承受能力等级为 **C4**。"
                       if intent == "risk_restriction" else f"{intent} 说明")
             out.results.append({
-                "task_id": f"t-{intent}", "intent": intent, "status": "succeeded",
+                "task_id": f"model-tool-{i}", "intent": intent, "status": "succeeded",
                 "answer": answer, "data": {}, "error": None, "clarification": None,
             })
-        out.stopped_reason = "no_tool_call"
+            # 带上决策，用于验证"轨迹按层附加"（不区分层时会显示成同一份）
+            out.decisions.append({"round": i, "tool": f"tool_{intent}",
+                                  "outcome": "executed", "reasoning": f"{intent}"})
+        out.stopped_reason = ("no_tool_call" if "risk_restriction" in (planned_intents or [])
+                              else "budget_exhausted")
         return out
 
 
@@ -139,3 +143,53 @@ def test_merged_results_cover_all_layers():
     intents = [r["intent"] for r in (patch.get("task_results") or [])]
     assert "risk_restriction" in intents and "risk_public" in intents, \
         f"应合并两层的 task 结果，实际 {intents}"
+
+
+# ---- 分层后引入的三个缺陷（本轮修复，防止回归）----
+# 每层是独立的 loop.run()，若不做标记会出现：
+#   ① 不同层产生同名 task_id（都叫 model-tool-1），无法区分归属
+#   ② 轨迹被合并后附加到**每个** task 上，两 task 显示完全相同的决策
+#   ③ 停止原因直接逗号拼接，看不出哪层是哪种原因
+
+def test_layer_results_have_unique_task_ids():
+    """① 各层 task_id 必须唯一（否则无法对齐到具体层）。"""
+    calls: list[dict] = []
+    patch = asyncio.run(_graph(calls).model_tool_node(_state("我有没有风险限制")))
+    ids = [r["task_id"] for r in patch["task_results"]]
+    assert len(ids) == len(set(ids)), f"task_id 重复（不同层同名），实际 {ids}"
+    # 应能看出层归属
+    assert any(i.startswith("L1") for i in ids), f"task_id 应带层前缀，实际 {ids}"
+    assert any(i.startswith("L2") for i in ids), f"task_id 应带层前缀，实际 {ids}"
+
+
+def test_stopped_reason_labels_each_layer_without_duplication():
+    """③ 停止原因须按层标注，且**不得重复追加**同一条。"""
+    calls: list[dict] = []
+    patch = asyncio.run(_graph(calls).model_tool_node(_state("我有没有风险限制")))
+    reason = patch["model_tool_stopped_reason"]
+    parts = [p.strip() for p in reason.split("|")]
+    assert len(parts) == len(set(parts)), f"停止原因出现重复条目: {reason}"
+    assert all(p.startswith("L") for p in parts), \
+        f"每条停止原因都应带层号（如 L1:...），实际 {reason}"
+
+
+def test_each_task_shows_only_its_own_layer_decisions():
+    """② 每个 task 只应显示**本层**决策，而非全部层的合并轨迹。"""
+    from app.services.graph_agent_runner import _results_from_state
+
+    calls: list[dict] = []
+    graph = _graph(calls)
+    state = _state("我有没有风险限制")
+    patch = asyncio.run(graph.model_tool_node(state))
+    results = _results_from_state({**state.__dict__, **patch})
+
+    traces = []
+    for r in results:
+        tr = r.data.get("model_tool_trace") or {}
+        traces.append([d.get("tool") for d in (tr.get("decisions") or [])])
+        assert tr.get("layer") is not None, \
+            f"轨迹应带层号，便于分辨归属：{r.task_id}"
+    # 两层意图不同 → 决策序列不应完全相同
+    assert len(traces) == 2, f"应有 2 个 task，实际 {len(traces)}"
+    assert traces[0] != traces[1], \
+        f"两个 task 显示了相同的决策序列（说明轨迹被整体附加）: {traces}"

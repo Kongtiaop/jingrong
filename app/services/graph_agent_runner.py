@@ -29,19 +29,42 @@ def _results_from_state(state: dict) -> list[TaskExecutionResultResponse]:
     图状态里，而 API 响应与排查脚本都只看 `results[].data`，导致"模型为什么多调一个工具"
     在图外完全不可见——只能靠猜。这里把它随结果一并带出，保证**留痕可查**。
     仅在模型自主调度真的跑过时才附加，避免污染确定性路径的响应体。
+
+    **按层附加**（修复本轮引入的缺陷）：`model_tool_node` 现已按 `depends_on` 分层执行，
+    每层各有自己的决策序列。初版把**合并后**的轨迹附加到**每个** task 上，
+    导致两个 task 显示完全相同的决策（实测 C4 用例），排查时无法分辨"哪层做了什么"。
+    现依据 `data.layer` 只附加**该 task 所属层**的轨迹；找不到对应层时
+    退回附加整体轨迹（保持向后可见性，不静默丢失）。
     """
     rounds = state.get("model_tool_rounds") or []
     decisions = state.get("model_tool_decisions") or []
     stopped_reason = state.get("model_tool_stopped_reason") or ""
-    trace = (
+    layer_traces = state.get("model_tool_layer_traces") or []
+    by_layer = {int(t.get("layer", 0)): t for t in layer_traces if t.get("layer")}
+    fallback = (
         {"rounds": rounds, "decisions": decisions, "stopped_reason": stopped_reason}
         if (rounds or decisions or stopped_reason) else {}
     )
+
     out: list[TaskExecutionResultResponse] = []
     for item in (state.get("task_results") or []):
         data = dict(item.get("data") or {})
-        if trace and "model_tool_trace" not in data:
-            data["model_tool_trace"] = trace
+        if fallback and "model_tool_trace" not in data:
+            layer_no = data.get("layer")
+            layer_trace = by_layer.get(int(layer_no)) if layer_no is not None else None
+            if layer_trace is not None:
+                data["model_tool_trace"] = {
+                    "rounds": layer_trace.get("rounds") or [],
+                    # 只给本层的决策 —— 这是修复点
+                    "decisions": layer_trace.get("decisions") or [],
+                    "stopped_reason": layer_trace.get("stopped_reason") or "",
+                    "layer": layer_trace.get("layer"),
+                    "layer_intents": layer_trace.get("layer_intents") or [],
+                    # 同时保留全局停止原因，便于跨层对照而不必翻每个 task
+                    "all_stopped_reasons": stopped_reason,
+                }
+            else:
+                data["model_tool_trace"] = fallback
         out.append(TaskExecutionResultResponse(
             task_id=item.get("task_id", ""),
             intent=item.get("intent", ""),

@@ -381,11 +381,17 @@ class SupervisorGraph:
 
         merged_rounds: list[dict] = []
         merged_names: list[str] = []
-        merged_decisions: list[dict] = []
         merged_results: list[dict] = []
         stop_reasons: list[str] = []
+        # 每层的轨迹**按层保存**，不再合并成一个大列表。
+        # 为什么（修复本轮引入的缺陷）：
+        #   初版把各层 decisions 全部 extend 成一个扁平列表，而
+        #   `graph_agent_runner._results_from_state` 会把该轨迹附加到**每个 task** 的
+        #   data 上 —— 导致两个 task 显示出**完全相同**的模型决策序列，
+        #   排查时无法分辨"哪层做了什么"。实测 C4 用例即出现该现象。
+        layer_traces: list[dict] = []
 
-        for layer in self._task_layers(plan.tasks):
+        for layer_index, layer in enumerate(self._task_layers(plan.tasks), start=1):
             planned_intents = [t.intent for t in layer]
             # 把**之前各层**已产出的事实作为上下文（语义与文案与 pipeline
             # `CustomerTaskExecutor._dependency_context` 一致）。
@@ -407,11 +413,23 @@ class SupervisorGraph:
                                planned_intents, type(exc).__name__)
                 continue
 
-            merged_rounds.extend(r.__dict__ for r in outcome.rounds)
+            layer_prefix = f"L{layer_index}"
+            merged_rounds.extend(
+                {**r.__dict__, "layer": layer_index, "layer_intents": planned_intents}
+                for r in outcome.rounds)
             merged_names.extend(outcome.tool_names)
-            merged_decisions.extend(outcome.decisions)
-            merged_results.extend(outcome.results)
-            stop_reasons.append(outcome.stopped_reason)
+            merged_results.extend(self._tag_layer_results(
+                outcome.results, layer_index=layer_index, layer_prefix=layer_prefix,
+                layer_intents=planned_intents))
+            stop_reasons.append(f"{layer_prefix}:{outcome.stopped_reason}")
+            # 该层的决策序列单独保存，供 runner 只附加到**本层**的 task 上
+            layer_traces.append({
+                "layer": layer_index,
+                "layer_intents": planned_intents,
+                "decisions": list(outcome.decisions),
+                "rounds": [r.__dict__ for r in outcome.rounds],
+                "stopped_reason": outcome.stopped_reason,
+            })
             # 若本层未产出任何结果（如模型未调用），停止后续层——
             # 后续层依赖的正是这些事实，没有事实就无从"套规则"。
             if not outcome.results:
@@ -420,12 +438,42 @@ class SupervisorGraph:
         patch: dict[str, Any] = {
             "model_tool_rounds": merged_rounds,
             "model_tool_names": merged_names,
-            "model_tool_stopped_reason": ",".join(stop_reasons) or "no_tool_call",
-            "model_tool_decisions": merged_decisions,
+            # 分层原因用 `L1:xxx | L2:yyy` 保留**每层各自的**停止原因。
+            # 初版直接逗号拼接（如 'no_tool_call,budget_exhausted'），
+            # 无法分辨哪层是哪种原因，排查时反而误导。
+            "model_tool_stopped_reason": " | ".join(stop_reasons) or "no_tool_call",
+            "model_tool_decisions": [d for t in layer_traces for d in t["decisions"]],
+            # 按层保存的轨迹：供 runner 只把**本层**的决策附加到本层的 task 上，
+            # 避免"每个 task 都显示全部层的决策"（初版缺陷）。
+            "model_tool_layer_traces": layer_traces,
         }
         if merged_results:
             patch["task_results"] = merged_results
         return patch
+
+    @staticmethod
+    def _tag_layer_results(results: list[dict], *, layer_index: int,
+                           layer_prefix: str, layer_intents: list[str]) -> list[dict]:
+        """给某层的 task 结果打上**层标记**并保证 `task_id` 全局唯一。
+
+        为什么需要：每层是**独立的** `loop.run()`，而循环内部按轮次生成 task_id
+        （如 `model-tool-1`），导致不同层产生**同名 task_id**。实测 C4 用例输出中
+        两个 task 都叫 `model-tool-1`，无法区分也无法对齐到具体层。
+        故加层前缀（`L1-model-tool-1`），并在 data 里记录层号与本层意图，
+        使"哪层查了什么"可直接从响应读出。
+        """
+        tagged: list[dict] = []
+        for item in results:
+            row = dict(item)
+            raw_id = str(row.get("task_id") or "")
+            row["task_id"] = f"{layer_prefix}-{raw_id}" if raw_id else layer_prefix
+            row["data"] = {
+                **(row.get("data") or {}),
+                "layer": layer_index,
+                "layer_intents": list(layer_intents),
+            }
+            tagged.append(row)
+        return tagged
 
     @staticmethod
     def _facts_context(results: list[dict]) -> str:
