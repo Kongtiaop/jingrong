@@ -159,7 +159,27 @@ class CustomerIntentPlanner:
         ("policy", "风险揭示", "rag_explanation", .85),
         ("policy", "合规", "rag_explanation", .80),
         ("policy", "管理办法", "rag_explanation", .80),
-        ("policy", "规定", "rag_explanation", .70),
+        # "规定" **不能单独作为触发词**（ISSUE-20260914-POLICY-TRIGGER-OVERBROAD）：
+        # 实测"开户有什么规定"被它单独拉成 ['policy'] —— 而用户问的是**流程**，
+        # 因缺"流程"二字导致 workflow 未触发，policy 却接走了，属**误分类**
+        # （比"多一个 task"更糟：正确答案丢失）。
+        # 故改为**限定搭配**：与制度/合规/投资语境同现时才触发 policy。
+        ("policy", "监管规定", "rag_explanation", .85),
+        ("policy", "管理规定", "rag_explanation", .85),
+        ("policy", "法律法规", "rag_explanation", .85),
+        ("policy", "制度规定", "rag_explanation", .85),
+        # 收紧后实测仍有漏（"投资有什么规定"→unknown、"公司有什么规定"→ 无 policy），
+        # 故按"制度域名词 + 规定"补常见搭配（而非放开裸"规定"）。
+        ("policy", "投资规定", "rag_explanation", .80),
+        ("policy", "投资有什么规定", "rag_explanation", .82),
+        ("policy", "有什么规定", "rag_explanation", .72),
+        ("policy", "规定有哪些", "rag_explanation", .72),
+        # workflow：补齐"开户/办理"等**流程类**说法，避免被 policy 抢走后无人回答流程。
+        ("workflow", "开户", "rag_explanation", .80),
+        ("workflow", "办理", "rag_explanation", .70),
+        ("workflow", "申请", "rag_explanation", .65),
+        ("workflow", "需要什么材料", "rag_explanation", .80),
+        ("workflow", "需要哪些材料", "rag_explanation", .80),
         ("risk_public", "风险", "rag_explanation", .70),
     ]
 

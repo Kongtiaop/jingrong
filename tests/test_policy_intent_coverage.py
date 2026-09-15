@@ -74,3 +74,41 @@ def test_policy_terms_do_not_over_trigger_on_unrelated_queries():
         intents = [t.intent for t in planner.plan(query).tasks]
         assert "policy" not in intents, \
             f"{query!r} 不应命中 policy，实际 {intents}（触发词过宽）"
+
+
+# ---- ISSUE-20260914-POLICY-TRIGGER-OVERBROAD ----
+# "规定" 曾被单独用作触发词，导致"开户有什么规定"被判成 ['policy'] ——
+# 用户明明在问**流程**，却因缺"流程"二字使 workflow 未触发、policy 接走，
+# 属**误分类**（比"多一个 task"更糟：正确答案丢失）。
+# 修复：把手里的裸"规定"改为限定搭配，并补齐 workflow 的流程类说法
+# （开户/办理/申请/需要什么材料）。
+# 注意本表是**收集式**子串匹配，故"开户有什么规定"应**同时**命中 policy 与 workflow。
+
+@pytest.mark.parametrize("query", [
+    "开户有什么规定",
+    "开户需要什么材料",
+    "怎么办理开户",
+])
+def test_process_queries_still_reach_workflow(query):
+    """流程类问句必须命中 workflow —— 不能被 policy 抢走后无人回答流程。"""
+    intents = [t.intent for t in CustomerIntentPlanner().plan(query).tasks]
+    assert "workflow" in intents, \
+        f"{query!r} 应命中 workflow（流程类），实际 {intents}"
+
+
+def test_bare_regulation_word_does_not_hijack_process_intent():
+    """"XX有什么规定"这类**制度**问句仍应命中 policy（收紧不能过度）。"""
+    planner = CustomerIntentPlanner()
+    for query in ("监管规定有哪些", "投资有什么规定", "规定有哪些",
+                  "公司有什么规定", "适当性规定是什么"):
+        intents = [t.intent for t in planner.plan(query).tasks]
+        assert "policy" in intents, \
+            f"{query!r} 应命中 policy（制度类），实际 {intents}；" \
+            f"若失败说明'规定'被收得过紧，制度问题又答不到了"
+
+
+def test_business_operation_not_displaced_by_policy():
+    """交易类问句含"规定"时，business_operation 不得被 policy 挤掉。"""
+    intents = [t.intent for t in CustomerIntentPlanner().plan("赎回有什么规定").tasks]
+    assert "business_operation" in intents, \
+        f"赎回类问句应保留 business_operation，实际 {intents}"
