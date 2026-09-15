@@ -26,6 +26,40 @@ def _level(value: str | None) -> int:
     return LEVEL.get(normalized, RISK.get(normalized, 1))
 
 
+# ---- 风险等级比对的**唯一权威实现**（收敛点）----
+# ISSUE-20260914-RISK-RANK-RULES-DIVERGED
+#
+# 此前同一套"等级排名 + 比较"在 4 处各写一遍，且**默认值已经不一致**：
+#   suitability_service.py:20  LEVEL / _level()，缺失默认 1
+#   trading_service.py:100-101 内联 dict，缺失默认 1（下单硬门禁）
+#   api/admin.py:135-136       内联 dict，**缺失默认 0** 并据此统计 missing_risk
+#   api/profile.py:740         内联 risk_order（展示排序用）
+# 风险：将来（如回答侧也要做"你能买什么"的推导）再写一份，就会出现
+#       "回答说能买、下单被拒"这类口径不一致。
+# 故把排名与比较集中到本模块，其余位置改为引用，保证只有一处定义。
+
+def risk_rank(value: str | None) -> int:
+    """等级归一化为 1–5。
+
+    兼容 C1–C5（客户等级）与 R1–R5（通用风险等级表述）：两者同域，均映射为 1–5。
+    未知/缺失返回 **0**（区别于 _level 的历史默认 1）——调用方据此可区分
+    "缺失"与"最低等级"，这是 admin 统计 missing_risk 与门禁拒绝所需要的语义。
+    """
+    normalized = str(value or "").upper().strip()
+    return LEVEL.get(normalized, RISK.get(normalized, 0))
+
+
+def is_suitable(customer_level: str | None, product_level: str | None) -> bool:
+    """客户等级是否满足产品要求：**同级或更高**即可（actual >= required）。
+
+    这是全系统唯一的适当性判定口径（与 trading_service 的下单门禁一致：
+    产品要求 C3 时，C3/C4/C5 客户可买，C1/C2 不可）。
+    """
+    actual = risk_rank(customer_level)
+    required = risk_rank(product_level) or 1   # 产品等级缺失时按最低要求处理
+    return actual >= required
+
+
 class SuitabilityService:
     def __init__(self, risk_repository=None, product_repository=None, profile_repository=None, asset_service=None):
         self.risk_repository = risk_repository or SqlAlchemyRiskRepository()

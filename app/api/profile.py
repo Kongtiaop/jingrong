@@ -15,7 +15,7 @@ from app.models.auth import User
 from app.models.profile import CustomerAssetSnapshot, CustomerEnterpriseVerification, CustomerHolding, CustomerProfile, CustomerRiskAssessment, Product
 from app.models.audit import AuditLog
 from app.schemas.profile import *
-from app.services.suitability_service import SuitabilityService
+from app.services.suitability_service import SuitabilityService, risk_rank
 from app.services.customer_tier_service import CustomerTierService, calculate_customer_tier
 from app.services.risk_assessment_service import RiskAssessmentService
 from app.services.asset_summary_service import AssetSummaryService
@@ -737,8 +737,15 @@ async def _create_advisor_operation_draft(session, uow, *, customer_id: str, adv
     ))).scalar_one()
     if float(daily_total) + amount > authorization.max_daily_amount:
         raise HTTPException(status_code=409, detail={"code": "AUTHORIZATION_DAILY_LIMIT_EXCEEDED", "message": "daily operation amount exceeds authorization limit"})
-    risk_order = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}
-    if risk_order.get(product.risk_level, 99) > risk_order.get(authorization.risk_level_ceiling, 0):
+    # 等级比对统一走 suitability_service.risk_rank
+    # （ISSUE-20260914-RISK-RANK-RULES-DIVERGED：此处原为内联 risk_order）。
+    # **注意语义与别处不同，转换时须保留**：
+    #   产品等级缺失 → 原为 99（**fail-closed**，宁可拒绝）；
+    #   上限等级缺失 → 原为 0（**fail-closed**，任何产品都超限）。
+    # 故此处不能用 `risk_rank(p) or 1`（那会变成 fail-open，放行未知产品）。
+    _product_rank = risk_rank(product.risk_level) or 99
+    _ceiling_rank = risk_rank(authorization.risk_level_ceiling)
+    if _product_rank > _ceiling_rank:
         raise HTTPException(status_code=403, detail={"code": "AUTHORIZATION_RISK_LIMIT_EXCEEDED", "message": "product risk exceeds authorization ceiling"})
     suitability = await SuitabilityService(
         risk_repository=uow.risks, product_repository=uow.products, profile_repository=uow.profiles,

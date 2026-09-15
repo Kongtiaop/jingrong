@@ -10,6 +10,8 @@ from app.common.security.auth import current_user, require_permission
 from app.models.audit import AuditLog
 from app.services.permission_scoped_cache import bump_permission_context_version
 from app.services.advisor_authorization_service import AdvisorAuthorizationService
+# 等级比对口径的**唯一权威实现**（ISSUE-20260914-RISK-RANK-RULES-DIVERGED）
+from app.services.suitability_service import risk_rank
 from app.models.auth import CustomerAdvisorAuthorization, Permission, Role, User
 from app.models.operations import BusinessOperation
 from app.models.outbox import OutboxEvent
@@ -125,15 +127,17 @@ async def risk_workbench_dashboard(request: Request, user: Annotated[User, Depen
         risk_rows = (await session.execute(select(CustomerRiskAssessment.risk_level, func.count()).where(CustomerRiskAssessment.status == "active").group_by(CustomerRiskAssessment.risk_level))).all()
         risk_map = {str(level): int(total) for level, total in risk_rows}
         risk_distribution = [{"level": level, "count": risk_map.get(level, 0)} for level in ["C1", "C2", "C3", "C4", "C5"]]
-        level_rank = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}
+        # 等级比对统一走 suitability_service.risk_rank
+        # （ISSUE-20260914-RISK-RANK-RULES-DIVERGED：此处原为内联 dict 且**缺失默认 0**，
+        #  与 trading_service 的内联版本（默认 1）口径不一致）
         pending_rows = (await session.execute(select(Order, Product, Account, CustomerRiskAssessment).join(Product, Product.id == Order.product_id).join(Account, Account.id == Order.account_id).outerjoin(CustomerRiskAssessment, (CustomerRiskAssessment.user_id == Order.user_id) & (CustomerRiskAssessment.status == "active")).where(Order.status == "pending_review"))).all()
         suitability = {"suitable": 0, "mismatch": 0, "restricted": 0, "missing_risk": 0}
         for order, product, account, assessment in pending_rows:
             if account.risk_restriction_status == "restricted":
                 suitability["restricted"] += 1
                 continue
-            actual = level_rank.get(str(assessment.risk_level).upper().replace("R", "C"), 0) if assessment else 0
-            required = level_rank.get(str(product.risk_level).upper().replace("R", "C"), 1)
+            actual = risk_rank(assessment.risk_level) if assessment else 0
+            required = risk_rank(product.risk_level) or 1
             if actual == 0:
                 suitability["missing_risk"] += 1
             elif actual < required:

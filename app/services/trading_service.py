@@ -11,6 +11,8 @@ from app.services.asset_summary_service import AssetSummaryService
 from app.repositories.trading import SqlAlchemyTradingUnitOfWork
 from app.repositories.unit_of_work import create_configured_unit_of_work
 from app.services.risk_alert_service import RiskAlertService
+# 适当性比对口径的**唯一权威实现**（ISSUE-20260914-RISK-RANK-RULES-DIVERGED）
+from app.services.suitability_service import is_suitable
 
 class TradingError(ValueError):
     pass
@@ -97,9 +99,11 @@ class TradingService:
         target_type = getattr(product, "target_customer_type", "individual")
         if target_type != "all" and (profile is None or profile.customer_type != target_type):
             raise TradingError(f"product is only available to {target_type} customers")
-        required = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}.get(str(product.risk_level).upper().replace("R", "C"), 1)
-        actual = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}.get(risk.risk_level, 1)
-        if actual < required: raise TradingError(f"risk level {risk.risk_level} is not suitable for product {product.risk_level}; complete a formal risk assessment to unlock higher-risk products")
+        # 适当性硬门禁：口径统一走 suitability_service.is_suitable
+        # （ISSUE-20260914-RISK-RANK-RULES-DIVERGED：此处原为内联 dict，
+        #  与 admin/profile 各写一份且默认值不一致，故收敛为单一实现）
+        if not is_suitable(risk.risk_level, product.risk_level):
+            raise TradingError(f"risk level {risk.risk_level} is not suitable for product {product.risk_level}; complete a formal risk assessment to unlock higher-risk products")
         account.available_balance -= order.amount; account.frozen_balance += order.amount
         await self.transition(session, order, "pending_review", user.id, "customer confirmed order")
         return order
