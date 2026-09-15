@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from sqlalchemy import select
 
-from app.models.profile import CustomerAssetSnapshot, CustomerHolding, Product
+from app.models.profile import CustomerAssetSnapshot, CustomerHolding, CustomerRiskAssessment, Product
 from app.models.trading import Account, Order, RiskAlert
 from app.models.workorder import WorkOrder
 
@@ -132,35 +132,70 @@ class CustomerQueryRouter:
         )
 
     async def _risk_restriction(self, *, session, customer_id: str) -> CustomerQueryRouteResult:
+        """账户风控状态 + 客户风险等级。
+
+        **为什么必须补上风险等级（ISSUE-20260914-RISK-LEVEL-NOT-READ）**：
+        用户问"我有没有风险限制"，真正想知道的是"**我能买什么**"。
+        而这需要两个数据：① 账户是否被风控冻结 ② **客户风险等级（C1–C5）**。
+        此前本方法**只读 ①**（`account.risk_restriction_status`，二进制 none/restricted），
+        完全没读 ②（`customer_risk_assessment.risk_level`）。
+        后果：下游 `risk_public`（制度说明）拿不到等级，却要回答"我有没有限制"，
+        于是只能**编造**——实测输出"是的，您有风险限制"，而账户实际是"未显示限制"
+        （见 ISSUE-20260914-STATUS-MACHINE-LACKS-CONSISTENCY-DIMENSION）。
+        故等级必须在此读出并进入答案，才能让后续比对（等级 <= 产品等级）成立。
+        """
         account = (await session.execute(select(Account).where(Account.user_id == customer_id))).scalar_one_or_none()
         alert = (await session.execute(
             select(RiskAlert)
             .where(RiskAlert.customer_id == customer_id, RiskAlert.status.in_(["open", "acknowledged", "investigating", "report_pending"]))
             .order_by(RiskAlert.created_at.desc()).limit(1)
         )).scalars().first()
+        # 客户风险等级：取最近一条有效测评（active / provisional）。
+        # provisional 表示"临时/未完成正式测评"，仍需告知用户，但标注其状态，
+        # 避免把未定级当作确定结论。
+        assessment = (await session.execute(
+            select(CustomerRiskAssessment)
+            .where(CustomerRiskAssessment.user_id == customer_id,
+                   CustomerRiskAssessment.status.in_(["active", "provisional"]))
+            .order_by(CustomerRiskAssessment.assessed_at.desc()).limit(1)
+        )).scalars().first()
+        risk_level = assessment.risk_level if assessment else None
+        assessment_status = assessment.status if assessment else "missing"
         restricted = account is not None and account.risk_restriction_status == "restricted"
         data = {
             "account_status": account.status if account else "not_found",
             "restriction_status": account.risk_restriction_status if account else "none",
             "restriction_reason": account.risk_restriction_reason if account else "",
             "restricted_until": account.risk_restricted_until.isoformat() if account and account.risk_restricted_until else None,
+            # 风险等级（新增）：供"可买范围"比对使用
+            "risk_level": risk_level,
+            "assessment_status": assessment_status,
+            "assessed_at": assessment.assessed_at.isoformat() if assessment and assessment.assessed_at else None,
             "latest_alert": None if alert is None else {"id": alert.id, "rule_code": alert.rule_code, "status": alert.status, "level": alert.alert_level},
         }
+        # 等级描述：缺失/临时的措辞必须与"已定级"区分开，避免误导。
+        if risk_level and assessment_status == "active":
+            level_text = f"您的风险承受能力等级为 **{risk_level}**。"
+        elif risk_level:
+            level_text = (f"您当前的风险承受能力等级为 **{risk_level}**"
+                          f"（状态：{assessment_status}，尚未完成正式风险测评，结果可能调整）。")
+        else:
+            level_text = "系统尚未查询到您的风险测评结果，建议先完成风险评估问卷。"
         if restricted:
             return CustomerQueryRouteResult(
                 source_type="business_fact", route="risk_restriction", evidence_status="sufficient",
-                answer="您的账户当前存在风险限制，请以系统展示的限制原因和处理要求为准。",
+                answer=f"您的账户当前存在风险限制，请以系统展示的限制原因和处理要求为准。{level_text}",
                 data=data, next_action="如需解除限制，请按风险处理要求补充材料或联系人工客服。",
             )
         if alert:
             return CustomerQueryRouteResult(
                 source_type="business_fact", route="risk_restriction", evidence_status="sufficient",
-                answer="您的账户当前未显示风险限制，但存在一条待处理风险记录。",
+                answer=f"您的账户当前未显示风险限制，但存在一条待处理风险记录。{level_text}",
                 data=data, next_action="请关注风险处理进度；如需说明，可继续咨询具体规则或联系人工客服。",
             )
         return CustomerQueryRouteResult(
             source_type="business_fact", route="risk_restriction", evidence_status="sufficient",
-            answer="您的账户当前未显示风险限制。",
+            answer=f"您的账户当前未显示风险限制。{level_text}",
             data=data, next_action="如系统状态变化，请以最新账户与风险记录为准。",
         )
 

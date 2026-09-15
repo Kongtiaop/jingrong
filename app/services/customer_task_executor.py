@@ -179,12 +179,52 @@ class CustomerTaskExecutor:
             results.update({item.task_id: item for item in batch_results})
         return [results[item.task_id] for item in plan.tasks]
 
+    @staticmethod
+    def _dependency_context(item: IntentTask,
+                            results: dict[str, TaskExecutionResult]) -> str:
+        """把 `depends_on` 指向的前序 task 结果拼成"上下文块"，供后序 task 使用。
+
+        **为什么需要（ISSUE-20260914-NO-TASK-ANSWER-PASSING）**：
+        此前 `depends_on` 只用于**执行顺序门控**（`ready = all(dep in results ...)`），
+        最多在 workflow/faq/policy 分支读一下依赖的 `intent` 用来选工具名，
+        **从不把前序 task 的答案传下去**。于是"后一个 task 依赖前一个 task 的结论"这件事
+        在系统里做不了——例如"用客户风险等级（事实）套制度规则（知识）"，
+        制度 task 拿不到等级，只能空谈规则甚至编造结论
+        （见 ISSUE-20260914-STATUS-MACHINE-LACKS-CONSISTENCY-DIMENSION）。
+
+        **与既有硬编码写法的区别**：`business_operation` 分支是"遍历 results 按 intent 找
+        product_recommendation"，属于**隐式耦合**（不依赖 depends_on 声明）。
+        本方法改走**显式声明**：只有规划器在 `depends_on` 里声明了依赖，才会注入。
+        这样"谁能看到谁的结论"由图结构决定，而不是散落在各分支里的硬编码。
+
+        返回空串表示无依赖或无可用结果（调用方应原样使用 item.query）。
+        """
+        if not item.depends_on:
+            return ""
+        blocks: list[str] = []
+        for dep_id in item.depends_on:
+            dep = results.get(dep_id)
+            if dep is None or not dep.answer:
+                continue
+            blocks.append(f"[{dep.intent}] {dep.answer}")
+        if not blocks:
+            return ""
+        return ("\n\n【前序查询结果（请基于这些事实作答，不要臆造）】\n"
+                + "\n".join(blocks))
+
     async def _execute_one(self, *, customer_id: str, item: IntentTask, results: dict[str, TaskExecutionResult]) -> TaskExecutionResult:
         if item.intent == "greeting":
             return TaskExecutionResult(item.task_id, item.intent, "succeeded", answer="您好，我可以协助查询业务事实、客服知识和人工服务。")
         if item.intent == "human_handoff":
             return TaskExecutionResult(item.task_id, item.intent, "needs_clarification", answer="可以为您转接人工客服。", clarification="是否现在转接人工客服？")
         if item.intent in self.REACT_INTENTS:
+            # 把前序事实作为上下文传给知识/制度类 task。
+            # 这是"用事实套规则"得以成立的前提：制度 task 必须拿到客户真实等级，
+            # 否则它只能空谈规则（实测会编出"是的，您有风险限制"这种错误断言）。
+            dep_context = self._dependency_context(item, results)
+            if dep_context:
+                from dataclasses import replace as _replace
+                item = _replace(item, query=f"{item.query}{dep_context}")
             return await self._bounded_react_knowledge(customer_id=customer_id, item=item)
         if item.intent == "business_operation":
             is_purchase = any(marker in item.query for marker in ("申购", "购买", "买入", "下单"))

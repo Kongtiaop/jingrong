@@ -176,6 +176,16 @@ class CustomerIntentPlanner:
                     depends=[next(t.task_id for t in tasks if t.intent in {"order_status","workorder_status"})]
                 if intent == "business_operation" and any(t.intent == "product_recommendation" for t in tasks):
                     depends=[next(t.task_id for t in tasks if t.intent == "product_recommendation")]
+                # 制度说明依赖风险事实（ISSUE-20260914-NO-TASK-ANSWER-PASSING）：
+                # 用户问"我有没有风险限制"时，答案是"**你是什么等级 → 能买什么**"，
+                # 这必须先用事实（客户风险等级，查库）再去套制度规则。
+                # 若 risk_public 不依赖 risk_restriction，它就拿不到等级，
+                # 只能空谈制度、甚至编出"是的，您有风险限制"这类与事实矛盾的事实断言
+                # （实测：账户状态实为"未显示限制"，见 STATUS-MACHINE-LACKS-CONSISTENCY-DIMENSION）。
+                # 注意：这里靠 patterns 的**先后顺序**保证 risk_restriction 已先入 tasks
+                # （risk_restriction 在 _patterns 中早于 risk_public 出现）。
+                if intent == "risk_public" and any(t.intent == "risk_restriction" for t in tasks):
+                    depends=[next(t.task_id for t in tasks if t.intent == "risk_restriction")]
                 task_query = query
                 if intent == "product_recommendation" and any(marker in normalized for marker in ("申购", "购买", "买入", "下单")):
                     task_query = re.split(r"(?:并且|同时|然后|并|再|后)", query, maxsplit=1)[0]
