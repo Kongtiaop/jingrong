@@ -2505,6 +2505,46 @@ reloptions: ['key_field=id']
   "仅写入路径不可用"区分开，再决定用 REINDEX 还是重建。
   另外：两次推断都是"听起来合理"的解释，但都被一个**具体探测**推翻——
   在基础设施问题上，可执行的探测比推理更可靠。
+**★ 最终根因（临时表对照实验证明，非推断）**：
+```
+A bm25 (id, content) WITH (key_field='id')   建索引OK 写入OK   <== 唯一可行形态
+B bm25 (content)    WITH (key_field='id')   建索引OK 写入FAIL <== 库里现有形态（故障源）
+C bm25 (id, content) 无 WITH                建索引FAIL
+D bm25 (content)    无 WITH                 建索引FAIL
+```
+**`key_field` 指名的列必须出现在字段列表中**（`bm25 (id, content)`），
+只写在 `WITH` 里不够（`bm25 (content) WITH (key_field='id')`）。
+后者能建索引、能查询（`@@@` 走读路径），但**任何 INSERT 都报 `No key field defined`** ——
+这正是"读写不对称"的来源。
+**修复**：`scripts/rebuild_bm25_index.py` 按 A 形态重建。
+过程中发现 ParadeDB 限制**一张表只能有一个 bm25 索引**
+（`a relation may only have one ParadeDB index`），
+故"先建新索引再切换"在架构上不可能，替换只能 DROP 后 CREATE；
+最终实现为**单事务 DROP+CREATE+写入探测**，失败整体回滚、旧索引自动恢复。
+另把该索引纳入 `migrations/versions/0025_knowledge_bm25_key_field.py` 版本管理。
+
+**修复后实测（容器内，导入客户语料后）**：
+```
+语料现状: company_info 49 chunks / company_business 40 / policy 24 / faq 21   全部 pl=public
+intent            query                命中  best     判定
+company_info      你们公司叫什么名字        5   0.6246  sufficient
+company_info      客服电话是多少          5   0.6416  sufficient
+company_business  你们公司的主营业务是什么    5   0.6366  sufficient   <== 修复前 0 命中
+company_business  公司提供哪些服务         5   0.5901  sufficient
+faq               怎么联系你们           5   0.7067  sufficient
+faq               基金申购后多久确认        5   0.6350  sufficient
+```
+`company_business` 从"0 命中、必然转人工"变为 `sufficient`，
+即最初 `你们公司的主营业务是什么` 答案重复/无依据的**语料结构根因已消除**。
+
+**自己引入的一个 bug（一并记录）**：`probe_insert` 原实现无论成败都调用
+`session.rollback()`；而重建场景下 DDL 与探测在同一事务，该 rollback 会把刚执行的
+DROP+CREATE **一起撤销**，脚本却报告"写入探测成功" —— **假成功**。
+改为 `use_savepoint=True`（SAVEPOINT 只回滚探测本身），并用 sqlite 事务对照实验验证：
+外层 DDL 保留、探测行未落库；同时验证无脑 rollback 确实会撤销外层 DDL（反例成立）。
+**教训**：诊断/修复脚本自身的正确性也要验证，尤其涉及事务边界时——
+"看起来修好了"与"真的修好了"在事务语义下可以差很远。
+
 **附带发现**：`scripts/enable_pg_search_bm25.sql` 的建索引语句**整体被注释**，
 仓库内 migrations 与 docker/postgres/init 都没有创建 BM25 索引；
 即该索引是**手工创建**的、未纳入版本管理 —— 这也是它与扩展版本脱节、
