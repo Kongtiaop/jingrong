@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 217 条真 bug 修复记录。
+- 共 218 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2396,3 +2396,69 @@ faq              怎么联系你们           {'company_info':5}    0/5    0.563
 （权限/状态/类目值），再重新评估"意图与类目的映射关系是否需要重新设计"。
 **方法论**：这是"**先量化再决策**"生效的一次——若直接按最初设想去改，
 会引入 40% 的答不出率，而且要等到线上才发现。
+
+### ISSUE-20260914-CATEGORY-PERMISSION-CORPUS-MISMATCH
+- 日期：2026-09-14
+- 分类：RAG / 知识库治理（**根因条目**）
+- 严重程度：P0
+**背景**：承接 `INTENT-CATEGORY-FILTER-NEVER-APPLIED`（intent 从不传 category）与
+`CATEGORY-NARROWING-UNVIABLE`（按类目收窄会让 40% 用例检索为空）。
+`scripts/check_scope_corpus_alignment.py` 的容器实测终于给出三方对账结果：
+```
+scope 声明类目 = company_info, company_business, faq, policy, risk_public, workflow
+scope 允许权限 = public, customer_visible
+
+语料实际（类目 / 权限 / chunk 数）:
+  company_business   pl=staff    39
+  company_info       pl=public   28
+  policy             pl=public   24
+  faq                pl=public    2
+  business           pl=public    0   <- 类目名与意图名不符（'business' vs 'company_business'）
+  workflow           （不存在）        <- scope 声明了但没有
+  risk_public        （不存在）        <- scope 声明了但没有
+```
+**根因：三套命名/取值互不匹配，各自独立出错**
+1. **权限不匹配（P0 主因）**：`company_business` 的 39 个 chunk 权限是 **`staff`**，
+   而 `public_customer()` 只允许 `public` / `customer_visible` → **被权限过滤，不是被类目过滤**。
+   用 `KnowledgeScope.allows()` 逐条验证：
+```
+category          permission  客户可见  顾问可见  语料
+company_business  staff       False     False    39   <- 两种 scope 都取不到
+company_info      public      True      False    28
+policy            public      True      True     24
+faq               public      True      False     2
+business          public      False     False     0
+```
+   `staff` **不在任何一种 scope 的 permission_levels 里**
+   （`public_customer` 允许 public/customer_visible；`internal_advisor` 允许 public/internal/advisor）。
+   → 这 39 个 chunk 是**孤儿内容**：**没有任何 scope 能检索到它们**。
+2. **类目名不匹配**：语料里存在类目 `business`（0 chunk），而代码/scope/意图用的是 `company_business`。
+   两个名字并存，说明导入时类目值是**手填**的，未与代码枚举对齐。
+3. **scope 声明了不存在的类目**：`workflow`、`risk_public` 被 `public_customer()` 声明允许，
+   但语料中**完全没有**这两类文档。映射到它们的意图在收窄方案下必然检索为空。
+**内容语义佐证（样例）**：
+- `company_business` 的样例是"**XX科技有限公司 高净值客户服务规范**…本规范为**内部服务标准文件**"
+  → 它本就是**内部/员工**材料，权限标为 `staff` 是**正确的**。错的是**意图把它当成客户可见的公司业务资料**。
+- `faq` 的样例是 `# Upload contract`（**上传契约测试文档**）
+  → 这 2 条是**测试残留**，不是真实 FAQ。故"客服电话/怎么联系"在 faq 里查到的是无关内容、
+  相似度暴跌（0.4927→0.1547）——**根因是 faq 类目下装的是测试数据**。
+**修正此前的判断**：
+- 曾判定"意图识别对了，只是映射到资料有问题"——**方向对，但精确说法应为**：
+  意图**识别**正确；**映射链条（意图→类目→权限→语料）三处取值不一致**，
+  且其中"公司业务"这一类客户侧**根本没有对应语料**。
+- 曾判定"多知识意图拆分无信息增量"——**错误**（已撤回）。真实情况是
+  `company_info` 与"本应回答业务问题的语料"之间没有可用映射，
+  导致两个意图都退回到同一批 company_info 文档。
+**因此"让 category 生效"与"补语料"都不是正确修法**：
+- 让 category 生效 → `company_business` 因权限仍取不到（收窄后为空，已实测 4/10 空）；
+- 只补语料 → 若新文档权限仍标 `staff`、类目仍手填 `business`，一样取不到。
+**正确修法的方向（待产品确认，本轮未改代码）**：
+1. 明确"公司业务"这类问题**应由哪些客户可见文档回答**；若无，则**导入客户版本文档**
+   并统一类目名为 `company_business`、权限为 `public`；
+2. 清理 `faq` 下的测试文档（`Upload contract`），或修正其类目；
+3. 让 `public_customer()` 声明的类目与**语料实际存在的类目**对齐（去掉 workflow/risk_public，
+   或补上对应文档）；
+4. 权限取值需要**枚举化校验**（`staff` 这种既有值不在任何 scope 中，应在导入时即报错）。
+**方法论**：本次是"**逐层对账**"的胜利——从"类目没生效"→"收窄不可行"→"权限不匹配"→
+"孤儿内容 + 测试残留"，每一步都用真实数据推进，没有停在第一个看似合理的解释上。
+若在第一层就动手改 `category` 传参，会引入 40% 答不出率并掩盖真正的权限问题。
