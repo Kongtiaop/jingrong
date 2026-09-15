@@ -52,3 +52,6 @@ frontend/frontend/
 # Local DB volume backups (large; never sync)
 /pgdata_*.tar.gz
 /wealth_pgdata_*.tar.gz
+
+# 临时脚本/提交信息文件（不入库）
+.tmp_*
