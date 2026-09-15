@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 216 条真 bug 修复记录。
+- 共 217 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2346,3 +2346,53 @@ best_sim: min=0.5045 max=0.5046 极差=0.0001
 - 但**教训仍在**：上一轮基于单样本判定"拆 task 无增量"确实错了；
   正确的纠正方式是**多次采样**（本脚本），而不是换成另一个单样本。
 - 结论：集合指标的稳定性**必须实测**，既不能假定它稳定，也不能假定它抖动。
+
+### ISSUE-20260914-CATEGORY-NARROWING-UNVIABLE
+- 日期：2026-09-14
+- 分类：RAG / 检索策略
+- 严重程度：P1（**方案被数据否决**：按类目过滤会让 40% 用例直接答不出）
+**背景**：`ISSUE-20260914-INTENT-CATEGORY-FILTER-NEVER-APPLIED` 发现 intent 到类目的收敛未生效
+（`CustomerRagService` 从不传 `category`），当时设想的修法是"让类目生效（过滤）"。
+**批量探针结果**（`scripts/probe_intent_category_convergence.py`，5 个意图 10 条用例，容器实测）：
+```
+intent           query              现状类目分布           自身命中  best    收窄后类目        best2
+company_info     你们公司叫什么名字      {'company_info':5}    5/5    0.5631  {'company_info':5} 0.5631
+company_info     公司客户规模有多大      {'company_info':5}    5/5    0.5750  {'company_info':5} 0.5750
+company_business 你们公司的主营业务是什么 {'company_info':5}    0/5    0.5045  {}                 -
+company_business 公司提供哪些服务       {'company_info':5}    0/5    0.5227  {}                 -
+policy           什么是双录            {'policy':3,'company_info':2} 3/5 0.6247 {'policy':5}   0.6247
+policy           风险等级怎么划分        {'policy':5}         5/5    0.7183  {'policy':5}      0.7183
+workflow         开户流程是怎样的        {'company_info':3,'policy':2} 0/5 0.4192 {}              -
+workflow         怎么修改绑定银行卡      {'company_info':3,'policy':2} 0/5 0.3582 {}              -
+faq              客服电话是多少         {'company_info':5}    0/5    0.4927  {'faq':2}       0.1547
+faq              怎么联系你们           {'company_info':5}    0/5    0.5638  {'faq':2}       0.2485
+
+汇总：
+  company_business 现状自身命中 0/10 (0%)    收窄后有命中 0/2   语料 39 chunks
+  company_info     现状自身命中 10/10 (100%) 收窄后有命中 2/2   语料 28 chunks
+  faq              现状自身命中 0/10 (0%)    收窄后有命中 2/2   语料  2 chunks
+  policy           现状自身命中 8/10 (80%)   收窄后有命中 2/2   语料 24 chunks
+  workflow         现状自身命中 0/10 (0%)    收窄后有命中 0/2   语料  0 chunks
+现状检索空 0/10  ->  收窄后检索空 **4/10**
+```
+**结论一：按类目"过滤"不可行**。收窄后 40% 用例检索为空（答不出），比现状更差。
+**结论二：`workflow` 类目语料为 0**。`KnowledgeScope.public_customer()` 声明允许
+6 个类目（company_info / company_business / faq / workflow / policy / risk_public），
+但语料中**只有 4 类**（company_business 39 / company_info 28 / policy 24 / faq 2）。
+即 scope **声明了语料中不存在的类目** —— 任何映射到 workflow / risk_public 的意图，
+在收窄方案下必然为空。这是"配置声明与数据脱节"，属独立问题。
+**结论三：`faq` 收窄后相似度暴跌（0.49→0.15、0.56→0.25）**。
+说明"客服电话/怎么联系"这类问题，**真正相关的证据在 company_info 里，不在 faq 里**。
+即：**类目划分与用户问题语义并不对应**——`faq` 类目下那 2 个 chunk 与这些问题无关。
+**结论四：`company_business` 有 39 chunks 却收窄后为空**，值得单独查。
+若类目过滤真生效，39 个候选不可能全落空。可能原因（待 `check_scope_corpus_alignment.py` 确认）：
+其文档的 `permission_level` 不在 scope 允许的 (public, customer_visible) 内，
+或文档/版本 status 非 active —— 即这批内容**对客户侧本来就不可见**。
+**重要修正**：此前我把"答案重复、两个 intent 命中同一批 chunk"归因于
+"类目没生效导致不分区"。现在看**更根本的原因是类目划分本身与语义不对应**：
+即便让类目生效，`company_business` 会查空、`faq` 会查到不相关内容。
+**因此"让 category 生效"不是修复，而是引入新故障。**
+**未改动**：本轮不改检索行为。下一步应先查清 `company_business` 39 chunks 为何不可见
+（权限/状态/类目值），再重新评估"意图与类目的映射关系是否需要重新设计"。
+**方法论**：这是"**先量化再决策**"生效的一次——若直接按最初设想去改，
+会引入 40% 的答不出率，而且要等到线上才发现。
