@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 225 条真 bug 修复记录。
+- 共 226 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2735,3 +2735,52 @@ unknown          "客服电话是多少""开户需要什么材料""什么是基�
 **教训**：**意图从不触发，比意图映射错误更隐蔽** ——
 映射错会表现为答非所问（有输出、可发现），从不触发则表现为"走到别的意图"或"unknown"，
 看上去像识别能力不足，实则是规则覆盖缺口。
+
+### ISSUE-20260914-STATUS-MACHINE-LACKS-CONSISTENCY-DIMENSION
+- 日期：2026-09-14
+- 分类：状态机 / 答案质量 / 架构
+- 严重程度：P1（**已知矛盾无法被现有任何状态表达**）
+**现象**：`我有没有风险限制` 的答案自相矛盾：
+```
+您的账户当前未显示风险限制，但存在一条待处理风险记录。
+✅ 是的，您有风险限制。
+```
+前半句来自 `get_my_risk_restriction`（**事实**：账户未显示限制），
+后半句来自 `search_customer_knowledge`（**制度**：C1–C5 会形成限制）。
+两句各自都对，拼在一起就成了矛盾。而 `overall_status` 报 **`completed`**。
+**根因（维度缺失，非判定错误）**：
+`CustomerTaskExecutor.summarize()` 的输入只有每个 task 的 `status` 字段：
+```
+succeeded / partially_answered / needs_clarification / failed / blocked
+关键分支：if succeeded == len(results): status = "completed"
+```
+两个 task **确实各自都成功了**（查到了事实、也查到了制度），
+故必然判为 `completed`。实测复现：
+```
+results = [TaskExecutionResult(intent="risk_restriction", status="succeeded", answer="您的账户当前未显示风险限制"),
+           TaskExecutionResult(intent="risk_public",      status="succeeded", answer="是的，您有风险限制")]
+CustomerTaskExecutor.summarize(results) -> status="completed"
+aggregate answer = '您的账户当前未显示风险限制\n是的，您有风险限制'
+```
+**所以不是"状态机判错了"，而是"它根本没有在看这件事"**：
+现有维度是 **[完成度]**，缺少 **[一致性]**。
+矛盾发生在**把多个 task 的答案拼成一段时**，而拼接结果不进入任何判定。
+**与既有条目的关系**：
+- `ISSUE-20260914-NO-PARTIAL-STATE` 补的是"答了但没答全"（`partially_answered`）——仍是**完成度**维度；
+- `ISSUE-20260914-COMPLETED-STATUS-MASKED-BY-DROPPED-TASK` 补的是 task 丢失——也是**完成度**；
+- 本条是**第三个正交维度**：完成度满分、但内容自相矛盾。
+三者叠加说明：单靠 `overall_status` 一个字段，**无法同时表达完成度与自洽性**。
+**为什么这次不能靠"再加一个状态值"解决**（关键判断）：
+`partially_answered` 之所以可行，是因为"答案自述资料不足"可由**生成文本自证**
+（grep 固定标记即可判定）。而"自相矛盾"需要**跨 task 的语义比对**——
+没有廉价、确定的判据。若用 LLM 判定，则引入与我们一直在规避的同类问题
+（judge 误判、不可复现、成本）。**故不应草率新增状态值。**
+**待决方向（未实现，需产品与架构共同确认）**：
+1. **降权**：多 task 拼接时，若两类证据**语义角色不同**（事实 vs 制度），
+   不并排陈述，而是结构化分节（"您的账户现状" / "制度说明"），从**生成层**消除矛盾；
+2. **标注来源**：回答中显式标注每条结论的依据类型，让用户能分辨"你的账户"与"制度规定"；
+3. **不新增状态**：`overall_status` 保持表达完成度，一致性作为**离线评测指标**
+   （如定期抽检多 task 答案的自洽性），而不是塞进在线状态机。
+**教训**：**一个字段承担不了两个正交维度。**
+每当"状态看起来是对的、但答案明显不对"时，要先问"状态机有没有在看这件事"，
+而不是急着加一个状态值——加值只能覆盖**它能测量的**那一类问题。

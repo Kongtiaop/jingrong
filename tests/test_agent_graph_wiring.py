@@ -173,15 +173,28 @@ def test_readonly_query_intents_allowed_in_model_tool(query):
 
 
 def test_unknown_intent_does_not_enter_model_tool():
-    """"什么是双录" 规划为 unknown（规则未识别），不应进模型工具轮。
+    """规则未识别的（unknown）意图不应进模型工具轮，应交回确定性路径。
 
-    实测该 query 管线与图均为 needs_clarification（对照 OK），
-    门禁把它交回确定性 execute_node 反而与管线一致。
+    **本测试此前把 bug 当成了期望行为**（ISSUE-20260914-POLICY-INTENT-NEVER-TRIGGERED）：
+    它用"什么是双录"作为 unknown 的样例，断言其规划为 unknown。
+    但"什么是双录"本应命中 `policy`（policy 类目下有《个人投资者适当性管理指南》等 24 个
+    chunk），当时判为 unknown 是**意图规则覆盖缺口**，而非正常行为。
+    修复 policy 触发词后该断言失败——这正说明它固定的是缺陷。
+    现改用**真正无法识别**的问句（措辞含糊、无任何意图 marker）来测同一条规则。
     """
     from app.services.customer_intent import CustomerIntentPlanner
-    plan = CustomerIntentPlanner().plan("什么是双录")
-    assert [t.intent for t in plan.tasks] == ["unknown"]
+    planner = CustomerIntentPlanner()
+    # 真正未识别的问句：不含任何意图标记
+    plan = planner.plan("这个那个")
+    assert [t.intent for t in plan.tasks] == ["unknown"], \
+        "应使用真正未识别的问句作为 unknown 样例"
     assert SupervisorGraph._model_tool_applicable(plan) is False
+
+    # 并固定住"双录"这类制度问题**必须**命中 policy（防止规则被改窄而无人察觉）
+    policy_plan = planner.plan("什么是双录")
+    assert "policy" in [t.intent for t in policy_plan.tasks], \
+        "制度类问题（双录/适当性/反洗钱等）应命中 policy；" \
+        "若此处失败，说明 policy 触发词被改窄（见 ISSUE-20260914-POLICY-INTENT-NEVER-TRIGGERED）"
 
 
 def test_model_tool_intents_whitelist_matches_expectation():

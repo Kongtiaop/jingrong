@@ -128,7 +128,25 @@ class CustomerIntentPlanner:
         ("business_operation", "申购", "draft_operation", .98), ("business_operation", "购买", "draft_operation", .98), ("business_operation", "买入", "draft_operation", .98), ("business_operation", "赎回", "draft_operation", .98), ("business_operation", "转账", "draft_operation", .98), ("business_operation", "下单", "draft_operation", .98),
         ("company_info", "公司", "rag_explanation", .70), ("company_business", "业务", "rag_explanation", .75),
         ("faq", "怎么", "rag_explanation", .55), ("workflow", "流程", "rag_explanation", .80),
-        ("policy", "政策", "rag_explanation", .80), ("risk_public", "风险", "rag_explanation", .70),
+        # policy：**不能只靠"政策"一个词**（ISSUE-20260914-POLICY-INTENT-NEVER-TRIGGERED）。
+        # 实测：唯一触发词是"政策"，导致 31 条候选问句里 0 条能命中该意图，
+        # 而 policy 类目下确有 24 个 chunk（《个人投资者适当性管理指南》等）。
+        # 用户实际不会问"什么是政策"，而是问**制度名词**：
+        #   什么是双录 / 什么是投资者适当性管理 / 反洗钱相关规定 / 什么是合格投资者
+        # 故按"该意图承载的内容"扩展触发词，而非按字面词。
+        # 注意：本表的匹配是**收集式**（一个问句可命中多个意图，见 plan() 的 seen 去重），
+        # 所以扩展触发词是**与 risk_public/faq 并存**，不会把它们挤掉。
+        ("policy", "政策", "rag_explanation", .80),
+        ("policy", "适当性", "rag_explanation", .88),
+        ("policy", "双录", "rag_explanation", .88),
+        ("policy", "反洗钱", "rag_explanation", .88),
+        ("policy", "合格投资者", "rag_explanation", .88),
+        ("policy", "冷静期", "rag_explanation", .85),
+        ("policy", "风险揭示", "rag_explanation", .85),
+        ("policy", "合规", "rag_explanation", .80),
+        ("policy", "管理办法", "rag_explanation", .80),
+        ("policy", "规定", "rag_explanation", .70),
+        ("risk_public", "风险", "rag_explanation", .70),
     ]
 
     def plan(self, query: str, context: dict | None = None) -> IntentPlan:
