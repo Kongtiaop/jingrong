@@ -2,7 +2,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 220 条真 bug 修复记录。
+- 共 225 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
@@ -2599,3 +2599,139 @@ q2 独有 = 公司业务 公司服务 服务范围 客户
 **顺带确认（本轮修复已生效的证据）**：语料四类全部 pl=public
 （company_info 49 / company_business 40 / policy 24 / faq 21），
 六个检索探针全部 `sufficient`，`company_business` 由 0 命中变为 0.6366。
+
+### ISSUE-20260914-CORPUS-MISSING-FROM-IMAGE
+- 日期：2026-09-14
+- 分类：构建 / 工程
+- 严重程度：P2（运行期报错，易被误判为脚本 bug）
+**现象**：容器内执行 `scripts/import_customer_corpus.py --dry-run` 报四个语料文件
+"文件不存在"，但文件在仓库里确实存在。
+**根因（两处叠加，任一存在即失败）**：
+1. `Dockerfile.api` 只 COPY `app/workers/scripts/migrations`，**没有 COPY knowledge_corpus**
+   —— 所以脚本本身能跑（在 scripts 里），但它要读的数据不在镜像内。
+2. `.dockerignore` 含 `*.md`，会把四个 `.md` 语料**全部排除**；
+   即便补了 COPY 也拷不进去，必须用 `!knowledge_corpus` 与 `!knowledge_corpus/**`
+   **两条例外**重新包含（仅写目录名无法让目录内文件生效），且顺序须在 `*.md` 之后。
+**修复**：Dockerfile.api 增 `COPY knowledge_corpus ./knowledge_corpus`；
+.dockerignore 增上述两条例外。并在导入脚本中，当同名文件全缺失时追加提示，
+直接指出"镜像未包含该目录"及检查项，避免下次把构建问题误当成脚本 bug。
+**验证**：新增 `tests/test_corpus_image_wiring.py`（4 条）固定该配置：
+COPY 存在、两条例外齐备、例外顺序在 `*.md` 之后、导入计划中的文件真实存在。
+并**验证测试能失败**：回退修复后 3 failed，恢复后 4 passed。
+**教训**：与 ISSUE-20260914-PGSEARCH-BM25-KEY-FIELD-BLOCKS-INSERT 同属
+"本地跑得好、容器里缺东西"——两者都说明**容器内的真实验证不可替代**。
+另注：`*.md` 这条排除规则本意是"别把文档塞进镜像"，
+但它同样排除了**作为数据用的** markdown，这是规则过宽的典型副作用。
+
+### ISSUE-20260914-ORDER-CASE-TESTS-NOT-FOUND-NOT-QUERY
+- 日期：2026-09-14
+- 分类：测试数据 / 对照用例
+- 严重程度：P3（用例误导，非功能缺陷）
+**现象**：`compare_graph_vs_pipeline.py` 的固定用例"我的订单 ORD-123456 状态"
+在本轮由 OK 变为 DIFF，graph 比 pipeline 多出一句"您当前没有可查询的订单记录。"，
+一度怀疑是收窄改动引入的回归。
+**查证（真实数据）**：
+```
+orders 表 9 行，order_no 形如 O98E346E6347D4BCB（O + 15 位十六进制，**无 ORD- 前缀**）
+  精确匹配 ORD-123456 = 0
+  全库含 "123456" 的 order_no = 0
+  work_order.ticket_no 含 "123456" = 0
+  **demo 客户（f3e3200b…）名下订单 = 0 条**（现有订单属 3a3f9a87… / 8886f88a…）
+```
+**结论**：`ORD-123456` **确实不存在**，且 demo 客户名下**没有任何订单**，
+故 `fact_not_found` 是**正确**行为。该用例从设计之初就注定走"查不到"分支——
+**它测的是降级行为，不是订单查询功能**。
+**差异性质**：非回归。graph 走模型循环（4 轮），pipeline 走确定性
+`CustomerQueryRouter`；两者 `overall_status` / `clarification` / `requires_handoff`
+**完全一致**，仅 task 的 answer 文本不同，且 **graph 更清楚**
+（告知"查过了、是没有"，而 pipeline 只说"请补充信息"）。
+**待办建议**：
+1. 补一条**用真实单号**的用例（需先给 demo 客户造订单），否则"订单查询"路径始终未被覆盖；
+2. 或把该用例的 query 语义改为明确"不存在"，避免被误读为查询功能有问题。
+**教训**：**用例的 query 必须与被测能力对齐**。这条用例名为"查询订单状态"，
+实际长期在测"查不到时的降级"，因而既掩盖了查询路径未被覆盖，
+又会在降级文案变化时产生看似异常的 DIFF。
+
+### ISSUE-20260914-FAILURE-HINT-ENCOURAGES-RETRY
+- 日期：2026-09-14
+- 分类：Agent 工具循环 / 提示词
+- 严重程度：P2（浪费 LLM 调用；且是既有问题的另一面）
+**现象**：`我的订单 ORD-123456 状态` 模型工具轮轨迹：
+```
+decision[r1] get_my_order_status  args={'query': '订单 ORD-123456 状态'}   executed
+decision[r2] get_my_order_status  args={'query': 'ORD-123456'}            executed
+decision[r3] get_my_order_status  args={'query': '订单号 ORD-123456'}      executed
+decision[r4] rejected_duplicate    args={'query': 'ORD-123456'}   ← 与 r2 重复，被闸门拦下
+stopped_reason = duplicate_call_skipped
+```
+模型在**单号确实不存在**的情况下，连续 3 次改写参数写法后**退回重复**，2 轮完全无效。
+**根因**：`fact_not_found` 的失败提示写到：
+> "未查到该对象（单号可能不存在或不属于当前客户）。**请勿改调其他工具**；
+>  可在本工具内**换一个更明确的查询参数**，或直接停止（让下游提示用户补充/转人工）。"
+
+**"换一个更明确的查询参数"这句在鼓励重试** —— 但本场景的问题**不在参数明确度**，
+而在"该单号就是不存在"。对确定性查询工具，单号已完整给出仍查不到时，
+**改写写法不可能改变结果**（历史已记录同一工具同参数重复调用必然同结果，
+见 ISSUE-20260914-TOOL-FAILURE-NOT-FEED-BACK 的重复调用闸门）。
+**与既有问题的关系**：ISSUE-20260914-FAILURE-HINT-MISLEADS-TOOL-SWITCH 记录的是
+提示**误导模型换工具**；本条是提示**误导模型换参数写法**——同一处文案的两面。
+**建议修法（未改，待定）**：把提示改为明确语义，例如
+"若已给出完整单号仍查不到，说明该单号不存在；**不要改写参数重试**，直接停止"。
+预期收益：省去 2 轮无效 LLM 调用。
+**注意**：需与"参数确实不明确"的场景区分（如"查我的订单"未给单号，
+此时**应当**提示补充单号），故不能简单删掉"换参数"这句，而应按错误类型分文案。
+
+### ISSUE-20260914-CLARIFICATION-EMPTY-TASK-ANSWER
+- 日期：2026-09-14
+- 分类：客服应答 / 用户体验
+- 严重程度：P2（用户无法区分"没有"与"没查"）
+**现象**：`needs_clarification` 场景下，pipeline 的 task.answer **为空字符串**：
+```
+[pipeline] task=t1 intent=order_status status=needs_clarification error=fact_not_found
+           answer=''                    ← 空
+           clarification='请补充更明确的查询对象或订单/产品信息。'
+[graph]    task=model-tool-1 ... answer='您当前没有可查询的订单记录。'   ← 有内容
+```
+最终用户看到的 pipeline 回答只有"下一步：请补充更明确的查询对象或订单/产品信息。"
+**用户无法判断**是"系统查过了、确实没有"，还是"系统根本没查、需要我补信息"。
+**根因**：`CustomerQueryRouter` 在 `fact_not_found` 时返回 `answer=""`（或未透传），
+task 层只带澄清文案，未附"已查询但未命中"的事实说明。
+**与既有条目的关系**：ISSUE-20260914-FAILED-VS-CLARIFICATION-MISMATCH 已统一了
+"失败 → needs_clarification"的**状态语义**；本条是**文案/信息量**层面的缺口——
+状态对了，但告诉用户的信息不足。
+**待决（产品语义，未改）**：是否让 pipeline 与 graph 对齐？
+若对齐，应是 **pipeline 补上"未查询到记录"这句**（而不是 graph 去掉），
+因为 graph 的表达对用户更友好。但这会改变对外可见的回答文本，故需产品确认。
+
+### ISSUE-20260914-POLICY-INTENT-NEVER-TRIGGERED
+- 日期：2026-09-14
+- 分类：意图识别 / 知识覆盖
+- 严重程度：P1（**24 个 chunk 的合规资料用户问不到**）
+**现象**：构建 scope 收窄实验时需按意图准备探针问句，逐个用 `CustomerIntentPlanner`
+反查 31 条候选，结果 **`policy` 意图无任何问句可触发**：
+```
+"什么是双录"             -> ['unknown']
+"什么是投资者适当性管理"   -> ['unknown']
+"风险等级怎么划分"        -> ['faq', 'risk_public']
+```
+**影响**：`policy` 类目下有 **24 个 chunk**（《个人投资者适当性管理指南》等），
+但用户问合规/适当性类问题**走不到这批资料**——不是检索问题，是**意图识别规则的覆盖缺口**。
+连带：双录、适当性、反洗钱等客服高频问题均无法命中该意图。
+**同期发现的意图触发面问题**（同一轮反查所得）：
+```
+company_info    14 条问句可触发（触发面最宽）
+company_business 3 条 / faq 4 条
+workflow         1 条     <- 仅 1 条
+risk_public      1 条     <- 仅 1 条
+policy           0 条     <- 完全无
+unknown          "客服电话是多少""开户需要什么材料""什么是基金定投"
+                 "什么是业绩比较基准""基金和理财产品有什么区别" 等大量自然问句
+```
+即意图规则的触发面**远窄于预期**，且 `unknown` 吸收了大量本应被识别的问句。
+**待办（未改）**：
+1. 查 `customer_intent.py` 中 `policy` 的关键词/模式是否配置或过于狭窄；
+2. 复核 `unknown` 吸收的问句是否应归属某意图（尤其"客服电话""开户材料"这类高频问题）；
+3. 补测试固定"各意图至少能被 N 条典型问句触发"，避免规则被改窄而无人察觉。
+**教训**：**意图从不触发，比意图映射错误更隐蔽** ——
+映射错会表现为答非所问（有输出、可发现），从不触发则表现为"走到别的意图"或"unknown"，
+看上去像识别能力不足，实则是规则覆盖缺口。
