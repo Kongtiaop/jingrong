@@ -39,6 +39,13 @@ class AgentState(BaseModel):
     model_tool_names: list[str] = Field(default_factory=list)    # 实际调用过的工具（按序）
     model_tool_stopped_reason: str = ""                          # no_tool_call/done/budget_exhausted/tool_not_allowed
     model_tool_decisions: list[dict] = Field(default_factory=list)  # 模型原始决策+自述理由（含被拦下的越界/重复调用）
+    # 按 `depends_on` 分层执行时，**每层各自的**轨迹（rounds/decisions/stopped_reason）。
+    # 为什么必须在此声明：LangGraph 只把 AgentState **已声明**的字段并入状态，
+    # 未声明的键会被**静默丢弃**（不报错、不告警）。初版只在 model_tool_node 返回的
+    # patch 里带该键，到 runner 时已不存在 —— 于是每个 task 都退回"合并后的整体轨迹"，
+    # 两个 task 显示完全相同的决策（实测 C4 用例暴露）。
+    # 教训：**"节点返回了某键" ≠ "状态里能读到该键"**，新增 state 字段务必同步本文件。
+    model_tool_layer_traces: list[dict] = Field(default_factory=list)
     # 上下文（intent_plan_node 从短时/长时/共享记忆装载，供规划与生成使用）
     conversation_id: str = ""                          # 用于短时记忆读写与 checkpointer thread_id
     conversation_context: str = ""                     # 共享记忆 conversation_summary

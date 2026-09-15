@@ -193,3 +193,49 @@ def test_each_task_shows_only_its_own_layer_decisions():
     assert len(traces) == 2, f"应有 2 个 task，实际 {len(traces)}"
     assert traces[0] != traces[1], \
         f"两个 task 显示了相同的决策序列（说明轨迹被整体附加）: {traces}"
+
+
+def test_layer_traces_survive_real_langgraph_state():
+    """分层轨迹必须能穿过**真实 LangGraph 状态**（而非仅直接调用节点）。
+
+    ISSUE-20260914-AGENT-STATE-SILENTLY-DROPS-UNDECLARED-KEYS
+
+    这是上一版测试漏掉的关键：直接调用 `model_tool_node` 会通过，
+    但真实图执行只把 `AgentState` **已声明**的字段并入状态，未声明的键
+    **静默丢弃**（不报错、不告警）。实测中 runner 因此拿不到分层轨迹，
+    每个 task 都退回整体轨迹，两个 task 显示完全相同的决策。
+    故本测试**用真实 StateGraph 跑一遍**，确认键确实存在于最终状态。
+    """
+    from langgraph.graph import END, START, StateGraph
+
+    from app.schemas.agents import AgentState
+
+    async def node(state: AgentState) -> dict:
+        return {"model_tool_layer_traces": [{"layer": 1, "decisions": [{"tool": "t"}]}]}
+
+    async def _run():
+        g = StateGraph(AgentState)
+        g.add_node("n", node)
+        g.add_edge(START, "n")
+        g.add_edge("n", END)
+        return await g.compile().ainvoke({
+            "request_id": "r", "trace_id": "t",
+            "conversation_id": "v", "customer_id": "c", "user_message": "q",
+        })
+
+    out = asyncio.run(_run())
+    assert "model_tool_layer_traces" in out, (
+        "该键未在 AgentState 声明 -> LangGraph 会静默丢弃，"
+        "导致 runner 读不到分层轨迹（两个 task 显示相同决策）")
+
+
+def test_node_patch_keys_are_all_declared_in_state():
+    """节点返回的每个键都必须在 AgentState 中声明，防止再犯同类静默丢失。"""
+    from app.schemas.agents import AgentState
+
+    fields = set(AgentState.model_fields)
+    calls: list[dict] = []
+    patch = asyncio.run(_graph(calls).model_tool_node(_state("我有没有风险限制")))
+    undeclared = [k for k in patch if k not in fields]
+    assert not undeclared, (
+        f"model_tool_node 返回了未在 AgentState 声明的键 {undeclared}，这些键会被静默丢弃")
