@@ -1,0 +1,24 @@
+fix(rag): BM25 重建改为单事务 DROP+CREATE（ParadeDB 一表仅允许一个 bm25 索引）
+
+实测失败：上一版"先建临时索引 -> 探测 -> 替换"报
+    a relation may only have one ParadeDB index
+ParadeDB 限制**一张表只能有一个 bm25 索引**，故"先建再切"在架构上不可能，
+替换只能 DROP 后 CREATE。
+
+改为【单事务 DROP+CREATE】，用事务保证原子性：
+  BEGIN
+    DROP INDEX IF EXISTS idx_knowledge_chunk_content_bm25
+    CREATE INDEX ... USING bm25 (id, content) WITH (key_field='id')
+    写入探测（SAVEPOINT 包裹）
+  COMMIT   -- 任一步失败则整体回滚，旧索引自动恢复
+这样即使 CREATE 语法/版本不符，也不会留下"没有 BM25 索引、检索失效"的状态。
+
+同时修掉自己脚本里一个**会导致假成功的 bug**：
+  probe_insert 原实现无论成败都调用 session.rollback()，
+  而重建场景下 DDL 与探测在同一事务 —— 该 rollback 会把刚执行的
+  DROP+CREATE 一起撤销，脚本却报告"写入探测成功"。
+  现改为 use_savepoint=True：用 SAVEPOINT 只回滚探测本身，不影响外层 DDL。
+  已用 sqlite 事务/SAVEPOINT 对照实验验证：外层 DDL 保留、探测行未落库；
+  并验证无脑 rollback 确实会撤销外层 DDL（反例成立）。
+
+tests 400 passed。

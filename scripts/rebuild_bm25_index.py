@@ -35,8 +35,28 @@ if str(_ROOT) not in sys.path:
 INDEX = "idx_knowledge_chunk_content_bm25"
 
 
-async def probe_insert(session) -> tuple[bool, str]:
-    """写入探测：用真实表结构插一行再回滚，返回 (是否成功, 错误信息)。"""
+class _ProbeRollback(Exception):
+    """内部信号：探测写入成功，用异常退出 SAVEPOINT 块以触发局部回滚。"""
+
+
+_PROBE_INSERT = (
+    "INSERT INTO knowledge_chunk (id, document_id, version_id, chunk_index, "
+    "content, content_hash, title_path, metadata_json, status) "
+    "VALUES (gen_random_uuid(), :d, :v, 88888, 'rebuild-probe', 'rebuild-hash', "
+    "'', '{}'::jsonb, 'active')"
+)
+
+
+async def probe_insert(session, *, use_savepoint: bool = False) -> tuple[bool, str]:
+    """写入探测：插一行后回滚，返回 (是否成功, 错误信息)。
+
+    **重要（踩过的坑）**：探测若直接 `session.rollback()`，会把调用方**同一事务里
+    已执行的 DDL 一起回滚掉**。重建场景正是"DROP+CREATE 与探测在同一事务"，
+    若无脑 rollback，重建会被静默撤销，而脚本却报告"写入探测成功" —— 假成功。
+
+    故 `use_savepoint=True` 时用 SAVEPOINT 包住探测：只回滚探测本身，
+    **不影响外层事务的 DDL**。
+    """
     from sqlalchemy import text
     try:
         row = (await session.execute(text(
@@ -44,11 +64,19 @@ async def probe_insert(session) -> tuple[bool, str]:
             "JOIN knowledge_document_version v ON v.document_id = d.id LIMIT 1"))).fetchone()
         if row is None:
             return False, "库里没有 document/version，无法探测"
-        await session.execute(text(
-            "INSERT INTO knowledge_chunk (id, document_id, version_id, chunk_index, "
-            "content, content_hash, title_path, metadata_json, status) "
-            "VALUES (gen_random_uuid(), :d, :v, 88888, 'rebuild-probe', 'rebuild-hash', "
-            "'', '{}'::jsonb, 'active')"), {"d": str(row.did), "v": str(row.vid)})
+        params = {"d": str(row.did), "v": str(row.vid)}
+        if use_savepoint:
+            try:
+                # 写入成功 -> 主动抛异常，让 begin_nested 只回滚这个 SAVEPOINT
+                async with session.begin_nested():
+                    await session.execute(text(_PROBE_INSERT), params)
+                    raise _ProbeRollback
+            except _ProbeRollback:
+                return True, ""
+            except Exception as exc:  # noqa: BLE001
+                # SAVEPOINT 已回滚，外层 DDL 完好
+                return False, f"{type(exc).__name__}: {str(exc).splitlines()[0][:150]}"
+        await session.execute(text(_PROBE_INSERT), params)
         await session.rollback()
         return True, ""
     except Exception as exc:  # noqa: BLE001
@@ -122,26 +150,34 @@ async def main() -> int:
             print("        不动索引定义，是最轻量的修法，优先尝试。")
             ddl_statements = [f"REINDEX INDEX {INDEX}"]
         else:
-            # 先建**临时**索引验证新语法能否成功，成功后再删除旧索引并改名替换。
-            # 这样即使 CREATE 语法不对，也**不会**把现有索引弄坏。
+            # 为什么不能"先建新索引再替换"（上一版的做法，实测失败）：
+            #   ParadeDB 限制 **一张表只能有一个 bm25 索引**，多建会报
+            #   `a relation may only have one ParadeDB index`。
+            #   故替换只能 DROP 后 CREATE，没有"并存再切换"的余地。
+            #
+            # 失败如何保证安全：把 DROP+CREATE **放进同一个事务**。
+            #   PostgreSQL 的 DDL 可事务化，若 CREATE 失败（语法/版本不符），
+            #   整个事务回滚，**旧索引自动恢复**，不会出现"索引没了、检索也挂了"。
             #
             # 定义依据（ISSUE-20260914-PGSEARCH-BM25-KEY-FIELD-BLOCKS-INSERT）：
-            #   在独立临时表上实测 4 种候选定义，**只有 A 能写入**：
+            #   独立临时表实测 4 种候选，**只有 A 能写入**：
             #     A bm25 (id, content) WITH (key_field='id')  建索引✓ 写入✓  <== 采用
-            #     B bm25 (content)    WITH (key_field='id')  建索引✓ 写入✗  <== 库里现有的（坏）
+            #     B bm25 (content)    WITH (key_field='id')  建索引✓ 写入✗  <== 库里现有（坏）
             #     C bm25 (id, content) 无 WITH               建索引✗
             #     D bm25 (content)    无 WITH                建索引✗
-            #   关键：**key_field 指名的列必须出现在字段列表中**，
-            #   只写在 WITH 里不够 —— 这正是现有索引不可写的原因。
-            print("  将执行（安全替换，先建临时索引，成功后再替换）：")
-            print(f"    1) CREATE INDEX {INDEX}__new ON knowledge_chunk USING bm25 (id, content)")
-            print(f"         WITH (key_field = 'id');")
-            print(f"    2) 写入探测（用新索引验证 INSERT 是否恢复）")
-            print(f"    3) DROP INDEX {INDEX};")
-            print(f"    4) ALTER INDEX {INDEX}__new RENAME TO {INDEX};")
-            print("  说明：第 1 步失败则**直接中止**，原索引保持不变，检索不受影响。")
+            #   关键：**key_field 指名的列必须出现在字段列表中**。
+            print("  将执行（单事务内 DROP+CREATE，失败自动回滚恢复旧索引）：")
+            print(f"    BEGIN;")
+            print(f"      DROP INDEX IF EXISTS {INDEX};")
+            print(f"      CREATE INDEX {INDEX} ON knowledge_chunk USING bm25 (id, content)")
+            print(f"          WITH (key_field = 'id');")
+            print(f"      -- 写入探测；失败则整体回滚，旧索引恢复")
+            print(f"    COMMIT;")
+            print("  说明：ParadeDB 限制一表只能有一个 bm25 索引，故无法'先建再切'；")
+            print("        用事务保证原子性，是本场景下唯一安全的方式。")
             ddl_statements = [
-                f"CREATE INDEX {INDEX}__new ON knowledge_chunk USING bm25 (id, content) "
+                f"DROP INDEX IF EXISTS {INDEX}",
+                f"CREATE INDEX {INDEX} ON knowledge_chunk USING bm25 (id, content) "
                 f"WITH (key_field = 'id')",
             ]
 
@@ -155,38 +191,50 @@ async def main() -> int:
         print("=" * 92)
         print("STEP 3：执行")
         print("=" * 92)
-        for stmt in ddl_statements:
-            print(f"  执行: {stmt[:100]}...")
+
+        if args.reindex_only:
+            # REINDEX 单独走：不动定义，改错后无需回滚语义
             try:
-                await session.execute(text(stmt))
+                await session.execute(text(ddl_statements[0]))
                 await session.commit()
-                print("    -> 成功")
+                print("  REINDEX -> 成功")
             except Exception as exc:  # noqa: BLE001
                 await session.rollback()
-                print(f"    -> 失败: {type(exc).__name__}: {str(exc).splitlines()[0][:200]}")
-                print()
-                print("  **重建失败，已中止。原索引未被删除，检索能力不受影响。**")
-                print("  下一步建议：改用 --reindex-only 试 REINDEX；")
-                print("  或回退 tsvector 后端（FULLTEXT_BACKEND=tsvector + 删索引）。")
+                print(f"  REINDEX -> 失败: {type(exc).__name__}: {str(exc).splitlines()[0][:200]}")
                 await database.dispose()
                 return 1
-
-        if not args.reindex_only:
-            # 用新索引验证写入
-            w_ok2, w_msg2 = await probe_insert(session)
-            print(f"  新索引下的写入探测: {'成功' if w_ok2 else '失败'}  {w_msg2}")
-            if not w_ok2:
+        else:
+            # DROP + CREATE + 写入探测，**全部放在同一事务**里。
+            # 任何一步失败 -> 整体回滚 -> 旧索引自动恢复（不会出现"索引没了"）。
+            # 之所以必须同事务：ParadeDB 限制一表只能有一个 bm25 索引，
+            # 无法"先建新索引再切换"，只能先删后建；若不原子化，
+            # CREATE 失败就会留下"没有 BM25 索引"的状态。
+            try:
+                print(f"  DROP INDEX IF EXISTS {INDEX} ...")
+                await session.execute(text(f"DROP INDEX IF EXISTS {INDEX}"))
+                print("  CREATE INDEX (id, content) WITH (key_field='id') ...")
+                await session.execute(text(ddl_statements[1]))
+                # 在同一事务内探测写入（未提交前即可见新索引的效果）。
+                # 必须 use_savepoint=True：否则探测内部的 rollback 会把
+                # 上面刚执行的 DROP+CREATE 一起撤销，造成"假成功"。
+                w_ok2, w_msg2 = await probe_insert(session, use_savepoint=True)
+                if not w_ok2:
+                    await session.rollback()
+                    print(f"  写入探测: 失败  {w_msg2}")
+                    print()
+                    print("  **新定义仍无法写入，已回滚。旧索引恢复，检索不受影响。**")
+                    await database.dispose()
+                    return 1
+                print("  写入探测: 成功")
+                await session.commit()
+                print("  -> 已提交，索引重建完成")
+            except Exception as exc:  # noqa: BLE001
+                await session.rollback()
+                print(f"  失败: {type(exc).__name__}: {str(exc).splitlines()[0][:200]}")
                 print()
-                print("  **新索引仍无法写入**，故不替换旧索引（避免白折腾）。")
-                print(f"  已创建的临时索引 {INDEX}__new 保留，可手工 DROP。")
+                print("  **DDL 失败，事务已回滚 —— 旧索引自动恢复，检索不受影响。**")
                 await database.dispose()
                 return 1
-            print(f"  删除旧索引 {INDEX} ...")
-            await session.execute(text(f"DROP INDEX IF EXISTS {INDEX}"))
-            print(f"  重命名 {INDEX}__new -> {INDEX} ...")
-            await session.execute(text(f"ALTER INDEX {INDEX}__new RENAME TO {INDEX}"))
-            await session.commit()
-            print("  -> 完成")
 
         print()
         print("=" * 92)
