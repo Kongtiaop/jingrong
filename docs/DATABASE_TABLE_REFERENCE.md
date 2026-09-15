@@ -3,7 +3,9 @@
 > **用途**：答辩数据库说明、日常排查、DataGrip 连接与表关系查阅。
 > **当前主库**：PostgreSQL 16 + pgvector，Docker 容器 `wealth-postgres`。
 > **事实源原则**：客户、账户、订单、资金流水、风险、工单、权限、审计均以 PostgreSQL 为业务事实源；Redis、Milvus、MySQL 迁移库不替代主库事实。
-> **更新日期**：2026-08-27（依据 `app/models/*.py` 实际模型重写；共 50 张表）
+> **更新日期**：2026-09-14（依据 `app/models/*.py` 复核；实际 **49** 张表）
+> ⚠️ 2026-08-27 版本声称"50 张表"，2026-09-14 复核实际为 49 张 —— 原计数有误，
+> 且遗漏了 `bad_case` 表（已补入第 10 节）。
 > **说明**：类型标注 `String(n)`=varchar(n)、`Numeric(a,b)`=定点数、`JSONB`/`JSON`=json、`VECTOR(1024)`=pgvector、`DateTime(tz)`=带时区时间；外键指向表名，`ondelete` 行为标注。
 
 ---
@@ -35,7 +37,7 @@ docker compose logs postgres --tail 100
 
 ---
 
-## 2. 表关系总览（50 张表）
+## 2. 表关系总览（49 张表）
 
 ```text
 身份权限：users ─┬─ user_roles → roles → role_permissions → permissions
@@ -68,6 +70,8 @@ docker compose logs postgres --tail 100
 
 异步基础设施：outbox_event（事务发件箱）/ async_task（后台任务）
 审计：audit_logs
+
+数据飞轮：bad_case（bad case 采集与标注；无外键，按 customer_id 逻辑关联 users）
 ```
 
 ---
@@ -878,7 +882,40 @@ docker compose logs postgres --tail 100
 
 ---
 
-## 15. 维护规则
+## 15. 数据飞轮
+
+### bad_case（bad case 采集与标注）
+> 2026-09-14 补入：本表由迁移 `0023_bad_case` 引入，但 2026-08-27 版本文档**遗漏**，
+> 且当时表数计数（50）与实际（49）不符。按第 15 节"维护规则 1"应同步更新本文档。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | String(36) PK | UUID |
+| customer_id | String(36) | 关联客户（逻辑关联 `users.id`，未建外键）|
+| query | Text | 原始问句 |
+| query_hash | String(64) index | 问句哈希（去重）|
+| intent | String(64) | 规则/模型识别出的意图 |
+| confidence | Float | 置信度 |
+| evidence_status | String(64) | RAG 证据状态（sufficient / low_confidence / …）|
+| handoff | Boolean | 是否转人工 |
+| clarifications | Integer | 澄清轮数 |
+| reasons | JSON | 判定为 bad case 的**信号列表**（如 intent=unknown / 低置信 / 规则回退 …）|
+| status | String(16) index | 处理状态 |
+| created_at | DateTime(tz) | 采集时间 |
+| labeled_intent | String(64) | 人工标注的正确意图 |
+| requires_clarification | Boolean | 人工判定是否应澄清 |
+| category | String(64) | 标注分类 |
+| note | Text | 标注备注 |
+| split | String(16) | 数据集划分（train/test）|
+| labeled_by | String(36) | 标注人 |
+| labeled_at | DateTime(tz) | 标注时间 |
+
+**用途**：运行时自动判定"当前问答是不是 bad case"并落库，形成可标注、可回流的数据集，
+支撑意图识别与 RAG 的持续评测（见 `docs/数据飞轮与意图识别评测.md`）。
+
+---
+
+## 16. 维护规则
 
 1. 新增实体时，必须同步：ORM Model、Alembic Migration、Schema/Repository/Service、测试和本说明。
 2. 不在 DataGrip 中直接修改生产/演示关键业务状态；资金、订单、风险限制应通过 API/Service 产生完整审计。

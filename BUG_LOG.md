@@ -1,5 +1,150 @@
 # Bug 修复记录
 
+### ISSUE-20260903-BM25-TX-POLLUTION
+- 日期：2026-09-03
+- 来源：原 `docs/BUG_LOG.md`（2026-09-14 合并，避免内容孤儿化）
+- 标题：2026-09-03：BM25 关键词腿降级时整库检索崩溃（事务污染）
+
+**现象**：把 `FULLTEXT_BACKEND=pg_search` 打开、但 pg_search 扩展未装/索引未建时，调用 `search_hybrid` 抛出
+`sqlalchemy.exc.DBAPIError: InFailedSQLTransactionError`，检索直接失败而非降级回 tsvector。
+
+**根因**：`_rank_text_pg_search` 里 `@@@` 原始 SQL 直接在 `search_hybrid` 的共享 session 上执行。
+pg_search 扩展缺失导致该 SQL 报错，**把共享事务 abort**；随后 `_rank_text_branch` 想在同一个 session 上
+降级跑 `_rank_text_tsvector`，因事务已 aborted → `InFailedSQLTransactionError`。即"降级"在共享事务里根本降不回去。
+
+**修复**：pg_search 的 BM25 原始查询改用**独立连接**（`self.database.engine.connect()`）执行，并在连接上先 `rollback()`
+清空挂起事务；出错只回滚该独立连接，不影响 `search_hybrid` 的共享 session，随后可干净降级回 tsvector。
+`app/repositories/knowledge.py` `_rank_text_pg_search` / `_rank_text_branch`。
+
+**验证**：`FULLTEXT_BACKEND=pg_search` + 扩展未装 → 检索返回结果（降级回 tsvector），日志有
+`pg_search_fulltext_failed_falling_back_to_tsvector` 告警，不再抛 InFailedSQLTransactionError。
+本地真实 DB 实测通过；相关 pytest 通过。
+
+---
+
+
+### ISSUE-20260903-BM25-CJK-WHOLE-SENTENCE-ZERO-HIT
+- 日期：2026-09-03
+- 来源：原 `docs/BUG_LOG.md`（2026-09-14 合并，避免内容孤儿化）
+- 标题：2026-09-03：中文整句 query 用 BM25 检索 0 命中
+
+**现象**：`content @@@ '什么是适当性管理'` 返回 0 行，而 `content @@@ '适当性'` 返回 12 行。
+
+**根因**：BM25（pg_search）是**词级/子串精确检索**，不是语义检索。整句中文明不做切分会被当成一个"词"，
+库里没有这么长的连续串 → 0 命中。这是 BM25 的正确行为，不是故障（与之前 PG `simple` 中文 ts_rank=0 是同类根因）。
+
+**修复**：应用层 `_extract_pg_search_terms` 做中文拆词：按标点/空白切段 → 剥首尾停用词（什么/是/怎么…）→
+长中文短语（≥5 字）生成字 bigram（重叠 2 字窗）→ 空格连接（pg_search 空格默认 OR）。整句 query 由此变成
+`适当性 管理` 之类的可召回词。语义排序仍由向量腿承担，BM25 腿只管精确命中，两腿 RRF 融合。
+`app/repositories/knowledge.py` `_extract_pg_search_terms` / `_rank_text_pg_search`。
+
+**验证**：真实 DB：整句"什么是适当性管理"经代码路径（`search_hybrid` 带真实向量）返回 5 条正确文档
+（适当性管理指南等）；本地 64 条评测集 keyword 腿 recall 96.1%。单测 `tests/test_pg_search_term_extractor.py` 覆盖。
+
+---
+
+
+### ISSUE-20260903-BM25-RRF-TOPK-TRUNCATION-ILLUSION
+- 日期：2026-09-03
+- 来源：原 `docs/BUG_LOG.md`（2026-09-14 合并，避免内容孤儿化）
+- 标题：2026-09-03：三路召回评测发现"双路 recall 略低于纯向量"（RRF top_k 截断假象）
+
+**现象**：64 条评测里个别 case（如 rag_03 有哪些牌照）vector=1.0、keyword=1.0，但 hybrid recall 只有 0.67；
+整体 hybrid 96.1% 略低于 vector_only 99.2%。
+
+**根因**：评测脚本里双路 RRF 后固定取 `fused[:5]`（top_k=5），候选池是 20。RRF 把不同来源的候选混进 top5，
+可能挤掉"单路下本来能命中、但 RRF 排名靠后"的 gold 片段 → 表现为双路 recall 低于单路。这是**评测参数
+（top_k 截断）造成的假象**，不是"双路更差"。真实生产 `search_hybrid` 的 RRF 行为与向量过滤逻辑不同。
+
+**处理**：不据此判定"双路不如单路"。改为按 intent 分层对比（`scripts/compare_rag_dual_path_by_intent.py`），
+避免样本不均衡掩盖结论。结论口径：向量腿在语义问答型语料上是主力（99%+）；关键词腿补精确词；双路 hit_rate
+最高（100%），尤其补上 keyword 单独漏的 faq/company_info case。
+
+**验证**：分层结果（64 条）：vector 99.2%/100%、keyword 96.1%/97%、hybrid 96.1%/100%；各 intent 分档输出见脚本。
+
+---
+
+
+### ISSUE-20260903-BM25-IMAGE-AND-TAG-PITFALLS
+- 日期：2026-09-03
+- 来源：原 `docs/BUG_LOG.md`（2026-09-14 合并，避免内容孤儿化）
+- 标题：2026-09-03：镜像源拉不到 ParadeDB / 默认 tag 是 PG18 等环境坑（部署侧）
+
+**现象与根因**：
+1. `docker pull paradedb/pg_search:latest` 被本地 Docker 的 DaoCloud 镜像加速源返回 403（该源未同步该仓库）。
+2. 换到 `docker.m.daocloud.io/paradedb/paradedb:latest` 能拉，但 `latest` 实际是 **PostgreSQL 18**，与现有 PG16 数据卷
+   主版本不兼容（PG 数据目录主版本必须一致）。
+3. ParadeDB 的 pg16 tag（`paradedb/paradedb:pg16` / `0.25.6-pg16` 等，同一 digest）= PG16.15 + vector 0.8.4 +
+   pg_search 0.25.6，PGDATA 仍为 `/var/lib/postgresql/data`，与 pgvector 镜像一致 → 卷无需改路径，可无缝换引擎。
+
+**解法**：选用并实测 `docker.m.daocloud.io/paradedb/paradedb:pg16`（PGDATA 同路径，卷兼容）。
+容器名字冲突：旧 `wealth-postgres` 由 p0 compose 项目起，需用 `docker compose -f docker-compose.p0.yml` 重建，
+而非本地 `docker-compose.yml`。
+
+**验证**：两个 compose `config` 通过；服务器重建后 `knowledge_chunk` 数据（如本地 93 chunk）完好、`vector` 扩展保留；
+pg_search 0.25.6 正常 CREATE EXTENSION。
+
+---
+
+
+### ISSUE-20260903-BM25-NEEDS-SHARED-PRELOAD
+- 日期：2026-09-03
+- 来源：原 `docs/BUG_LOG.md`（2026-09-14 合并，避免内容孤儿化）
+- 标题：2026-09-03：pg_search 需要 shared_preload_libraries 才能用
+
+**现象**：`CREATE EXTENSION pg_search` 报 `pg_search must be loaded via shared_preload_libraries`；
+`content @@@ ...` 报 `operator does not exist` / `does not contain a USING bm25 index`。
+
+**根因**：pg_search 需先在 `postgresql.conf` 的 `shared_preload_libraries` 加入 `pg_search` 并重启（该实例默认配置为空，
+镜像 postgresql.conf.sample 里预设了但实际运行实例未生效）。
+
+**解法**：`ALTER SYSTEM SET shared_preload_libraries = 'pg_search';` → `docker restart wealth-postgres` →
+`CREATE EXTENSION pg_search` → `CREATE INDEX ... USING bm25(content) WITH (key_field='id')`。
+
+**验证**：重启后 `SHOW shared_preload_libraries` = pg_search；pg_search 0.25.6 扩展 + BM25 索引建成功；
+`content @@@ '适当性'` 命中。
+
+---
+
+
+### ISSUE-20260903-UNDERSTANDING-CONFIG-NEVER-LOADED
+- 日期：2026-09-03
+- 来源：原 `docs/BUG_LOG.md`（2026-09-14 合并，避免内容孤儿化）
+- 标题：2026-09-03：理解层配置 config/understanding.yaml 运行时从未加载（静默回退默认）
+
+**现象**：做"A′ 枚举动态 top_k"验证时发现，枚举 query（如"公司有哪几个业务线/有哪些牌照"）经
+`get_top_k_for_query` 恒返回 5（代码默认），而不是 yaml 里配的 `top_k_enum: 10`；随后全链路检查确认
+`understanding_config` 单例的 `_data` 在运行时一直为空（长度 0），难度分级路由到 qwen-turbo/max、灰度、
+检索参数、以及本次新增的 `top_k_by_difficulty`/`top_k_enum`/C 兜底 **全部可能从未在生产生效**。
+
+**根因**（两个叠加）：
+1. **路径 bug（committed HEAD 就存在，非本次改动引入）**：`understanding_config.py` 里
+   `_CONFIG_DIR = os.path.dirname(os.path.join(os.path.dirname(__file__), "..", "..", "config"))`
+   多套了一层 `os.path.dirname()`，把末尾的 `config` 段剥掉，`_CONFIG_PATH` 解析成
+   `<仓库根>/understanding.yaml`（**不存在**），而非真实的 `<仓库根>/config/understanding.yaml`。
+   实测：`_CONFIG_PATH exists = False`，即使 `reload()` 也加载不到。
+2. **运行时从不调用 `reload()`**：全仓库（routers/dependencies/services/tasks/lifespan/`__init__`）只有测试里调用
+   `reload()`；模块级单例 `understanding_config = UnderstandingConfig()` 创建后 `_data` 恒为 `{}`，
+   `get_*()` 全部走代码内置默认。实证：import 整个 `app.main` / `app.api` 后 `_data` 长度仍为 0。
+
+之所以长期未被发现：多数代码默认值与 yaml 恰好一致（top_k=5 / rrf_k=60 / min_score=0.0001 等），
+掩盖了"配置未加载、一直在用默认参数"。
+
+**修复**（`ce122c2`）：
+- `app/services/understanding_config.py`：去掉多余的 `os.path.dirname()`，`_CONFIG_DIR` 正确落到 `config/`。
+- `app/main.py` lifespan 启动时调用 `understanding_config.reload()`，让难度路由/检索参数/灰度真正生效。
+- 顺带落地 A′（枚举动态 top_k `get_top_k_for_query`，枚举 marker → `top_k_enum`，否则按难度 S/M/L）+ C 证据兜底。
+
+**验证**：修复后正确路径下 `reload()` 成功（`_data` len=7，含 `top_k_enum`），枚举 query `公司有哪几个业务线`
+等经真实配置返回 top_k=10、非枚举 query（客服电话/员工数）返回 5。新增回归守卫
+`tests/test_rag_config.py::test_reload_loads_real_yaml_and_dynamic_top_k`，相关 19 项 pytest 通过；
+全量 225 项 collect 无导入错误。
+
+> ⚠️ 影响提醒：此修复让理解层配置**首次真正生效**。若线上曾依赖"代码默认值"，个别模型路由/检索参数行为
+> 可能与修复前不同（默认值与 yaml 多数一致，预计影响很小），上线后建议跑一次 `compare_rag_dual_path_by_intent.py`
+> 复核。
+
+
 ## 长链排查索引
 
 本文记录了一次**跨 8 层缺陷**的完整排查。起始症状：
@@ -37,7 +182,7 @@
 
 > 由 `docs/ISSUES.md` 整理抽取的**真 bug 修复记录**（含发现时间与解决方案）。未收录纯进度/决策/设计讨论条目。
 
-- 共 239 条真 bug 修复记录。
+- 共 249 条真 bug 修复记录。
 
 ### ISSUE-0003
 - 日期：2026-07-28
