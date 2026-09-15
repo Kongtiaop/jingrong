@@ -420,7 +420,7 @@ class SupervisorGraph:
             merged_names.extend(outcome.tool_names)
             merged_results.extend(self._tag_layer_results(
                 outcome.results, layer_index=layer_index, layer_prefix=layer_prefix,
-                layer_intents=planned_intents))
+                layer_intents=planned_intents, prior_facts=dep_context))
             stop_reasons.append(f"{layer_prefix}:{outcome.stopped_reason}")
             # 该层的决策序列单独保存，供 runner 只附加到**本层**的 task 上
             layer_traces.append({
@@ -453,7 +453,8 @@ class SupervisorGraph:
 
     @staticmethod
     def _tag_layer_results(results: list[dict], *, layer_index: int,
-                           layer_prefix: str, layer_intents: list[str]) -> list[dict]:
+                           layer_prefix: str, layer_intents: list[str],
+                           prior_facts: str = "") -> list[dict]:
         """给某层的 task 结果打上**层标记**并保证 `task_id` 全局唯一。
 
         为什么需要：每层是**独立的** `loop.run()`，而循环内部按轮次生成 task_id
@@ -461,6 +462,12 @@ class SupervisorGraph:
         两个 task 都叫 `model-tool-1`，无法区分也无法对齐到具体层。
         故加层前缀（`L1-model-tool-1`），并在 data 里记录层号与本层意图，
         使"哪层查了什么"可直接从响应读出。
+
+        `prior_facts`：本层执行时**已获得的**前序事实，写入 `data.prior_facts`，
+        供 `generate_node` 在**生成阶段**使用（ISSUE-20260914-GRAPH-GENERATION-MISSING-PRIOR-FACTS）。
+        为何放 data 而非 AgentState 顶层键：`task_results` 是**自由形态的 dict 列表**，
+        其内部键不会被 LangGraph 过滤；而顶层未声明的键会被**静默丢弃**
+        （见 ISSUE-20260914-AGENT-STATE-SILENTLY-DROPS-UNDECLARED-KEYS 的教训）。
         """
         tagged: list[dict] = []
         for item in results:
@@ -471,6 +478,7 @@ class SupervisorGraph:
                 **(row.get("data") or {}),
                 "layer": layer_index,
                 "layer_intents": list(layer_intents),
+                "prior_facts": prior_facts,
             }
             tagged.append(row)
         return tagged
@@ -653,8 +661,26 @@ class SupervisorGraph:
                 ) for c in citations],
                 handoff_required=False, message=r.get("answer", ""),
             )
+            # 生成用的 query：**必须带上本层的前序事实**。
+            #
+            # ISSUE-20260914-GRAPH-GENERATION-MISSING-PRIOR-FACTS
+            # 此前这里对所有 task 一律用 `state.react_query or state.user_message`，
+            # 即风险制度 task 只拿到用户原问句"我有没有风险限制"，**看不到**
+            # 前一层查到的"C4"。于是它只能讲通用规则，给不出"您可买 R1–R4"的结论，
+            # 还会自认"资料未完全覆盖"（partially_answered）。
+            # 而 pipeline 同一场景是对的——因为 `_bounded_react_knowledge` 会把
+            # `item.dependency_context` 附到生成 query 上。此处补齐这一环。
+            #
+            # 事实来源：`model_tool_node` 分层时写入 task 的 `data.prior_facts`
+            # （该键随 task 结果一起流转，因为 task_results 是**自由形态的 dict 列表**，
+            #  不像 AgentState 的顶层键那样会被过滤）。
+            # **只影响生成、不影响检索**：检索早已在 model_tool_node 完成。
+            layer_facts = str((r.get("data") or {}).get("prior_facts") or "")
+            gen_query = state.react_query or state.user_message
+            if layer_facts:
+                gen_query = f"{gen_query}{layer_facts}"
             generated = await self.answer_generator.generate(
-                query=state.react_query or state.user_message, result=rag_result)
+                query=gen_query, result=rag_result)
             r["answer"] = generated.answer
             r["data"] = {**(r.get("data") or {}), "generation_status": generated.generation_status}
             # 中间态：拿到了引用、生成了答案，但答案**自述资料不足**（引用没覆盖问题本身）。

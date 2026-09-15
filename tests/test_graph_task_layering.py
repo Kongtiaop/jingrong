@@ -239,3 +239,97 @@ def test_node_patch_keys_are_all_declared_in_state():
     undeclared = [k for k in patch if k not in fields]
     assert not undeclared, (
         f"model_tool_node 返回了未在 AgentState 声明的键 {undeclared}，这些键会被静默丢弃")
+
+
+# ---- ISSUE-20260914-GRAPH-GENERATION-MISSING-PRIOR-FACTS ----
+# 分层事实此前只进了 `model_tool_node` 的**提示层**（prior_facts），
+# 而 `generate_node` 对所有 task 一律用 `state.react_query or state.user_message`，
+# 于是风险制度 task 只拿到用户原问句、**看不到前一层查到的 C4**，
+# 只能讲通用规则，还自认"资料未完全覆盖"（partially_answered）。
+# pipeline 同一场景是对的（它把 dependency_context 附到生成 query）——本条即补齐这一环。
+
+def test_layer_facts_are_stored_on_task_results():
+    """各层的结果须带 `data.prior_facts`，供生成阶段使用。"""
+    calls: list[dict] = []
+    patch = asyncio.run(_graph(calls).model_tool_node(_state("我有没有风险限制")))
+    by_intent = {r["intent"]: r for r in patch["task_results"]}
+
+    first = by_intent["risk_restriction"]["data"]
+    second = by_intent["risk_public"]["data"]
+    assert first.get("prior_facts") == "", "第一层无前序事实"
+    assert "C4" in (second.get("prior_facts") or ""), \
+        "第二层应带上第一层的事实（C4），供生成阶段使用"
+
+
+def test_generate_node_uses_layer_facts_in_query():
+    """`generate_node` 必须把本层事实并入**生成** query。"""
+    import types
+
+    from app.agents.graph import SupervisorGraph
+
+    captured: list[tuple[str, str]] = []
+
+    class _Gen:
+        async def generate(self, *, query, result, conversation_summary=""):
+            captured.append((result.intent, query))
+            return types.SimpleNamespace(answer="a", generation_status="ok",
+                                         insufficient=False)
+
+    graph = SupervisorGraph.__new__(SupervisorGraph)
+    graph.answer_generator = _Gen()
+    state = types.SimpleNamespace(
+        react_query="", user_message="我有没有风险限制",
+        task_results=[{
+            "task_id": "L2-model-tool-1", "intent": "risk_public",
+            "status": "succeeded", "answer": "可基于客服知识库引用生成回答。",
+            "data": {
+                "citations": [{"chunk_id": "c", "document_id": "d", "version_id": "v",
+                               "content": "制度文本", "score": 0.9,
+                               "title_path": "", "page_number": None, "metadata": {}}],
+                "evidence_status": "sufficient",
+                "prior_facts": "\n\n【前序查询结果（请基于这些事实作答，不要臆造）】\n"
+                               "[risk_restriction] 等级为 **C4**。",
+            },
+            "error": None, "clarification": None,
+        }],
+    )
+    asyncio.run(graph.generate_node(state))
+    assert captured, "应有 task 进入生成"
+    intent, query = captured[0]
+    assert "C4" in query, (
+        f"生成 query 必须含前序事实（否则只能讲通用规则，实际 {query!r}）")
+    assert "前序查询结果" in query
+
+
+def test_generate_node_query_unchanged_without_facts():
+    """无前序事实时生成 query 保持原样（不影响既有单层场景）。"""
+    import types
+
+    from app.agents.graph import SupervisorGraph
+
+    captured: list[str] = []
+
+    class _Gen:
+        async def generate(self, *, query, result, conversation_summary=""):
+            captured.append(query)
+            return types.SimpleNamespace(answer="a", generation_status="ok",
+                                         insufficient=False)
+
+    graph = SupervisorGraph.__new__(SupervisorGraph)
+    graph.answer_generator = _Gen()
+    state = types.SimpleNamespace(
+        react_query="", user_message="你们公司叫什么名字",
+        task_results=[{
+            "task_id": "model-tool-1", "intent": "company_info",
+            "status": "succeeded", "answer": "x",
+            "data": {"citations": [{"chunk_id": "c", "document_id": "d",
+                                    "version_id": "v", "content": "公司简介",
+                                    "score": 0.9, "title_path": "",
+                                    "page_number": None, "metadata": {}}],
+                     "evidence_status": "sufficient"},
+            "error": None, "clarification": None,
+        }],
+    )
+    asyncio.run(graph.generate_node(state))
+    assert captured and captured[0] == "你们公司叫什么名字", \
+        f"无事实时不应改动生成 query，实际 {captured}"
