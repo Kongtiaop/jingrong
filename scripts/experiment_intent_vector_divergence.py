@@ -80,46 +80,75 @@ async def main() -> int:
     provider = QwenProvider(settings)
     retriever = WealthKnowledgeRetriever(KnowledgeRepository(database))
 
-    print("=" * 96)
-    print("向量腿分化实验：口径「现状」(原始query嵌入) vs 口径「分化」(各自normalized嵌入)")
-    print("=" * 96)
+    print("=" * 104)
+    print("意图分化三口径对照（目标：分化但不放宽门控）")
+    print("=" * 104)
+    print("  口径① 现状      : 向量腿=原始query嵌入  scope=6类目全开")
+    print("  口径② 改嵌入源  : 向量腿=各自normalized  scope=6类目全开  <- 已测：分化但相似度虚高")
+    print("  口径③ scope分化 : 向量腿=原始query嵌入  scope=各自类目    <- 本次重点")
+    print("  门控口径恒定：一律用**原始 query 嵌入**算相似度，保证三口径可比、且不被膨胀词抬高")
+    print("=" * 104)
 
     summary: list[tuple] = []
     for query in queries:
         plan = CustomerIntentPlanner().plan(query)
         planned = [t.intent for t in plan.tasks]
-        # 固定对比 company_info / company_business —— 这是"检索不分化"的那一对。
-        # 不依赖规划器是否把两者都列出来（多数问句只给 1 个 intent），
-        # 否则样本会退化成单条，无法形成分布。
         intents = COMPARE_INTENTS
         print(f"\nquery = {query!r}")
         print(f"  规划器实际输出 = {planned}   （本实验固定对比 {intents}）")
         emb_raw = (await provider.embed([query]))[0]
 
-        per_mode: dict[str, dict[str, dict]] = {"现状": {}, "分化": {}}
-        for mode in ("现状", "分化"):
-            for intent in intents:
-                normalized = normalize_customer_query(query, intent)
-                vec = emb_raw if mode == "现状" else (await provider.embed([normalized]))[0]
+        per_mode: dict[str, dict[str, dict]] = {"①现状": {}, "②改嵌入源": {}, "③scope分化": {}}
+        for intent in intents:
+            normalized = normalize_customer_query(query, intent)
+            base_scope = scope_for_customer_intent(intent)
+            emb_normalized = (await provider.embed([normalized]))[0]
+
+            variants = {
+                "①现状": (emb_raw, base_scope),
+                "②改嵌入源": (emb_normalized, base_scope),
+            }
+            # ③ 检索范围收窄到自身类目，但**门控嵌入仍是原始 query**
+            from app.common.knowledge_scope import KnowledgeScope
+            narrowed = KnowledgeScope(
+                knowledge_base_ids=base_scope.knowledge_base_ids,
+                categories=(intent,),
+                permission_levels=base_scope.permission_levels,
+            )
+            variants["③scope分化"] = (emb_raw, narrowed)
+
+            for mode, (vec, scope) in variants.items():
                 hits = await retriever.search(
-                    query=normalized, query_embedding=vec, top_k=args.top_k,
-                    scope=scope_for_customer_intent(intent))
+                    query=normalized, query_embedding=vec, top_k=args.top_k, scope=scope)
                 ids = {str(h.chunk_id) for h in hits}
-                sims = [float(h.vector_similarity) for h in hits
-                        if h.vector_similarity is not None]
+                # 门控相似度：三口径一律用**原始 query 嵌入**重新计算，
+                # 避免把"检索用哪个嵌入"与"门控用哪个嵌入"混为一谈。
+                # 这样比较的是"分化效果"，而不是"相似度被抬高的副作用"。
+                hits_raw = await retriever.search(
+                    query=normalized, query_embedding=emb_raw, top_k=args.top_k, scope=scope)
+                sims_raw = [float(h.vector_similarity) for h in hits_raw
+                            if h.vector_similarity is not None]
+                sims_used = [float(h.vector_similarity) for h in hits
+                             if h.vector_similarity is not None]
                 per_mode[mode][intent] = {
-                    "ids": ids, "best": max(sims) if sims else None,
+                    "ids": ids,
+                    "best": max(sims_raw) if sims_raw else None,      # 门控口径（恒定）
+                    "best_used": max(sims_used) if sims_used else None,  # 该口径实际返回的相似度
+                    "n": len(hits),
                 }
 
-        for mode in ("现状", "分化"):
+        for mode in per_mode:
             print(f"  --- 口径「{mode}」")
             for intent in intents:
                 d = per_mode[mode][intent]
-                print(f"      [{intent:<18}] best={d['best'] if d['best'] else 0:.4f}  "
+                print(f"      [{intent:<18}] 命中={d['n']}  "
+                      f"门控best={d['best'] if d['best'] else 0:.4f}  "
                       f"ids={sorted(x[:8] for x in d['ids'])}")
+                if d["n"] < args.top_k:
+                    print(f"          **警告：命中不足 top_k（{d['n']}<{args.top_k}）"
+                          f"-> 该口径下候选池可能过小，收窄有'检索不到'的风险**")
 
-        # 两两比较（同一口径下的不同 intent）
-        for mode in ("现状", "分化"):
+        for mode in per_mode:
             for a, b in itertools.combinations(intents, 2):
                 da, db = per_mode[mode][a], per_mode[mode][b]
                 inter = da["ids"] & db["ids"]
@@ -131,33 +160,38 @@ async def main() -> int:
                 summary.append((query, mode, a, b, jac, only_a, only_b,
                                 da["best"], db["best"]))
 
-        # 门控影响：best_sim 是否跨过 answer 阈值
-        print(f"  --- 门控影响（answer 阈值 0.65）")
-        for mode in ("现状", "分化"):
+        # 门控影响：门控相似度**恒定用原始 query**，故此处比较的是
+        # "该口径实际返回的相似度是否被抬高"（②会抬高、①③不会）
+        print(f"  --- 相似度是否被抬高（门控阈值 0.65）")
+        for mode in per_mode:
             for intent in intents:
-                b = per_mode[mode][intent]["best"]
-                crossed = (b is not None and b >= 0.65)
-                print(f"      [{mode}] {intent:<18} best={b if b else 0:.4f}  "
-                      f"{'>=0.65 直接放行' if crossed else '<0.65 落 judge/拒答带'}")
+                d = per_mode[mode][intent]
+                gate, used = d["best"], d["best_used"]
+                flag = ""
+                if gate is not None and used is not None and used - gate > 0.02:
+                    flag = "  <== 被抬高（门控会被绕过）"
+                print(f"      [{mode}] {intent:<18} 门控口径={gate if gate else 0:.4f}  "
+                      f"实际返回={used if used else 0:.4f}{flag}")
 
     print()
-    print("=" * 96)
+    print("=" * 104)
     print("汇总（多条问题取平均，避免单样本结论）")
-    print("=" * 96)
-    for mode in ("现状", "分化"):
+    print("=" * 104)
+    for mode in ("①现状", "②改嵌入源", "③scope分化"):
         rows = [s for s in summary if s[1] == mode]
         if not rows:
             continue
         avg_jac = sum(r[4] for r in rows) / len(rows)
         fully_same = sum(1 for r in rows if r[4] == 1.0)
         diverged = sum(1 for r in rows if r[4] < 1.0)
-        print(f"  口径「{mode}」: 配对 {len(rows)} 组  平均 Jaccard={avg_jac:.3f}  "
-              f"完全重合 {fully_same}  部分/完全分化 {diverged}")
+        print(f"  口径「{mode:<12}」配对 {len(rows)} 组  平均 Jaccard={avg_jac:.3f}  "
+              f"完全重合 {fully_same}  分化 {diverged}")
+
     print()
     print("判读：")
-    print("  若「分化」口径下 Jaccard 明显下降 -> 改嵌入源能让意图真正分化")
-    print("  若两者 Jaccard 都≈1.0        -> 即便改嵌入源也不分化，拆意图无检索收益")
-    print("  另需看 best_sim 是否普遍 >=0.65 —— 那意味着门控被整体放松，需单独评估风险")
+    print("  - 分化效果看 Jaccard 降幅（越低越分化）")
+    print("  - 门控安全看“实际返回相似度”是否比门控口径虚高（②会虚高）")
+    print("  理想口径 = Jaccard 低 且 相似度不虚高")
 
     await provider.close()
     await database.dispose()
