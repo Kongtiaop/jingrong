@@ -42,8 +42,14 @@ def extract_entities(query: str) -> dict[str, str]:
     """Extract explicit identifiers without guessing business meaning."""
     text = query.strip()
     entities: dict[str, str] = {}
+    # 标识符形态必须覆盖**生产真实格式**，否则用户粘贴自己的单号会识别不出。
+    # 实测（ISSUE-20260914-ORDER-NO-PATTERN-MISSES-REAL-FORMAT）：
+    #   orders.order_no 实际形如 `O98E346E6347D4BCB`（见 trading_service.py 生成
+    #   `f"O{uuid4().hex[:16].upper()}"`），而原正则只认 `ORD-` 前缀或"订单号:XXX"，
+    #   于是"我的订单 O98E346E6347D4BCB 状态" -> entities={}，单号提取不到。
+    # 现补上 `O` + 12~20 位十六进制（大小写均可），并保留原有形态以兼容历史/测试数据。
     patterns = {
-        "order_no": r"\b(?:ORD[-_A-Z0-9]+|订单号[:：]?\s*[A-Z0-9_-]{6,})\b",
+        "order_no": r"\b(?:ORD[-_A-Z0-9]+|O[A-F0-9]{12,20}|订单号[:：]?\s*[A-Z0-9_-]{6,})\b",
         "ticket_no": r"\b(?:WO[-_A-Z0-9]+|工单号[:：]?\s*[A-Z0-9_-]{6,})\b",
     }
     for key, pattern in patterns.items():

@@ -566,10 +566,46 @@ class CustomerModelToolLoop:
                 # 于是实测链路变成：order → workorder → knowledge → knowledge，
                 # 产出 3 个无关 task（pipeline 只有 1 个）。**失败时应留在同一意图内调参/改写，
                 # 而不是换用其他意图的工具。**
+                #
+                # 进一步修正（ISSUE-20260914-FAILURE-HINT-ENCOURAGES-RETRY）：
+                # 原 fact_not_found 文案含"可在本工具内换一个更明确的查询参数"，
+                # **这句在鼓励重试**。实测「我的订单 ORD-123456 状态」模型据此连续 3 轮改写参数
+                # （'订单 ORD-123456 状态' → 'ORD-123456' → '订单号 ORD-123456'），
+                # 第 4 轮又退回重复被闸门拦下，2 轮完全无效；而事实是**该单号确实不存在**
+                # （已查库确认：orders 表无此后缀，含"123456"的 order_no 为 0 条）。
+                # 关键区分：**标识符已给出 vs 标识符缺失**——
+                #   已给出（如含 ORD-xxx）仍查不到 → 该对象不存在，改写写法不可能改变结果，应停止；
+                #   未给出（如只说"查我的订单"）→ 应提示补充，此时"换参数"才是对的。
+                # 故按是否给出标识符**动态选择文案**，而不是一律鼓励或一律禁止重试。
+                # 判断"用户/模型是否已给出明确标识符"：复用项目既有的
+                # `extract_entities`（customer_intent.py，支持 order_no / ticket_no 等），
+                # 而不是自造正则——避免与既有识别口径不一致。
+                from app.services.customer_intent import extract_entities as _extract_entities
+                try:
+                    _ents = _extract_entities(str(tool_query or ""))
+                except Exception:  # noqa: BLE001 - 解析失败按"未给出"处理
+                    _ents = {}
+                has_identifier = any(
+                    k in _ents and str(_ents[k]).strip()
+                    for k in ("order_no", "ticket_no"))
+                if str(result.error or "") == "fact_not_found" and has_identifier:
+                    # 注意：本条文案必须**同时**满足两个约束，缺一不可：
+                    #   ① 禁止改调其他工具（ISSUE-20260914-FAILURE-HINT-MISLEADS-TOOL-SWITCH）
+                    #      —— 旧文案缺此句时，模型会去查工单/知识库，产出无关 task；
+                    #   ② 不再鼓励改写参数重试（ISSUE-20260914-FAILURE-HINT-ENCOURAGES-RETRY）
+                    #      —— 标识符已给出仍查不到，说明对象不存在，改写写法不可能改变结果。
+                    # 初版改这条时**漏掉了 ①**，被既有测试当场抓到（test_failure_hint_
+                    # forbids_switching_tools），说明该测试有效。
+                    fact_hint = (
+                        "已给出明确标识符仍查不到，说明**该对象不存在**（或不属于当前客户）。"
+                        "**不要改写参数重试**——对确定性查询，同一标识符改写写法结果必然相同；"
+                        "**请勿改调其他工具**。请直接停止（交由下游提示用户核对单号或转人工）。")
+                else:
+                    fact_hint = (
+                        "未查到该对象（标识符可能不存在或不属于当前客户）。"
+                        "**请勿改调其他工具**；若用户尚未提供明确标识符，可停止并让下游提示补充。")
                 failure_hint = {
-                    "fact_not_found": "未查到该对象（单号可能不存在或不属于当前客户）。"
-                                      "**请勿改调其他工具**；可在本工具内换一个更明确的查询参数，"
-                                      "或直接停止（让下游提示用户补充/转人工）。",
+                    "fact_not_found": fact_hint,
                     "ambiguous_product": "产品不明确。**请勿改调其他工具**；请补充完整产品名称，或停止。",
                     "low_confidence": "知识库无匹配依据。可在本摘要内改写 query 换种说法再试一次；"
                                       "**若已改写两次以上仍失败请立即停止**，不要改调其他工具。",

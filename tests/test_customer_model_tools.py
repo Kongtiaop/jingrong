@@ -609,11 +609,42 @@ def test_failed_tool_result_is_recorded_as_clarification():
     assert outcome.results, "失败结果应保留为 task 结果（否则丢失 fact_not_found 语义）"
     assert outcome.results[0]["status"] == "needs_clarification"
     assert outcome.results[0]["clarification"], "应带有'请补充信息'的 clarification"
-    # 回灌内容必须含失败原因、已试参数与可执行的调整建议
+    # 回灌内容必须含失败原因与已试参数
     feedback = provider.calls[1]["user"]
     assert "fact_not_found" in feedback, "应回灌具体 error"
     assert "ORD-1" in feedback, "应回灌已试参数"
-    assert "重复" in feedback or "换" in feedback, "应给出可执行的调整建议"
+    # 本用例的 query 里**已给出标识符 ORD-1**，故按新语义应提示"停止"，
+    # 而不是"换个参数再试"。此断言原为 `"重复" in feedback or "换" in feedback`，
+    # 那是在固定旧的"鼓励重试"文案（ISSUE-20260914-FAILURE-HINT-ENCOURAGES-RETRY）——
+    # 实测模型据此连续 3 轮改写参数（'订单 ORD-123456 状态' → 'ORD-123456' →
+    # '订单号 ORD-123456'），而该单号确实不存在，2 轮完全无效。故改为断言新语义。
+    assert "不要改写参数重试" in feedback, \
+        f"已给出标识符仍查不到时应明确禁止改参重试: {feedback[-260:]}"
+    assert "请勿改调其他工具" in feedback, "仍须禁止改调其他工具（两个约束缺一不可）"
+
+
+def test_failed_tool_result_without_identifier_asks_to_supplement():
+    """未给出标识符时（如只说"查订单"），提示应指向"补充信息"而非"停止"。
+
+    与上一条互补：两种场景的正确文案不同，故必须分别固定，
+    避免"一刀切"改文案时误伤另一种场景。
+    """
+    tools = FakeReadTools(results={
+        "get_my_order_status": SimpleNamespace(
+            success=False, data={}, answer="", error="fact_not_found")
+    })
+    provider = FakeProvider([
+        # 模型参数里**不含**单号
+        {"name": "get_my_order_status", "arguments": {"query": "我的订单"}},
+        None,
+    ])
+    loop = CustomerModelToolLoop(provider=provider, tools=tools, database=FakeDatabase(), max_rounds=2)
+    # query 也不含标识符
+    asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="查订单"))
+    feedback = provider.calls[1]["user"]
+    assert "请勿改调" in feedback, "未给出标识符时同样禁止换工具"
+    assert "不要改写参数重试" not in feedback, \
+        "未给出标识符时不应禁止重试——此时补充/明确参数才是对的"
 
 
 # ---------- 审计与 schema ----------
