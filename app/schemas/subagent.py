@@ -37,6 +37,9 @@ class SubagentMergeResult(BaseModel):
     fanout_mode: str = ""     # parallel / serial
     fanout_reason: str = ""   # 模型自述理由
     fanout_source: str = ""   # model / fallback_serial / disabled
+    # 融合期的去重统计。**必须可见**：否则"重复被去掉多少"无从追踪，
+    # 而"重复"正是本层最容易退化的地方（同一份数据/知识被子代理重复读）。
+    dedup: dict = Field(default_factory=dict)
 
 
 class FanoutDecision(BaseModel):

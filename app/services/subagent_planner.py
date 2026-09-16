@@ -49,6 +49,18 @@ logger = get_logger(__name__)
 # 只会放大 LLM 调用与延迟，不会提升答案质量。硬上限而非提示词上限。
 MAX_SUBTASKS = 4
 
+# 可以按 capability 折叠重复的**事实类**能力（返回只取决于 customer_id、与 query 无关）。
+# **刻意不包含** `customer_rag_knowledge` / `customer_risk_explanation`：
+# 知识检索的返回**取决于 query**，两个不同的知识问题折叠成一个会**丢答案**。
+# 详见 `parse_fanout_decision` 中的折叠逻辑说明。
+_DEDUPABLE_FACT_CAPABILITIES = frozenset({
+    "customer_asset_summary",
+    "customer_product_status",
+    "customer_order_status",
+    "customer_workorder_status",
+    "customer_risk_restriction",
+})
+
 # capability → 中文说明。**由服务端提供**（而不是让模型自己想象能力语义），
 # 否则模型只能从能力名猜用途，容易把"风险限制"当成"风险解释"用错。
 _CAPABILITY_DESC: dict[str, str] = {
@@ -200,6 +212,58 @@ def parse_fanout_decision(raw: dict | None, *, fallback_query: str,
     mode = str(args.get("mode") or "parallel").strip().lower()
     if mode not in {"parallel", "serial"}:
         mode = "parallel"
+
+    # ---- 同一份数据只读一次：按 capability 折叠重复的**事实类**子任务 ----
+    # 为什么需要（实测依据，2026-09-15）：模型会把**同一个数据源**拆成多个子任务，
+    # 例如"我的总资产"与"我的持仓数量"都映射到 `customer_asset_summary`，
+    # 实测导致 `get_my_asset_summary` 被调用 **2 次**、融合答案里
+    # "总资产 3,000,000.00 元" 出现 **2 次** —— 同一份数据读两遍并重复呈现。
+    #
+    # 关键设计判断：**只折叠"确定性事实工具"，不折叠 `customer_rag_knowledge`**。理由：
+    #   - 事实工具（资产/订单/工单/风险限制）的返回**只取决于 customer_id**，与 query 无关
+    #     → 同一 capability 查两次**必然**是同一份数据，折叠无信息损失；
+    #   - 知识检索的返回**取决于 query**："公司业务"与"开户流程"虽同属
+    #     `customer_rag_knowledge`，但检索的是**不同知识**，折叠会**丢答案**。
+    # 这个区分必须做对：笼统地"按 capability 去重"会把两个不同的知识问题合并成一个，
+    # 属于**用去重引入正确性缺陷**——比重复本身更糟。
+    folded: list[SubagentTask] = []
+    fold_index: dict[str, int] = {}                 # capability → 折叠后下标
+    old_to_new: dict[int, int] = {}                 # 原始下标 → 折叠后下标
+    folded_count = 0
+    for old_index, task in enumerate(tasks):
+        cap = task.read_only_capability
+        if cap in _DEDUPABLE_FACT_CAPABILITIES and cap in fold_index:
+            old_to_new[old_index] = fold_index[cap]
+            folded_count += 1
+            continue
+        old_to_new[old_index] = len(folded)
+        fold_index[cap] = len(folded)
+        folded.append(task)
+
+    if folded_count:
+        logger.info("subagent.fanout_folded_duplicate_facts folded=%d", folded_count)
+        tasks = folded
+        # 依赖下标必须**重新映射**后再过滤：折叠会让下标前移，不映射就会指向错位的任务。
+        #
+        # 注意：结果必须按**新下标**组织（长度 == 折叠后任务数），
+        # 而不是按旧下标 enumerate 一遍——后者会产出与 tasks 不等长的 depends_on，
+        # 下游按 index 取值时就会读到错误/缺失的依赖（这个错我第一版就写出来了，
+        # 被 test_folding_remaps_depends_on_correctly 当场抓到）。
+        new_deps: list[set[int]] = [set() for _ in tasks]
+        for old_index, deps in enumerate(depends_on):
+            if old_index not in old_to_new:
+                continue
+            target = old_to_new[old_index]
+            for d in deps:
+                if d in old_to_new:
+                    mapped = old_to_new[d]
+                    if mapped != target:          # 折叠成同一个任务时不算依赖自身
+                        new_deps[target].add(mapped)
+        depends_on = [sorted(s) for s in new_deps]
+        # 重新编号 task_id，保持与 depends_on 下标一致
+        for i, t in enumerate(tasks):
+            t.task_id = f"sub-{i + 1}"
+
     return FanoutDecision(
         mode=mode,
         tasks=tasks,

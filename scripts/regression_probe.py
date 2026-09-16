@@ -274,6 +274,50 @@ async def main() -> int:
         ok = False
     print(f"  [{'OK ' if safe else '**差**'}] 写操作能力被拒（保留={caps}）")
 
+    # G5. 去重：同一份内容/数据不得重复呈现、失败提示不得丢失
+    #     用户提出的质疑，见 BUG_LOG
+    #     ISSUE-20260915-SUBAGENT-NO-DEDUP-DUPLICATE-DATA-AND-KNOWLEDGE
+    from app.schemas.subagent import SubagentResult
+    from app.services.subagent_executor import SubagentExecutor
+
+    m = SubagentExecutor._merge([
+        SubagentResult(task_id="s1", status="success", confidence=0.9,
+                       summary="公司主营财富管理（引用1）。"),
+        SubagentResult(task_id="s2", status="success", confidence=0.9,
+                       summary="公司主营财富管理。"),
+    ])
+    cnt = m.answer.count("公司主营财富管理")
+    dedup_ok = cnt == 1
+    if not dedup_ok:
+        ok = False
+    print(f"  [{'OK ' if dedup_ok else '**差**'}] 融合去重（相同内容出现 {cnt} 次，应为 1）")
+
+    fold = parse_fanout_decision({"mode": "parallel", "tasks": [
+        {"capability": "customer_asset_summary", "query": "总资产"},
+        {"capability": "customer_asset_summary", "query": "持仓数量"}]}, fallback_query="q")
+    fold_ok = len(fold.tasks) == 1
+    if not fold_ok:
+        ok = False
+    print(f"  [{'OK ' if fold_ok else '**差**'}] 同一份数据只读一次（折叠后 task 数={len(fold.tasks)}）")
+
+    keep = parse_fanout_decision({"mode": "parallel", "tasks": [
+        {"capability": "customer_rag_knowledge", "query": "公司主营业务"},
+        {"capability": "customer_rag_knowledge", "query": "开户流程"}]}, fallback_query="q")
+    keep_ok = len(keep.tasks) == 2
+    if not keep_ok:
+        ok = False
+    print(f"  [{'OK ' if keep_ok else '**差**'}] 不同知识不折叠（避免丢答案，task 数={len(keep.tasks)}，应为 2）")
+
+    hint = SubagentExecutor._merge([
+        SubagentResult(task_id="s1", status="success", confidence=0.9, summary="总资产 300 万。"),
+        SubagentResult(task_id="s2", status="partial", error="fact_not_found",
+                       summary="请补充更明确的订单号。"),
+    ])
+    hint_ok = "请补充" in hint.answer
+    if not hint_ok:
+        ok = False
+    print(f"  [{'OK ' if hint_ok else '**差**'}] 失败方可操作提示未被丢弃")
+
     print()
     print(_line("="))
     print(f"回归结果：{'全部通过' if ok else '**存在失败项，见上方 ** 标记**'}")

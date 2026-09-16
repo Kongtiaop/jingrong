@@ -115,15 +115,18 @@ def test_parse_envelope_and_bare_arguments_agree():
 
 # ---------- 2. runner：capability → 只读工具 ----------
 
-def _citation(text: str = "主营财富管理") -> dict:
+def _citation(text: str = "主营财富管理", chunk_id: str = "c1") -> dict:
     """与 `KnowledgeCitation` 真实字段对齐（8 个必填字段）。
 
     初版测试只给了 chunk_id/content 两个字段 → `KnowledgeCitation(**c)` 抛 TypeError
     → 生成被静默跳过、断言失败。**fixture 必须与真实结构一致**，
     否则测的是假路径（同一类坑在这个项目里已出现过多次）。
+
+    `chunk_id` 可指定：引用去重是按 chunk_id 判定的，测试"两条不同引用"时
+    必须给不同的 id，否则会被正确地判为同一个 chunk。
     """
     return {
-        "chunk_id": "c1", "document_id": "d1", "version_id": "v1", "content": text,
+        "chunk_id": chunk_id, "document_id": "d1", "version_id": "v1", "content": text,
         "score": 0.9, "title_path": "产品服务手册", "page_number": 1,
         "metadata": {}, "vector_similarity": 0.8,
     }
@@ -678,4 +681,192 @@ def test_serial_with_default_runner_still_gets_prior_facts():
     # 后序子任务必须拿到前序结论 —— 证明默认 runner 也被包装了
     assert len(seen_prior) == 2
     assert "答-sub-1" in seen_prior[1], f"默认 runner 未被包装，前序事实丢失：{seen_prior}"
+
+
+# ---------- 8. 去重：同一份数据/知识不得被重复读、重复呈现 ----------
+
+def test_merge_dedups_identical_summaries():
+    """回归：两个子代理给出相同内容时，融合答案必须只出现一次。
+
+    旧实现无条件拼接 → `[sub-1] 公司主营财富管理…\\n[sub-2] 公司主营财富管理…`。
+    与 ISSUE-20260914-SUMMARIZE-DUPLICATE-FILLER 同族（该模块已犯过一次）。
+    """
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="success", confidence=0.9,
+                       summary="公司主营财富管理（引用1）。"),
+        SubagentResult(task_id="sub-2", status="success", confidence=0.9,
+                       summary="公司主营财富管理（引用1）。"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert merged.answer.count("公司主营财富管理") == 1, f"重复：{merged.answer!r}"
+    assert merged.dedup["dropped_duplicate_summaries"] == 1
+
+
+def test_merge_dedups_reworded_same_content():
+    """措辞不同但内容相同（引用标注/标点/空白差异）也应去重。
+
+    实测：同一份知识由不同子代理生成时措辞常不同，纯字符串相等去不掉。
+    """
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="success", confidence=0.9,
+                       summary="公司主营财富管理。"),
+        SubagentResult(task_id="sub-2", status="success", confidence=0.9,
+                       summary="公司主营财富管理（引用 2）"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert merged.answer.count("公司主营财富管理") == 1, f"未去重：{merged.answer!r}"
+
+
+def test_merge_keeps_distinct_content():
+    """去重不能误伤**内容不同**的答案。"""
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="success", confidence=0.9,
+                       summary="您的总资产为 3,000,000.00 元。"),
+        SubagentResult(task_id="sub-2", status="success", confidence=0.9,
+                       summary="您的订单 O123 已成交。"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert "总资产" in merged.answer and "订单" in merged.answer
+
+
+def test_merge_does_not_conflate_risk_levels():
+    """**关键**：去重归一化绝不能把 R1 与 R2 视为同一条。
+
+    `_content_key` 去掉标点/空白，但**必须保留数字与字母**——
+    否则"可购买 R1"与"可购买 R2"会被合并，属于用去重引入正确性缺陷。
+    """
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="success", confidence=0.9,
+                       summary="C4 客户可购买 R1 产品。"),
+        SubagentResult(task_id="sub-2", status="success", confidence=0.9,
+                       summary="C4 客户可购买 R2 产品。"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert "R1" in merged.answer and "R2" in merged.answer, f"等级被误合并：{merged.answer!r}"
+
+
+def test_merge_keeps_actionable_hint_from_failed_subtask():
+    """回归：失败方的**可操作提示**不能被丢弃。
+
+    旧实现只拼接 success 的 summary → `fact_not_found` 的"请补充订单号"整个丢失，
+    用户只看到"（部分子任务未完成）"，**不知道要补充什么**。
+    """
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="success", confidence=0.9,
+                       summary="您的总资产为 3,000,000.00 元。"),
+        SubagentResult(task_id="sub-2", status="partial", error="fact_not_found",
+                       summary="请补充更明确的查询对象或订单/产品信息。"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert "请补充" in merged.answer, f"可操作提示被丢弃：{merged.answer!r}"
+    assert "总资产" in merged.answer, "成功内容不应丢失"
+    assert merged.overall_status == "partial"
+
+
+def test_merge_all_failed_shows_actionable_hint_not_vague_note():
+    """全部失败时也要给出可操作提示，而不是只说"部分子任务未完成"。"""
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="failed", error="subagent_timeout"),
+        SubagentResult(task_id="sub-2", status="partial", error="fact_not_found",
+                       summary="请补充更明确的订单号。"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert "请补充" in merged.answer
+    assert merged.overall_status == "partial"
+
+
+def test_merge_technical_errors_do_not_leak_into_answer():
+    """纯技术错误（超时/能力未映射）不应出现在用户可见文案里。"""
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="failed", error="subagent_timeout"),
+        SubagentResult(task_id="sub-2", status="failed", error="capability_not_mapped"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert "subagent_timeout" not in merged.answer
+    assert "capability_not_mapped" not in merged.answer
+    assert merged.answer.strip()  # 仍要给出概括性说明
+
+
+def test_merge_reports_citation_duplication():
+    """引用级重复必须被统计出来（实测三个近义 query 重复率 47%）。"""
+    from app.services.subagent_executor import SubagentExecutor
+    shared = [_citation("公司主营财富管理", "k1"), _citation("持有基金销售牌照", "k2")]
+    results = [
+        SubagentResult(task_id="sub-1", status="success", confidence=0.9,
+                       summary="答案一", data={"citations": shared}),
+        SubagentResult(task_id="sub-2", status="success", confidence=0.9,
+                       summary="答案二", data={"citations": shared}),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert merged.dedup["unique_citations"] == 2
+    assert merged.dedup["duplicate_citation_refs"] == 2
+
+
+# ---------- 9. 同一份数据只读一次，但不同知识不可折叠 ----------
+
+def test_parse_folds_duplicate_fact_capabilities():
+    """同一事实 capability 出现两次 → 折叠成一个（同一份数据只读一次）。
+
+    实测：模型把"我的总资产"与"我的持仓数量"都映射到 customer_asset_summary，
+    导致 get_my_asset_summary 被调 2 次、答案里总资产出现 2 次。
+    """
+    d = parse_fanout_decision({"mode": "parallel", "tasks": [
+        {"capability": "customer_asset_summary", "query": "我的总资产"},
+        {"capability": "customer_asset_summary", "query": "我的持仓数量"},
+    ]}, fallback_query="q")
+    assert len(d.tasks) == 1, f"同一事实能力未折叠：{[t.read_only_capability for t in d.tasks]}"
+
+
+def test_parse_does_not_fold_knowledge_capabilities():
+    """**关键**：知识类 capability 不可折叠 —— 不同 query 检索的是不同知识。
+
+    笼统按 capability 去重会把"公司业务"与"开户流程"合并成一个，**丢答案**。
+    这比重复更糟：属于用去重引入正确性缺陷。
+    """
+    d = parse_fanout_decision({"mode": "parallel", "tasks": [
+        {"capability": "customer_rag_knowledge", "query": "公司主营业务"},
+        {"capability": "customer_rag_knowledge", "query": "开户流程"},
+    ]}, fallback_query="q")
+    assert len(d.tasks) == 2, "知识类子任务被误折叠 → 会丢答案"
+    assert {t.query for t in d.tasks} == {"公司主营业务", "开户流程"}
+
+
+def test_folding_remaps_depends_on_correctly():
+    """折叠会让下标前移，depends_on 必须重映射，否则指向错位任务。"""
+    d = parse_fanout_decision({"mode": "serial", "tasks": [
+        {"capability": "customer_asset_summary", "query": "资产"},
+        {"capability": "customer_asset_summary", "query": "持仓"},   # 折叠 → 并入下标0
+        {"capability": "customer_rag_knowledge", "query": "解释", "depends_on": [0, 1]},
+    ]}, fallback_query="q")
+    assert len(d.tasks) == 2
+    assert d.depends_on[1] == [0], f"依赖未重映射：{d.depends_on}"
+    assert len(d.depends_on) == len(d.tasks)
+
+
+def test_end_to_end_folded_fact_reads_data_once():
+    """端到端：同一份数据只读一次。"""
+    tools = _FakeTools()
+    decision = {"mode": "parallel", "tasks": [
+        {"capability": "customer_asset_summary", "query": "我的总资产"},
+        {"capability": "customer_asset_summary", "query": "我的持仓数量"},
+    ]}
+    svc, planner = _service(decision, runner=None)
+    runner = ReadOnlySubagentRunner(tools=tools)
+
+    async def go():
+        return await svc.run_read_only_fanout(
+            customer_id="c1", conversation_id="cv1", query="资产和持仓",
+            planner=planner, runner=runner, enabled=True)
+
+    res = asyncio.run(go())
+    assert len(tools.calls) == 1, f"同一份数据被读了 {len(tools.calls)} 次"
+    assert tools.calls[0]["name"] == "get_my_asset_summary"
+    assert res.answer.count("工具答案") == 1, f"答案重复：{res.answer!r}"
 

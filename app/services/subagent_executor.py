@@ -35,6 +35,31 @@ SubagentRunner = Callable[[SubagentTask], Awaitable[SubagentResult]]
 AuditCallback = Callable[[SubagentTask, SubagentResult, float], Awaitable[None]]
 
 
+def _content_key(text: str) -> str:
+    """把一段回答归一化成去重键。
+
+    为什么要归一化而不是直接比字符串（实测依据）：两个子代理对**同一份知识**
+    生成的答案往往**措辞不同**（如"公司主营财富管理。"vs"公司主营业务为财富管理"），
+    直接相等比较**去不掉**。故做轻量归一化：
+      - 去掉空白（含换行/全角空格）；
+      - 去掉常见标点与引用标注（"（引用1）"这类）；
+      - 统一大小写。
+    保留**中文字符与数字**——它们是内容的实质，不能去掉（否则"R1"和"R2"会被视为相同，
+    而那正是必须区分的内容）。
+
+    刻意**不做**语义级去重（如向量相似度聚类）：那会引入不确定性与阈值调参，
+    而融合层的设计要求是**确定性**（见设计文档 §5.5）。此处只处理
+    "同一份知识的不同表述"中最明显的表层差异。
+    """
+    import re as _re
+    s = str(text or "")
+    s = _re.sub(r"\s+", "", s)
+    # 引用标注形如（引用1）/（引用 1）/ [引用1] —— 它们是出处标记，不是内容
+    s = _re.sub(r"[（(\[【]?\s*引用\s*\d+\s*[)）\]】]?", "", s)
+    s = _re.sub(r"[，。、；：！？,.;:!?\"'“”‘’\-—…·]", "", s)
+    return s.strip().lower()
+
+
 async def _noop_audit(_task: SubagentTask, _result: SubagentResult, _dur: float) -> None:
     return None
 
@@ -125,9 +150,67 @@ class SubagentExecutor:
 
     @staticmethod
     def _merge(results: list[SubagentResult]) -> SubagentMergeResult:
+        """确定性融合：**去重 + 保留可操作提示**，不再无条件拼接。
+
+        修复三个实测缺陷（2026-09-15，均有复现证据）：
+
+        1. **同一内容重复拼接**：两个子代理命中同一 chunk、给出相同答案时，
+           旧实现输出 `[sub-1] 公司主营财富管理…\\n[sub-2] 公司主营财富管理…`。
+           现按 `summary` 归一化去重（相同内容只保留置信度最高的那条）。
+           **这与 `ISSUE-20260914-SUMMARIZE-DUPLICATE-FILLER` 同族**——
+           该类缺陷在该模块已犯过一次（`CustomerTaskExecutor.summarize` 无条件拼接
+           导致占位文案重复），此处不再重犯。
+
+        2. **引用级重复**：不同子代理命中**同一批 chunk**（实测三个近义 query
+           共返回 15 条引用、去重后仅 8 条，重复率 47%），答案里会出现同一份知识
+           的不同表述。现按 `citations[].chunk_id` 去重，并把去重统计写入
+           `data.dedup` 供观测（**不静默丢弃**，让"重复率"可被量化追踪）。
+
+        3. **失败方的可操作提示被整个丢弃**：旧实现只拼接 `status == "success"`
+           的 summary，导致 `fact_not_found` 产生的"请补充订单号"这类**可操作提示
+           完全丢失**，用户只看到"（部分子任务未完成）"——
+           比"重复文案"更糟：**用户不知道要补充什么**。
+           现改为：失败/部分失败子任务若带有**面向用户的提示**（非空 summary，
+           且不是纯粹的空串），以"待补充"段落单独呈现；纯技术错误
+           （如 `subagent_timeout`、`capability_not_mapped`）不进用户可见文案，
+           只保留在 `results[].error` 里供排查。
+
+        排序保持确定性：先按置信度降序、再按 task_id，保证同一输入结果稳定。
+        """
         ok = [r for r in results if r.status == "success"]
         ok_sorted = sorted(ok, key=lambda r: (-r.confidence, r.task_id))
-        parts = [f"[{r.task_id}] {r.summary}" for r in ok_sorted if (r.summary or "").strip()]
+
+        # ---- 1. 按内容去重（保留置信度最高者，顺序已保证确定性）----
+        parts: list[str] = []
+        seen_content: set[str] = set()
+        dedup_content = 0
+        for r in ok_sorted:
+            summary = (r.summary or "").strip()
+            if not summary:
+                continue
+            key = _content_key(summary)
+            if key in seen_content:
+                dedup_content += 1
+                continue
+            seen_content.add(key)
+            parts.append(f"[{r.task_id}] {summary}")
+
+        # ---- 2. 失败方的可操作提示：单独成段，不与成功内容混排 ----
+        pending_parts: list[str] = []
+        seen_pending: set[str] = set()
+        for r in sorted(results, key=lambda x: x.task_id):
+            if r.status == "success":
+                continue
+            hint = (r.summary or "").strip()
+            if not hint:
+                # 无面向用户的提示（如纯超时）→ 不进用户可见文案，仅在 error 中留痕
+                continue
+            key = _content_key(hint)
+            if key in seen_pending:
+                continue
+            seen_pending.add(key)
+            pending_parts.append(hint)
+
         failed = [r for r in results if r.status == "failed"]
         partial = [r for r in results if r.status == "partial"]
         if ok and (failed or partial):
@@ -138,8 +221,37 @@ class SubagentExecutor:
             overall = "partial"
         else:
             overall = "failed"
+
         answer = "\n".join(parts)
-        if failed or partial:
+        if pending_parts:
+            # 明确标注"需补充"而不是只说"部分未完成"——前者可操作，后者只会让用户困惑。
+            answer = (answer + "\n" + "\n".join(pending_parts)).strip()
+        elif failed or partial:
+            # 没有任何可操作提示时，才退回到原先的概括性说明
             note = "（部分子任务未完成）" if overall == "partial" else "（子任务失败）"
             answer = f"{answer}{note}".strip()
-        return SubagentMergeResult(results=results, overall_status=overall, answer=answer)
+
+        # ---- 3. 引用级去重统计（观测用，便于持续追踪重复率）----
+        seen_chunks: set[str] = set()
+        duplicate_chunks = 0
+        for r in results:
+            for c in (r.data or {}).get("citations") or []:
+                if not isinstance(c, dict):
+                    continue
+                cid = str(c.get("chunk_id") or c.get("id") or "")
+                if not cid:
+                    continue
+                if cid in seen_chunks:
+                    duplicate_chunks += 1
+                else:
+                    seen_chunks.add(cid)
+
+        return SubagentMergeResult(
+            results=results, overall_status=overall, answer=answer,
+            dedup={
+                "dropped_duplicate_summaries": dedup_content,
+                "duplicate_citation_refs": duplicate_chunks,
+                "unique_citations": len(seen_chunks),
+                "pending_hints": len(pending_parts),
+            },
+        )
