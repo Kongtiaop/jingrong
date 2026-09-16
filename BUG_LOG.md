@@ -3915,3 +3915,102 @@ C:\Users\tx360\Desktop\金融 - 副本\金融政策\个人投资者适当性管�
 若只跑一轮看到 2/5 就继续改语料，则会改错地方。
 
 ---
+
+---
+
+### ISSUE-20260915-JWT-DECODE-DUPLICATED
+- 日期：2026-09-15
+- 分类：安全 / 认证 / 代码重复
+- 严重程度：**P2（潜在权限漏洞）**
+- 状态：**FIXED**
+
+**问题**：HTTP 与 WebSocket 两条认证通道**各写了一遍** JWT 解析与校验：
+- `current_user`（HTTP，原 `auth.py:15`）
+- `websocket_current_user`（WS，原 `auth.py:74`）
+
+两份实现完全相同（`jwt.decode` + `payload["type"] != "access"` + 按 sub 查启用用户），
+但**没有任何机制保证它们保持一致**。
+
+**为什么是 P2 而不是"代码整洁"问题**：
+任何一处收紧校验、另一处没跟上，就形成**可绕过的权限通道**。例如将来加
+token 版本/黑名单/签发者（iss/aud）校验，若只改 HTTP 侧：
+→ **HTTP 拒绝、WebSocket 仍放行**。
+而两条路径从不互相报错，**普通功能测试不会失败**——这是最典型的"静默权限分叉"。
+
+**修复**：抽出单一实现，两侧只在**失败形态**上不同：
+```python
+def _decode_access_token(token) -> dict:      # 解析 + type 校验；失败返回 {}
+async def _load_active_user(app, subject)     # 按 sub 查 status=active 用户（含预加载）
+```
+- `current_user`：失败 → `HTTPException(401)`
+- `websocket_current_user`：失败 → `None`（WS 无法返回 HTTP 状态码）
+
+**验证**：
+- 新增 `tests/test_auth_channel_consistency.py`（8 个用例）：合法 token 通过 /
+  refresh token 被拒 / 缺 type 被拒 / 签名错 / 过期 / 垃圾串；
+- **两条结构性护栏**：断言 `auth.py` 中 `jwt.decode` **只出现 1 次**、
+  `selectinload(User.roles)` **只出现 1 次**。若将来有人再抄一份，用例立即失败；
+- **反向验证**：故意在 ws 侧注入一份重复的 `jwt.decode`（实测 2 处）→
+  `test_both_channels_share_one_implementation` **失败**；恢复后 8 个全过。
+  （证明护栏真的有效，不是"恰好通过"）
+
+**方法论教训**：
+**"重复代码"的风险等级取决于它守的是什么。**
+重复一段格式化逻辑是整洁问题；重复一段**鉴权逻辑**是安全问题——
+因为分叉后的两侧**不会互相报错**，缺陷只在被利用时才暴露。
+对这种地方，除了合并实现，还应加**结构性用例**防止再次分叉
+（普通行为测试测不出"两份实现"这个事实）。
+
+---
+
+### ISSUE-20260915-NO-GATEWAY-GUARDS
+- 日期：2026-09-15
+- 分类：网关保护 / 可用性 / 安全
+- 严重程度：P2
+- 状态：**FIXED**
+
+**问题**：应用层完全没有网关级护栏——无限流、无全局超时、无请求体大小限制、无 GZip。
+（差距清单 C 类项，此前只记录未做。）
+
+**关键发现**：`app/common/rate_limit/redis_limiter.py` 的 `RedisRateLimiter`
+**早已实现但从未挂载**（全仓 0 个调用点）——与 `common/dependencies/request.py`
+的三个 DI 辅助函数是**同一种病**：**实现了、导出了、没人用**。
+故本次是**接线**而非重写。
+
+**修复**：新增 `app/common/middleware/request_guard.py`，并挂到最外层：
+
+| 护栏 | 配置项 | 默认 | 超限 |
+|---|---|---|---|
+| 请求体大小 | `REQUEST_MAX_BODY_BYTES` | 12MB | 413 |
+| 全局超时 | `REQUEST_TIMEOUT_SECONDS` | 120s | 504 |
+| 按 IP 限流 | `RATE_LIMIT_REQUESTS` | **0=关** | 429 |
+| GZip | `GZIP_MIN_SIZE_BYTES` | 1024 | 自动 |
+| CORS 白名单 | `CORS_ALLOW_ORIGINS` | localhost×2 | — |
+
+**用纯 ASGI 而非 `BaseHTTPMiddleware`**：后者**只处理 HTTP**，
+而本项目最需要保护的实时 Agent 通道是 WebSocket。纯 ASGI 可同时覆盖两者，
+故限流对 ws 也生效（ws 超限回 `websocket.close(1013)`）。
+
+**三个关键设计判断（每个都有实测）**：
+1. **限流器故障必须"放行"而非"拒绝"**：Redis 抖动时保守拒绝会让**整个服务不可用**。
+   限流是保护措施，不是业务前置条件。实测：限流器抛异常时请求仍 200。
+2. **健康检查豁免限流**：否则探活被 429，编排系统误判服务不健康。
+   实测 `RATE_LIMIT_REQUESTS=1` 时 `/ping` 429、`/api/v1/health` 仍 200。
+3. **限流默认关闭**：开启会改变既有压测/回归行为（并发测试出现 429），故默认 0。
+
+**顺带修复**：CORS 白名单此前**硬编码**在 `main.py`（生产换域名必须改代码），
+改为 `CORS_ALLOW_ORIGINS` 配置驱动，并加用例断言其与 settings 一致。
+
+**验证**：`tests/test_request_guard.py` 16 个用例，每条护栏都验证
+**"生效"与"不误伤"两个方向**（只测"能拦"会漏掉误拦）；全量 `541 passed`。
+**踩坑记录**：GZip 一度看似"客户端没声明也压缩"，实为 `TestClient` 默认注入
+`Accept-Encoding` 的**测试假象**；用 `Accept-Encoding: identity` 复测确认行为正确。
+
+**方法论教训**：
+1. **保护性设施的降级方向要按"失效后果"选**：限流/熔断这类应 **fail-open**
+   （放行），而鉴权/资金这类应 **fail-closed**（拒绝）。选错方向会把
+   "局部故障"放大成"整体不可用"。
+2. **"已实现但未接线"是本项目的重复模式**（长期记忆、子代理层、限流器、DI 辅助函数）。
+   排查"某能力缺失"时应先 grep 是否**已有实现没挂上**，而不是直接新写。
+
+---

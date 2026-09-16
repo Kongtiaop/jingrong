@@ -109,6 +109,22 @@ class Settings(BaseSettings):
     workorder_upload_dir: str = "uploads/workorders"
     workorder_attachment_max_bytes: int = 10 * 1024 * 1024
 
+    # ---- 网关级保护（中间件）----
+    # 请求体大小上限：超过直接 413，避免大 body 打满内存/带宽。
+    # 必须 > 工单附件上限（workorder_attachment_max_bytes），否则上传会被全局限制先拦掉。
+    request_max_body_bytes: int = 12 * 1024 * 1024
+    # 全局请求超时（秒）：超过则返回 504，避免慢请求长期占用 worker。
+    # 注意：这是**兜底**，比所有业务超时都长；设太短会误杀正常的 LLM 长调用。
+    # LLM 相关最坏耗时见 tests/test_llm_resource_guard.py。
+    request_timeout_seconds: float = 120.0
+    # CORS 白名单（逗号分隔）。此前硬编码在 main.py，生产换域名要改代码；现改为配置。
+    cors_allow_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
+    # 限流（按 IP 的固定窗口）。0 = 关闭（默认关闭，避免影响压测与既有回归）。
+    rate_limit_requests: int = 0
+    rate_limit_window_seconds: int = 60
+    # 超过此长度的响应启用 GZip（字节）。0 = 关闭。
+    gzip_min_size_bytes: int = 1024
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

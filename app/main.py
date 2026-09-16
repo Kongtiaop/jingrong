@@ -9,6 +9,7 @@ from app.common.exceptions import AppException, app_exception_handler, validatio
 from app.common.logging import configure_logging
 from app.common.logging.config import get_logger
 from app.common.middleware.trace import TraceIdMiddleware
+from app.common.middleware.request_guard import RequestGuardMiddleware
 from app.core.settings import get_settings
 from app.db.health import DatabaseHealth
 from app.db.schema import ensure_schema
@@ -68,6 +69,31 @@ async def _run_all_seeds(database: Database, settings) -> None:
     await ensure_data_catalog_seed(database)
 
 
+def _install_rate_limiter(settings, redis_client) -> None:
+    """把 Redis 限流器挂到已注册的 Guard 中间件上。
+
+    为什么在 lifespan 里挂：`add_middleware` 发生在**模块导入时**，
+    那时 `RedisClient` 还没连接；而 Starlette 把中间件实例存在
+    `app.middleware_stack`（首次请求时才构建）。这里直接遍历
+    `app.user_middleware` 的 kwargs 改不了已构建实例，故采用
+    **模块级可注入引用**：Guard 从 `app.state` 之外拿不到 redis，
+    改由本函数把 limiter 实例写到一个模块级槽位，Guard 读该槽位。
+
+    权衡：这比"把 redis 传进中间件构造器"要绕，但避免了在导入期建立连接
+    （导入期连接会污染所有测试与 CLI 脚本）。
+    """
+    if int(getattr(settings, "rate_limit_requests", 0) or 0) <= 0:
+        return
+    try:
+        from app.common.rate_limit import RedisRateLimiter
+        from app.common.middleware import request_guard
+        request_guard.set_limiter(RedisRateLimiter(redis_client.client))
+        logger.info("rate_limiter_enabled limit=%s window_s=%s",
+                    settings.rate_limit_requests, settings.rate_limit_window_seconds)
+    except Exception as exc:  # noqa: BLE001 - 限流器装不上不阻塞启动
+        logger.error("rate_limiter_install_failed err=%s — 限流未生效", type(exc).__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -81,6 +107,7 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.database = database
     app.state.redis = redis_client
+    _install_rate_limiter(settings, redis_client)
     app.state.health_service = HealthService(DatabaseHealth(database), redis_client, QwenProvider(settings), settings)
     app.state.task_service = TaskService(database, settings)
     app.state.auth_service = AuthService(database, settings)
@@ -120,8 +147,35 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Wealth Manager API", version="0.1.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# ---- 中间件注册顺序（Starlette 逆序包裹：**后 add 的在最外层**）----
+# 目标执行顺序（外→内）：
+#   RequestGuard（限流/体限/超时） → TraceId → CORS → GZip → 路由
+# 理由：
+#   * Guard 在外层：体限/限流应**先于**业务执行，且被限流的请求也要能观测到；
+#   * TraceId 次之：仍能覆盖被 CORS 拒绝/404/401 的请求（实测验证过）；
+#   * CORS 在 GZip 之外：CORS 头必须能加到压缩响应上；
+#   * GZip 在最内：只压缩业务真实产生的响应。
+# 故注册顺序（先 add 的在内层）必须是：GZip → CORS → TraceId → Guard，
+# 其中 GZip 由 Guard 内部包住（见 RequestGuardMiddleware._inner），故此处不单独 add。
+def _cors_origins() -> list[str]:
+    """CORS 白名单改为**配置驱动**（此前硬编码 localhost，生产换域名要改代码）。"""
+    raw = getattr(get_settings(), "cors_allow_origins", "") or ""
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+app.add_middleware(CORSMiddleware, allow_origins=_cors_origins(), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(TraceIdMiddleware)
+# Guard 最后 add → 处于最外层，最先看到请求、最后写响应。
+app.add_middleware(
+    RequestGuardMiddleware,
+    max_body_bytes=get_settings().request_max_body_bytes,
+    timeout_seconds=get_settings().request_timeout_seconds,
+    limiter=None,  # lifespan 后才能拿到 redis；由 startup 事件挂上（见下方 _install_rate_limiter）
+    rate_limit=get_settings().rate_limit_requests,
+    rate_window_seconds=get_settings().rate_limit_window_seconds,
+    gzip_min_size=get_settings().gzip_min_size_bytes,
+)
 app.add_exception_handler(AppException, app_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.include_router(api_router)
