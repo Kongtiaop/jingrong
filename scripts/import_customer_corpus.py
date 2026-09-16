@@ -28,6 +28,10 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 CORPUS_DIR = _ROOT / "knowledge_corpus"
+# 政策类语料目录。**必须一并校验**：`policy` 类目的 R1–R5 曾经就是从这里进入线上答案的
+# （"C4客户能买什么"命中的正是《个人投资者适当性管理指南》的匹配矩阵），
+# 只校验 knowledge_corpus/ 会漏掉一半语料。
+POLICY_DIR = _ROOT / "金融政策"
 
 # 语料文件 → (类目, 权限)。两者都必须通过下方校验。
 CORPUS_PLAN: dict[str, tuple[str, str]] = {
@@ -55,6 +59,47 @@ def _known_permissions() -> set[str]:
     for scope in (KnowledgeScope.public_customer(), KnowledgeScope.internal_advisor()):
         perms.update(scope.permission_levels)
     return perms
+
+
+# 数据模型中真实存在的风险等级标签（`product.risk_level` 与
+# `customer_risk_assessment.risk_level` 实测均为 C1–C5）。
+# 见 ISSUE-20260915-RISK-LEVEL-VOCAB-MISMATCH-R-AND-C。
+_VALID_RISK_LEVELS = frozenset({"C1", "C2", "C3", "C4", "C5"})
+# 禁止出现的等级写法 → 出现即视为语料与数据模型脱节。
+# **为什么用正则而不是简单子串**：`R1` 会误伤 `R10`、英文缩写（如 `R&D`）等；
+# 用 `R` 后紧跟单个 1-5 且非字母数字的边界，才能精确匹配"风险等级 R3"这类写法。
+import re as _re  # noqa: E402
+_FORBIDDEN_LEVEL_PATTERN = _re.compile(r"(?<![A-Za-z0-9])R[1-5](?![0-9A-Za-z])")
+
+
+def validate_risk_level_vocabulary(text: str, filename: str) -> list[str]:
+    """校验语料中的风险等级词汇必须与数据模型一致（**纯函数，便于单测**）。
+
+    为什么需要这条校验（真实缺陷，已复现到用户答案层）：
+    语料曾用 **R1–R5** 描述产品风险等级，而 `product.risk_level` 实际是 **C1–C5**。
+    后果：答案是"C4进取型投资者可购买 **R1至R4**"——一句话混用两套编号，
+    而 **R1–R5 在数据模型中根本不存在**，用户据此在 App 里找不到对应产品。
+
+    为什么之前没被发现：检索只看语义相似度（R3 与 C3 语义等价 → 命中正常）、
+    `evidence_status=sufficient`、答案通顺有引用 —— **所有流程指标都是绿的**，
+    只有人肉读答案才能发现术语是错的。
+    故必须在**导入期**用确定性校验拦住，而不是靠人工校对
+    （原则：能靠校验保证的，不要只靠人工核对）。
+    """
+    errors: list[str] = []
+    found = sorted({m.group(0) for m in _FORBIDDEN_LEVEL_PATTERN.finditer(text)})
+    if found:
+        errors.append(
+            f"{filename}: 出现数据模型中不存在的风险等级写法 {found} —— "
+            f"`product.risk_level` / `customer_risk_assessment.risk_level` 实测只有 "
+            f"{sorted(_VALID_RISK_LEVELS)}；R1–R5 是历史语料的错误说法，"
+            f"会让答案里混用两套编号（历史问题：用户被告知可买 'R1至R4'，而 App 里没有 R 级产品）")
+    return errors
+
+
+def _validate_corpus_text(path, text: str) -> list[str]:
+    """语料**内容**校验（与类目/权限校验并列）。"""
+    return validate_risk_level_vocabulary(text, path.name)
 
 
 def _validate(category: str, permission: str) -> list[str]:
@@ -95,7 +140,7 @@ async def main() -> int:
 
     if not args.verify_only:
         print("=" * 88)
-        print("STEP 1：校验语料文件（类目 / 权限 / 文件存在）")
+        print("STEP 1：校验语料文件（类目 / 权限 / 风险等级词汇 / 文件存在）")
         print("=" * 88)
         problems: list[str] = []
         files: list[tuple[Path, str, str]] = []
@@ -106,6 +151,10 @@ async def main() -> int:
                 print(f"  [x] {name}: 文件不存在")
                 continue
             errs = _validate(category, permission)
+            # **内容校验**：风险等级词汇必须与数据模型一致（见 validate_risk_level_vocabulary）。
+            # 这是"流程指标全绿但术语错误"这类缺陷的唯一拦截点 ——
+            # 检索相似度、evidence_status、引用数都发现不了 R3 与 C3 的差别。
+            errs.extend(_validate_corpus_text(path, path.read_text(encoding="utf-8")))
             if errs:
                 problems.extend(f"{name}: {e}" for e in errs)
                 print(f"  [x] {name}: 校验失败")
@@ -135,6 +184,31 @@ async def main() -> int:
         print(f"共 {len(files)} 个文件通过校验。")
 
         if args.dry_run:
+            print()
+            print("=" * 88)
+            print("附加校验：政策类语料（金融政策/）的风险等级词汇")
+            print("=" * 88)
+            pol_problems: list[str] = []
+            if POLICY_DIR.exists():
+                for p in sorted(POLICY_DIR.glob("*.md")):
+                    errs = validate_risk_level_vocabulary(
+                        p.read_text(encoding="utf-8"), p.name)
+                    if errs:
+                        pol_problems.extend(errs)
+                        print(f"  [x] {p.name}")
+                        for e in errs:
+                            print(f"       - {e}")
+                    else:
+                        print(f"  [v] {p.name}")
+            else:
+                print(f"  （{POLICY_DIR} 不存在，跳过）")
+            if pol_problems:
+                print()
+                print("政策类语料校验未通过 —— 该类目语料由 "
+                      "`scripts/fix_rag_knowledge_meta.py --ingest` 导入，"
+                      "请先修正后再导入。")
+                await database.dispose()
+                return 2
             print("--dry-run：仅校验，不写库。")
             await database.dispose()
             return 0
