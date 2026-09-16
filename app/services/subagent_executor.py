@@ -195,21 +195,48 @@ class SubagentExecutor:
             seen_content.add(key)
             parts.append(f"[{r.task_id}] {summary}")
 
-        # ---- 2. 失败方的可操作提示：单独成段，不与成功内容混排 ----
+        # ---- 2. 失败子任务的处置：**区分"可操作提示"与"降级声明"** ----
+        #
+        # 为什么必须区分（2026-09-15 真实端到端测出来的问题）：
+        # 上一版把所有失败子任务的 summary 都当"提示"塞进答案，实测出现：
+        #   `[sub-1] 您的总资产为 3,000,000.00 元…`
+        #   `当前知识库没有足够依据，建议转人工客服或创建工单。`      ← 紧跟其后
+        # 后者是**整体降级声明**，不是"某一项要补充什么"。把它和明确的成功答案并排，
+        # 用户会以为**整个回答都失败了**（实际上资产答案是完全正确的）。
+        #
+        # 分类依据用 **error 码**（结构性），不用文本匹配（脆且易随文案改动失效）：
+        #   factual/ambiguous → **可操作提示**：告诉用户"补充什么"就能重试，必须保留；
+        #   low_confidence    → **降级声明**：知识库没依据，需要转人工，属全局信号；
+        #   其余技术错误      → 不进用户可见文案（只在 results[].error 留痕）。
+        _ACTIONABLE_ERRORS = {"fact_not_found", "ambiguous_product"}
+        _HANDOFF_ERRORS = {"low_confidence"}
+
         pending_parts: list[str] = []
         seen_pending: set[str] = set()
+        handoff_notices: list[str] = []
+        seen_handoff: set[str] = set()
         for r in sorted(results, key=lambda x: x.task_id):
             if r.status == "success":
                 continue
-            hint = (r.summary or "").strip()
-            if not hint:
-                # 无面向用户的提示（如纯超时）→ 不进用户可见文案，仅在 error 中留痕
+            text = (r.summary or "").strip()
+            if not text:
+                # 无面向用户的文案（如纯超时）→ 仅在 error 中留痕
                 continue
-            key = _content_key(hint)
-            if key in seen_pending:
-                continue
-            seen_pending.add(key)
-            pending_parts.append(hint)
+            key = _content_key(text)
+            err = str(r.error or "")
+            if err in _ACTIONABLE_ERRORS:
+                if key not in seen_pending:
+                    seen_pending.add(key)
+                    pending_parts.append(text)
+            elif err in _HANDOFF_ERRORS:
+                # 降级声明单独收集：只在**没有任何成功答案**时才作为主文案给出。
+                # 有成功答案时它不该污染答案——是否转人工由 requires_handoff 字段表达，
+                # 而不是塞进正文（正文混排会让正确内容看起来也失败了）。
+                if key not in seen_handoff:
+                    seen_handoff.add(key)
+                    handoff_notices.append(text)
+            # 其他 error（subagent_timeout / capability_not_mapped / route_mismatch 等）
+            # 属技术细节，不进用户可见文案。
 
         failed = [r for r in results if r.status == "failed"]
         partial = [r for r in results if r.status == "partial"]
@@ -226,12 +253,16 @@ class SubagentExecutor:
         if pending_parts:
             # 明确标注"需补充"而不是只说"部分未完成"——前者可操作，后者只会让用户困惑。
             answer = (answer + "\n" + "\n".join(pending_parts)).strip()
+        elif not parts and handoff_notices:
+            # 没有任何成功答案 → 降级声明就是唯一能给用户的实质信息，直接给出。
+            answer = "\n".join(handoff_notices).strip()
         elif failed or partial:
-            # 没有任何可操作提示时，才退回到原先的概括性说明
+            # 有成功答案、且失败方只给了降级声明 → **不把降级声明混进正文**
+            # （那会让正确内容看起来也失败了）。仅用中性的概括说明收尾。
             note = "（部分子任务未完成）" if overall == "partial" else "（子任务失败）"
             answer = f"{answer}{note}".strip()
 
-        # ---- 3. 引用级去重统计（观测用，便于持续追踪重复率）----
+        # ---- 3. 引用级/内容级去重统计（观测用，便于持续追踪重复率）----
         seen_chunks: set[str] = set()
         duplicate_chunks = 0
         for r in results:
@@ -248,10 +279,16 @@ class SubagentExecutor:
 
         return SubagentMergeResult(
             results=results, overall_status=overall, answer=answer,
+            # 降级信号**结构化表达**而不是塞进正文：
+            # 正文混排会让"资产答案正确"和"知识库没依据"看起来同样失败；
+            # 而调用方（Supervisor）需要的是"要不要转人工"这个**判定**，不是一句文案。
+            requires_handoff=bool(handoff_notices),
             dedup={
                 "dropped_duplicate_summaries": dedup_content,
                 "duplicate_citation_refs": duplicate_chunks,
                 "unique_citations": len(seen_chunks),
                 "pending_hints": len(pending_parts),
+                # 降级声明条数：便于观测"多少个知识子任务无依据"
+                "handoff_notices": len(handoff_notices),
             },
         )

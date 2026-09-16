@@ -809,6 +809,76 @@ def test_merge_reports_citation_duplication():
     assert merged.dedup["duplicate_citation_refs"] == 2
 
 
+# ---------- 8b. 区分「可操作提示」与「降级声明」 ----------
+
+def test_handoff_notice_does_not_pollute_successful_answer():
+    """回归：整体降级声明**不得**与成功答案并排出现在正文里。
+
+    真实端到端测出来的问题（2026-09-15）：
+      `[sub-1] 您的总资产为 3,000,000.00 元…`
+      `当前知识库没有足够依据，建议转人工客服或创建工单。`   ← 紧跟其后
+    资产答案本身是完全正确的，但用户读到"建议转人工"会以为**整个回答都失败了**。
+
+    正确做法：转人工是**判定**，用 `requires_handoff` 结构化表达，不写进正文。
+    """
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="success", confidence=0.9,
+                       summary="您最近一次资产快照的总资产为 3,000,000.00 元。"),
+        SubagentResult(task_id="sub-2", status="partial", error="low_confidence",
+                       summary="当前知识库没有足够依据，建议转人工客服或创建工单。"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert "总资产" in merged.answer
+    assert "建议转人工" not in merged.answer, f"降级声明污染了正文：{merged.answer!r}"
+    # 但信号不能丢：必须通过结构化字段表达
+    assert merged.requires_handoff is True
+    assert merged.dedup["handoff_notices"] == 1
+
+
+def test_handoff_notice_is_shown_when_no_successful_answer():
+    """全部失败且只有降级声明时，它必须给用户看（否则用户拿不到任何信息）。"""
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="partial", error="low_confidence",
+                       summary="当前知识库没有足够依据，建议转人工客服或创建工单。"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert "建议转人工" in merged.answer, f"无成功答案时应给出降级声明：{merged.answer!r}"
+    assert merged.requires_handoff is True
+
+
+def test_actionable_hint_still_preserved_alongside_success():
+    """可操作提示（补充什么）与降级声明不同：它**应该**保留在正文里。"""
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="success", confidence=0.9,
+                       summary="您最近一次资产快照的总资产为 3,000,000.00 元。"),
+        SubagentResult(task_id="sub-2", status="partial", error="fact_not_found",
+                       summary="请补充更明确的订单号。"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert "请补充" in merged.answer, f"可操作提示被丢弃：{merged.answer!r}"
+    assert "总资产" in merged.answer
+    assert merged.requires_handoff is False  # fact_not_found 不是转人工信号
+
+
+def test_actionable_and_handoff_can_coexist():
+    """一个子任务要补充信息、另一个知识库无依据：提示保留在正文，转人工走字段。"""
+    from app.services.subagent_executor import SubagentExecutor
+    results = [
+        SubagentResult(task_id="sub-1", status="success", confidence=0.9, summary="资产 300 万。"),
+        SubagentResult(task_id="sub-2", status="partial", error="fact_not_found",
+                       summary="请补充更明确的订单号。"),
+        SubagentResult(task_id="sub-3", status="partial", error="low_confidence",
+                       summary="当前知识库没有足够依据，建议转人工客服或创建工单。"),
+    ]
+    merged = SubagentExecutor._merge(results)
+    assert "请补充" in merged.answer
+    assert "建议转人工" not in merged.answer
+    assert merged.requires_handoff is True
+
+
 # ---------- 9. 同一份数据只读一次，但不同知识不可折叠 ----------
 
 def test_parse_folds_duplicate_fact_capabilities():

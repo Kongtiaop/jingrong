@@ -120,11 +120,13 @@ class CustomerRagService:
         # 可选：ambiguous 带的 LLM-judge（async judge_answerable(query, contexts)->bool）；None 则退回 min_similarity 单阈值
         self.ambiguous_judge = ambiguous_judge
 
-    def _evidence_decision(self, best_sim: float | None, judge_result: bool | None = None) -> str:
+    def _evidence_decision(self, best_sim: float | None, judge_result: bool | None = None,
+                           judge_failed: bool = False) -> str:
         from app.services.rag_eval_metrics import decide_evidence
         t = self.thresholds
         return decide_evidence(best_sim, reject=t["reject"], answer=t["answer"],
-                               judge_result=judge_result, fallback=self.min_similarity)
+                               judge_result=judge_result, fallback=self.min_similarity,
+                               judge_failed=judge_failed)
 
     def _maybe_collect_bad_case(self, query: str, result: CustomerRagResult) -> None:
         """线上 bad case 回流（默认关；异常安全，绝不阻塞/破坏响应）。"""
@@ -210,15 +212,27 @@ class CustomerRagService:
         # 故把高分区（如 0.55~0.65）直接放行，只让 judge 处理更边缘的低分区。
         # 见 ISSUE-20260914-JUDGE-MISJUDGES-RELEVANT-EVIDENCE。
         judge_result = None
+        judge_failed = False
         judge_lo = self.thresholds.get("judge_reject", self.thresholds["reject"])
         judge_hi = self.thresholds.get("judge_answer", self.thresholds["answer"])
         if self.thresholds.get("judge_ambiguous") and self.ambiguous_judge is not None and best_sim is not None \
                 and judge_lo <= best_sim < judge_hi:
             try:
                 judge_result = await self.ambiguous_judge(query, [c.content for c in useful])
-            except Exception:  # noqa: BLE001 - judge 失败不阻塞，按不通过处理
-                judge_result = False
-        decision = self._evidence_decision(best_sim, judge_result=judge_result)
+            except Exception:  # noqa: BLE001 - judge 失败不阻塞
+                # **必须区分"judge 判为不足"与"judge 没跑成"**（ISSUE-20260915-JUDGE-FAILURE-MASQUERADES-AS-REJECT）：
+                #   旧实现把异常也置 `judge_result = False` → `decide_evidence` 返回 "reject"
+                #   → `low_confidence` → 提示用户"知识库没有足够依据，建议转人工"。
+                #   后果：**基础设施抖动（限流/超时/网络）被伪装成"数据不存在"**，
+                #   而该 query 的证据其实完全充分（实测 best_sim=0.5971、5 条引用、
+                #   judge 正常时 8/8 返回 True）。
+                #   这正是"同一问句时好时坏"的根因：答案取决于一次**可能失败的 LLM 调用**，
+                #   而失败被静默当成"证据不足"。
+                # 现改为标记 `judge_failed=True`，交由 decide_evidence 走**确定性阈值兜底**
+                # （而非当作"judge 说不行"），使组件故障不再改变业务结论。
+                judge_failed = True
+        decision = self._evidence_decision(best_sim, judge_result=judge_result,
+                                           judge_failed=judge_failed)
         if decision == "reject":
             result = CustomerRagResult(intent=intent, answer_mode="handoff", evidence_status="low_confidence", citations=[], handoff_required=True, message="当前知识库没有足够依据，建议转人工客服或创建工单。")
             self._maybe_collect_bad_case(query, result)

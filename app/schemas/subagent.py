@@ -32,6 +32,10 @@ class SubagentMergeResult(BaseModel):
     results: list[SubagentResult] = Field(default_factory=list)
     overall_status: str = ""  # succeeded / partial / failed
     answer: str = ""
+    # 是否需要转人工：由"知识类子任务 low_confidence"等降级信号驱动。
+    # **结构化表达而非写进正文**——正文混排会让正确内容看起来也失败了，
+    # 而调用方需要的是"要不要转人工"这个判定。
+    requires_handoff: bool = False
     # 本次 fan-out 的决策元数据（由 run_read_only_fanout 回填）：
     # 让响应/审计能直接回答"这次到底并行了没有、为什么"，无需反查审计表。
     fanout_mode: str = ""     # parallel / serial
