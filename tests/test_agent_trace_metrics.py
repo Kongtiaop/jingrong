@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.services.customer_model_tools import (
+    CUSTOMER_READ_TOOL_SCHEMAS,
     CustomerModelToolLoop,
     _OUTPUT_PREVIEW_MAX_CHARS,
     _summarize_output,
@@ -247,3 +248,52 @@ def test_audit_detail_records_blocked_round_reasoning():
     assert detail["error"] == "tool_out_of_plan_scope"
     assert detail["reasoning"] == "想解释工单流程"
     assert detail["prompt_tokens"] == 120, "被拦截轮次的决策 token 同样要进审计"
+
+
+# ---------- 7. 思维链来源：arguments.reasoning（必填参数） ----------
+
+def test_every_tool_schema_requires_reasoning():
+    """每个工具的 schema 都必须把 reasoning 声明为**必填**参数。
+
+    这是思维链唯一可靠的来源：
+    - tool_call 同帧的 message.content 在 DashScope 实测**恒为空**；
+    - 靠 prompt 请求模型"顺便说一句"也无效（已实测，reasoning 仍为空）。
+    只有 function calling 的必填参数模型一定会填。
+
+    若有人把 required 里的 reasoning 去掉，思维链会**静默**变空而不报错——故在此锁死。
+    """
+    for item in CUSTOMER_READ_TOOL_SCHEMAS:
+        name = item["function"]["name"]
+        params = item["function"]["parameters"]
+        assert "reasoning" in params.get("properties", {}), f"{name} 缺少 reasoning 属性"
+        assert "reasoning" in params.get("required", []), f"{name} 的 reasoning 未声明为必填"
+
+
+def test_reasoning_is_extracted_and_stripped_from_arguments():
+    """理由必须从 arguments 取出，并**剥离**后再交给工具。
+
+    不剥离的后果有两个，且都会静默出错：
+    1. 工具收到一个它不认识的 reasoning 参数（污染入参）；
+    2. 重复调用闸门按 (工具, 参数) 判重，而每轮理由措辞略有不同 →
+       真正相同的调用不再被判为重复，闸门失效。
+    """
+    decision = {"name": "get_my_workorder_status",
+                "arguments": {"query": "工单", "reasoning": "用户问工单进展，需查真实状态"}}
+    outcome = _run(UsageProvider([decision]), planned_intents=["workorder_status"])
+
+    r = outcome.rounds[0]
+    assert r.reasoning == "用户问工单进展，需查真实状态", "思维链必须取到"
+    assert "reasoning" not in r.arguments, "reasoning 不得混入工具入参"
+    assert r.arguments.get("query") == "工单", "其余参数必须原样保留"
+
+
+def test_reasoning_falls_back_to_content_when_arguments_lack_it():
+    """arguments 没给理由时，回退取 provider 给的 reasoning（原 message.content 路径）。
+
+    保留兜底是为了兼容：别的模型/接口可能确实会在 tool_call 同帧带 content。
+    """
+    decision = {"name": "get_my_workorder_status", "arguments": {"query": "工单"},
+                "reasoning": "来自 message.content 的理由"}
+    outcome = _run(UsageProvider([decision]), planned_intents=["workorder_status"])
+
+    assert outcome.rounds[0].reasoning == "来自 message.content 的理由"

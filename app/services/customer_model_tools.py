@@ -136,6 +136,31 @@ CUSTOMER_READ_TOOL_SCHEMAS: list[dict] = [
     },
 ]
 
+# 让模型把"为什么调这个工具"作为**必填参数**写进 arguments，而不是依赖 tool_call 同帧的
+# `message.content`。后者在 OpenAI 兼容接口返回 tool_calls 时恒为空（DashScope 实测如此），
+# 曾导致 reasoning 永远拿不到——链路面板的"思维链"一栏因此长期空白。
+# 声明为 required 是因为：function calling 的必填参数模型一定会填，比在 prompt 里
+# 请求它"顺便说一句"可靠得多（后者实测无效）。
+_REASONING_PROPERTY = {
+    "type": "string",
+    "description": "一句话说明为什么调用这个工具、期望拿到什么。仅用于链路追踪留痕，不影响查询。",
+}
+
+
+def _inject_reasoning_param(schemas: list[dict]) -> list[dict]:
+    for item in schemas:
+        params = (item.get("function") or {}).get("parameters")
+        if not isinstance(params, dict):
+            continue
+        params.setdefault("properties", {})["reasoning"] = dict(_REASONING_PROPERTY)
+        required = params.setdefault("required", [])
+        if "reasoning" not in required:
+            required.append("reasoning")
+    return schemas
+
+
+_inject_reasoning_param(CUSTOMER_READ_TOOL_SCHEMAS)
+
 # 硬白名单：与 CustomerReadTools.execute 内部 allowed 集合保持一致。
 # 双重校验——即使模型返回未声明/写操作工具名，也会在此被拒。
 _ALLOWED_TOOL_NAMES = frozenset(item["function"]["name"] for item in CUSTOMER_READ_TOOL_SCHEMAS)
@@ -339,6 +364,8 @@ _TOOL_LOOP_SYSTEM = (
     "**不要改调与用户问题无关的其他工具**（例如查订单失败后不要改查工单或知识库），"
     "反复失败就停止，交由下游提示用户补充信息或转人工。\n"
     "8. 不要臆造工具名与参数。\n"
+    "9. **每次调用都要填写 reasoning 参数**：用一句话说明为什么要调这个工具、期望拿到什么。\n"
+    "   该参数仅用于链路追踪与事后排查，帮助区分模型是有意补充依据还是误判，不影响查询结果。\n"
 )
 
 
@@ -543,11 +570,15 @@ class CustomerModelToolLoop:
                 break
 
             tool_name = str(decision.get("name") or "").strip()
-            arguments = decision.get("arguments") or {}
-            # 模型发起 tool_call 时同时给出的文本（"为什么调这个工具"）。
-            # 仅用于留痕：判断"模型多调一个工具"是**有意补充**还是**误判**，必须看它的自述理由，
-            # 否则只能凭结果反推（此前正是如此，导致同一现象反复猜测）。
-            reasoning = str(decision.get("reasoning") or "").strip()
+            # 复制一份再动：decision 会被记进 decisions 留痕，不应被就地修改。
+            arguments = dict(decision.get("arguments") or {})
+            # 思维链优先取 arguments.reasoning（schema 声明的必填参数）。
+            # 兜底才用 tool_call 同帧的 message.content——该值在 DashScope 实测恒为空。
+            # 取完**立即剥离**：它不参与查询，更不能参与重复调用判定
+            # （每轮措辞略有差异会让真正相同的调用不被识别为重复，闸门失效）。
+            reasoning = str(
+                arguments.pop("reasoning", None) or decision.get("reasoning") or ""
+            ).strip()
             outcome.decisions.append({
                 "round": round_index, "tool": tool_name, "arguments": arguments,
                 "reasoning": reasoning, "outcome": "pending",
