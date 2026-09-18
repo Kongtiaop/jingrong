@@ -105,6 +105,11 @@ class QwenProvider:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        # 最近一次 LLM 调用的用量与耗时，供上层按"轮次 / 对话"归因（链路追踪面板）。
+        # 刻意设计成**实例属性**而非改 request_tool_call 的返回值：
+        # 既有调用方与测试断言依赖于"返回 dict 或 None"，改返回结构会破坏 485 个测试中的多个；
+        # 而测试里的假 provider 没有该属性，上层用 getattr(..., None) 读取即可自然降级。
+        self.last_call_usage: dict | None = None
         self._client = (
             AsyncOpenAI(
                 api_key=settings.dashscope_api_key,
@@ -179,6 +184,16 @@ class QwenProvider:
             )
         else:
             logger.info("llm.usage model=%s usage_unavailable duration_ms=%.0f", model, dur_ms)
+        # 记录最近一次调用的用量，供 Agent 链路追踪按轮次归因展示。
+        # 放在日志之后、return 之前，保证成功路径必然留下可读取的用量；
+        # usage 缺失时仍记录耗时，使前端至少能显示延迟而非空白。
+        self.last_call_usage = {
+            "model": model,
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+            "duration_ms": round(dur_ms, 1),
+        }
         return resp
 
     async def classify(self, *, query: str, conversation_summary: str = "") -> dict:

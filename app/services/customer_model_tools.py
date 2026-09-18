@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -220,7 +221,12 @@ def _uncovered_intents(planned_intents: list[str] | None,
 
 @dataclass
 class ToolRound:
-    """一轮工具调用的记账（用于审计与观测）。"""
+    """一轮工具调用的记账（用于审计与观测）。
+
+    除审计字段外，另带**链路追踪面板所需的观测字段**：
+    duration_ms / prompt_tokens / completion_tokens / output_preview。
+    这些字段不参与任何控制流，仅用于前端展示"这一轮做了什么、花了多久、消耗多少"。
+    """
 
     round_index: int
     tool: str
@@ -230,6 +236,60 @@ class ToolRound:
     evidence_status: str | None = None
     citations: int = 0
     reasoning: str = ""          # 模型自述的调用理由（审计/排查用，不参与控制流）
+    # ---- 观测字段（阶段一新增）----
+    duration_ms: float | None = None        # 本轮工具执行耗时
+    prompt_tokens: int | None = None        # 本轮决策 LLM 调用的 prompt token
+    completion_tokens: int | None = None    # 本轮决策 LLM 调用的 completion token
+    llm_duration_ms: float | None = None    # 本轮决策 LLM 调用耗时（与工具耗时分开记）
+    output_preview: str = ""                # 工具返回摘要（已截断，供前端展示）
+
+
+# 工具返回摘要的截断长度。刻意压短：既要能看出"这一轮拿到了什么"，
+# 又避免把客户资产明细、身份证号等敏感原文带进前端与日志。
+_OUTPUT_PREVIEW_MAX_CHARS = 160
+
+
+def _usage_fields(usage: dict) -> dict:
+    """把 provider 记录的用量转成 ToolRound 的观测字段。
+
+    抽出来的原因：被拦下的调用（越界 / 重复 / 不在白名单）同样消耗了决策 token，
+    若只给"已执行"的轮次记账，被拦截那几轮的开销就会被漏掉，成本统计偏低。
+    """
+    return {
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "llm_duration_ms": usage.get("duration_ms"),
+    }
+
+
+def _summarize_output(*, answer: str | None, data: dict | None, success: bool,
+                      error: str | None = None) -> str:
+    """把工具返回压成一句**结构性摘要**，而不是原文。
+
+    为什么不用原文：工具返回可能含客户资产、单号等敏感信息；
+    且原文往往数千字，前端展开后会把对话挤爆。摘要只回答"拿到了什么、拿到了几条"。
+    """
+    data = data or {}
+    if not success:
+        return f"调用失败（{error or 'unknown'}）"
+    parts: list[str] = []
+    citations = data.get("citations") or []
+    if citations:
+        parts.append(f"命中 {len(citations)} 条知识块")
+    items = data.get("items") or []
+    if items:
+        parts.append(f"返回 {len(items)} 条记录")
+    for key, label in (("risk_level", "风险等级"), ("total_asset", "总资产"),
+                       ("status", "状态"), ("product_name", "产品")):
+        value = data.get(key)
+        if value not in (None, "", []):
+            parts.append(f"{label}={value}")
+    if parts:
+        return "；".join(parts)
+    text = (answer or "").strip().replace("\n", " ")
+    if not text:
+        return "无返回内容"
+    return text[:_OUTPUT_PREVIEW_MAX_CHARS] + ("…" if len(text) > _OUTPUT_PREVIEW_MAX_CHARS else "")
 
 
 @dataclass
@@ -328,17 +388,26 @@ class CustomerModelToolLoop:
             tool_name = _INTENT_TO_TOOL.get(intent)
             if tool_name is None or tool_name not in _ALLOWED_TOOL_NAMES:
                 continue
+            _fill_t0 = time.monotonic()
             result = await self.tools.execute(
                 name=tool_name, customer_id=customer_id, query=query,
                 intent=intent if tool_name == "search_customer_knowledge" else None,
             )
+            fill_duration_ms = round((time.monotonic() - _fill_t0) * 1000, 1)
             data = result.data or {}
+            # 规则补齐**不经过 LLM 决策**，故 token 字段留空（前端显示"—"而非 0）。
+            # 这一点对成本归因很重要：把确定性路径也记成 0 token 会低估模型开销，
+            # 反过来若记成真实值则与事实不符。
             outcome.rounds.append(ToolRound(
                 round_index=round_index, tool=tool_name,
                 arguments={"query": query, "intent": intent, "filled_by": "rule_backstop"},
                 success=result.success, error=result.error,
                 evidence_status=data.get("evidence_status"),
                 citations=len(data.get("citations") or []),
+                duration_ms=fill_duration_ms,
+                output_preview=_summarize_output(
+                    answer=getattr(result, "answer", None), data=data,
+                    success=result.success, error=result.error),
             ))
             outcome.tool_names.append(tool_name)
             await self._audit(
@@ -361,6 +430,21 @@ class CustomerModelToolLoop:
                 })
                 filled_any = True
         return filled_any
+
+    def _consume_llm_usage(self) -> dict:
+        """读取并**消费**最近一次 LLM 调用的用量（prompt/completion tokens + 耗时）。
+
+        为什么读后即清空：用量是"最近一次"语义。若本轮 LLM 调用异常未记录用量，
+        不清空会让下一轮错误地沿用上一轮的数字，导致 token 统计虚高。
+        为什么用 getattr：测试里的假 provider 没有该属性，这里必须自然降级为空字典，
+        不能因为缺少属性就让整条工具链路失败。
+        """
+        usage = getattr(self.provider, "last_call_usage", None)
+        try:
+            self.provider.last_call_usage = None
+        except Exception:  # noqa: BLE001 - provider 不可写时忽略，仅影响观测字段
+            pass
+        return usage if isinstance(usage, dict) else {}
 
     async def run(self, *, customer_id: str, conversation_id: str, query: str,
                   planned_intents: list[str] | None = None,
@@ -405,6 +489,9 @@ class CustomerModelToolLoop:
                 system=_TOOL_LOOP_SYSTEM, user=user_block,
                 tools=CUSTOMER_READ_TOOL_SCHEMAS, model=self.model,
             )
+            # 决策 LLM 调用的用量归入**本轮**：工具轮把单请求放大成多轮 LLM 调用，
+            # 不按轮归因就无法回答"这一轮花多少 token / 多久"。
+            round_usage = self._consume_llm_usage()
             if not decision:
                 # 模型主动停止。但若规则规划器识别出的意图**尚未被覆盖**，则不能就此结束——
                 # 实测："我有没有风险限制" 命中 risk_restriction(事实) + risk_public(知识)，
@@ -456,7 +543,9 @@ class CustomerModelToolLoop:
             if allowed_tools and tool_name not in allowed_tools:
                 outcome.rounds.append(ToolRound(
                     round_index=round_index, tool=tool_name, arguments=arguments,
-                    success=False, error="tool_out_of_plan_scope"))
+                    success=False, error="tool_out_of_plan_scope",
+                    reasoning=reasoning, **_usage_fields(round_usage),
+                    output_preview="未执行：该工具不在本次计划范围内"))
                 await self._audit(customer_id=customer_id, conversation_id=conversation_id,
                                   round_index=round_index, tool=tool_name, arguments=arguments,
                                   success=False, error="tool_out_of_plan_scope",
@@ -480,7 +569,9 @@ class CustomerModelToolLoop:
             if call_key in seen_calls:
                 outcome.rounds.append(ToolRound(
                     round_index=round_index, tool=tool_name, arguments=arguments,
-                    success=False, error="duplicate_call_skipped"))
+                    success=False, error="duplicate_call_skipped",
+                    reasoning=reasoning, **_usage_fields(round_usage),
+                    output_preview="未执行：与已执行过的调用参数完全相同，跳过"))
                 await self._audit(customer_id=customer_id, conversation_id=conversation_id,
                                   round_index=round_index, tool=tool_name, arguments=arguments,
                                   success=False, error="duplicate_call_skipped",
@@ -498,7 +589,9 @@ class CustomerModelToolLoop:
             if tool_name not in _ALLOWED_TOOL_NAMES:
                 outcome.rounds.append(ToolRound(
                     round_index=round_index, tool=tool_name, arguments=arguments,
-                    success=False, error="tool_not_allowed"))
+                    success=False, error="tool_not_allowed",
+                    reasoning=reasoning, **_usage_fields(round_usage),
+                    output_preview="未执行：该工具不在只读白名单内"))
                 await self._audit(customer_id=customer_id, conversation_id=conversation_id,
                                   round_index=round_index, tool=tool_name, arguments=arguments,
                                   success=False, error="tool_not_allowed",
@@ -518,10 +611,12 @@ class CustomerModelToolLoop:
                 intent = "faq"
             entities = {k: v for k, v in arguments.items() if k == "product_name" and v}
 
+            _tool_t0 = time.monotonic()
             result = await self.tools.execute(
                 name=tool_name, customer_id=customer_id, query=tool_query,
                 intent=intent, entities=entities or None,
             )
+            tool_duration_ms = round((time.monotonic() - _tool_t0) * 1000, 1)
             data = result.data or {}
             round_record = ToolRound(
                 round_index=round_index, tool=tool_name, arguments=arguments,
@@ -529,6 +624,11 @@ class CustomerModelToolLoop:
                 evidence_status=data.get("evidence_status"),
                 citations=len(data.get("citations") or []),
                 reasoning=reasoning,
+                duration_ms=tool_duration_ms,
+                **_usage_fields(round_usage),
+                output_preview=_summarize_output(
+                    answer=getattr(result, "answer", None), data=data,
+                    success=result.success, error=result.error),
             )
             outcome.rounds.append(round_record)
             outcome.tool_names.append(tool_name)
