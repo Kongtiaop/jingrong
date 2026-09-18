@@ -36,6 +36,54 @@ class TaskExecutionResult:
 
 OPERATION_ACTION_TARGETS = {"赎回": "/customer-center?tab=operations&action=redeem", "转账": "/customer-center?tab=operations&action=transfer", "下单": "/customer-center?tab=operations&action=order"}
 
+def explain_recommendation(recommendation) -> str:
+    """把「为什么是这些产品」讲出来。
+
+    用户追问依据时，要的是判定规则与他自己的数据，而不是再收一份清单。
+    这里刻意复用同一个 RecommendationResponse：解释里提到的等级、门槛、排除原因，
+    都必须与筛选时的真实依据一致，不能另起一套说辞。
+    """
+    lines: list[str] = []
+    context = getattr(recommendation, "context", None)
+    if context is not None:
+        level = getattr(context, "risk_level", "") or "未测评"
+        status = getattr(context, "risk_assessment_status", "") or "unknown"
+        lines.append(f"您当前的风险承受能力等级为 {level}（测评状态：{status}）。")
+        investable = getattr(context, "investable_asset", None)
+        if investable is not None:
+            lines.append(f"可用于投资的资产为 ¥{float(investable):,.2f}。")
+    lines.append("筛选规则是适当性匹配，需同时满足两条：产品风险等级不高于您的风险承受能力等级；"
+                 "起购金额不超过您的可投资产。")
+
+    matches = list(getattr(recommendation, "matches", None) or [])
+    if matches:
+        lines.append(f"\n按上述规则，有 {len(matches)} 个产品通过匹配，其中：")
+        for entry in matches[:5]:
+            reason = (getattr(entry, "recommendation_reason", "")
+                      or "；".join(getattr(entry, "reasons", None) or []))
+            amount = getattr(entry, "minimum_amount", 0) or 0
+            lines.append(f"- {getattr(entry, 'product_name', '')}"
+                         f"（{getattr(entry, 'product_risk_level', '')}，起购 ¥{float(amount):,.2f}）：{reason}")
+    else:
+        lines.append("\n当前没有产品通过匹配。")
+
+    excluded = list(getattr(recommendation, "excluded", None) or [])
+    if excluded:
+        lines.append(f"\n另有 {len(excluded)} 个产品未通过匹配，原因是风险等级高于您的承受能力，"
+                     "或起购金额超出可投资产。")
+
+    for warning in list(getattr(recommendation, "warnings", None) or []):
+        message = getattr(warning, "message", "") or ""
+        if message:
+            lines.append(f"\n提示：{message}")
+
+    # 刻意不拼 preference_note：它本身就是「产品清单 + 理由」的浓缩
+    # （见 suitability_service.py:169,172），而上面已经逐条列出并通过匹配数说明了总量。
+    # 实测拼上去会变成复读：正文列完产品，末尾又追加一遍
+    # 「以下 2 个产品通过适当性匹配：…」。
+    return "\n".join(lines)
+
+
 class CustomerTaskExecutor:
     """Plan executor with a bounded, read-only ReAct-style fallback for knowledge tasks."""
 
@@ -57,6 +105,24 @@ class CustomerTaskExecutor:
             "请提供官方流程、适用条件和注意事项",
             "请说明相关制度或流程，并给出依据",
         ]
+
+    async def _build_recommendation(self, customer_id: str):
+        """跑一遍适当性匹配，返回 RecommendationResponse。
+
+        推荐与「追问推荐依据」共用此实现是有意的：两处各查一次不但浪费，
+        更会让解释文本与实际筛选结果之间产生时间差（一边查完、另一边数据已变）。
+        """
+        uow = SqlAlchemyTradingUnitOfWork()
+        suitability = SuitabilityService(
+            risk_repository=uow.risks,
+            product_repository=uow.products,
+            profile_repository=uow.profiles,
+            asset_service=AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets),
+        )
+        async with self.database.session_factory() as session:
+            # 长时记忆偏好（软排序，不改变适当性硬门禁）
+            preferences = await self._load_preference_facts(customer_id)
+            return await suitability.recommend(session, customer_id, preferences=preferences)
 
     async def _load_preference_facts(self, customer_id: str) -> dict:
         """读偏好事实（软排序用）。先读私有长时记忆，再补客服写入的 shared 观察（跨 Agent 复用）。"""
@@ -275,21 +341,16 @@ class CustomerTaskExecutor:
                 )
             operation = next((name for name in ("申购", "购买", "买入", "赎回", "转账", "下单") if name in item.query), "业务操作")
             return TaskExecutionResult(item.task_id, item.intent, "needs_confirmation", answer=f"可以为您准备“{operation}”业务，但不会在客服对话中直接执行。", data={"operation": operation, "confirmation_required": True, "executed": False, "action_target": OPERATION_ACTION_TARGETS.get(operation, "/customer-center?tab=operations"), "prefill_hint": f"请在统一助手中确认{operation}的对象、金额和最终提交。"}, clarification=f"请补充或确认“{operation}”的对象、金额和最终提交。")
-        if item.intent == "product_recommendation":
-            uow = SqlAlchemyTradingUnitOfWork()
-            suitability = SuitabilityService(
-                risk_repository=uow.risks,
-                product_repository=uow.products,
-                profile_repository=uow.profiles,
-                asset_service=AssetSummaryService(account_repository=uow.accounts, holding_repository=uow.holdings, asset_repository=uow.assets),
-            )
-            async with self.database.session_factory() as session:
-                # 长时记忆偏好（软排序，不改变适当性硬门禁）
-                preferences = await self._load_preference_facts(customer_id)
-                recommendation = await suitability.recommend(session, customer_id, preferences=preferences)
+        if item.intent in {"product_recommendation", "recommendation_explanation"}:
+            # 两个意图共用同一份适当性结果，只是**呈现方式**不同：
+            # 推荐给清单，追问给依据。共用是有意的——否则解释里写的规则
+            # 可能与实际筛选规则漂移，用户按解释去核对反而对不上。
+            recommendation = await self._build_recommendation(customer_id)
             return TaskExecutionResult(
                 item.task_id, item.intent, "succeeded",
-                answer="根据当前风险测评、客户类型和资产门槛，以下产品通过适当性匹配。",
+                answer=("根据当前风险测评、客户类型和资产门槛，以下产品通过适当性匹配。"
+                        if item.intent == "product_recommendation"
+                        else explain_recommendation(recommendation)),
                 data={"recommendation": recommendation.model_dump(mode="json"), "execution_mode": "plan_rules"},
             )
         if item.intent == "unknown":

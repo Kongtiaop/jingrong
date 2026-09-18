@@ -129,6 +129,19 @@ def extract_preference_statement(query: str) -> tuple[str, str] | None:
 # 购买资格/推荐类歧义（"我能买什么/可以买哪些/有什么能买的"）→ 产品推荐，而非"购买"业务
 _BUY_ELIGIBILITY_RE = re.compile(r"(能买什么|可以买什么|能买哪些|可以买哪些|有什么.{0,6}(能|可)买|哪些(我)?(能|可)买|哪些产品(能|可)买|适合(我)?(买|购买|投)什么|推荐(我)?(能|可以)买|买什么产品|能购买什么)")
 
+# 推荐依据追问（"为什么推荐这些产品给我" / "凭什么推荐" / "推荐理由是什么"）。
+# 必须**先于**"推荐"判定：`_patterns` 里 ("product_recommendation", "推荐", ..., .88)
+# 只要句中出现"推荐"二字就把整句判成产品推荐，疑问词毫无作用。
+# 实测（2026-09-18）：问"为什么推荐这些产品给我"，得到的回答与"给我推荐"完全相同
+# （route=customer_recommendation，返回同一份清单），用户问的是**依据**却收到清单。
+# 故把「解释词 + 推荐/产品」的组合单独识别为一个意图。
+_EXPLAIN_RECOMMEND_RE = re.compile(
+    r"(?:为什么|为何|依据|理由|原因|凭什么|怎么选|怎么挑|怎么判断)"
+    r".{0,15}(?:推荐|产品|这些|以上)"
+    r"|(?:推荐|产品|这些|以上).{0,15}"
+    r"(?:为什么|为何|依据|理由|原因|凭什么|怎么选|怎么挑|怎么判断)"
+)
+
 
 class CustomerIntentPlanner:
     _patterns: list[tuple[str, str, str, float]] = [
@@ -191,6 +204,10 @@ class CustomerIntentPlanner:
             return IntentPlan(normalized_query="", tasks=[], clarification="请描述您需要查询或办理的事项。")
         if re.match(r"^(你好|您好|嗨|hello|hi|谢谢|感谢|再见)[!！。？? ]*$", normalized):
             return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "greeting", "direct", query, confidence=.99, arguments=extract_entities(query), execution_mode=execution_mode_for_intent("greeting"))])
+        # 推荐依据追问必须先于"推荐"判定：否则含"推荐"二字就被当成立即推荐，
+        # 用户问"为什么"只会再收到一份一模一样的清单（实测如此）。
+        if _EXPLAIN_RECOMMEND_RE.search(normalized):
+            return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "recommendation_explanation", "suitability", query, confidence=.92, execution_mode=execution_mode_for_intent("recommendation_explanation"))])
         # 购买资格/推荐歧义："我能买什么产品"是问"推荐我能买的"，不是"我要买"
         if _BUY_ELIGIBILITY_RE.search(normalized):
             return IntentPlan(normalized_query=normalized, tasks=[IntentTask("t1", "product_recommendation", "suitability", query, confidence=.9, execution_mode=execution_mode_for_intent("product_recommendation"))])
