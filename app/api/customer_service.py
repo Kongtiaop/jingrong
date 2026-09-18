@@ -38,6 +38,10 @@ from app.repositories.data_catalog import DataCatalogRepository
 from app.models.data_catalog import DataCatalogColumn, DataCatalogExampleQuery, DataCatalogTable
 
 router = APIRouter(prefix="/customer-service/sessions", tags=["customer-service"] )
+# 对话级（conversation）与人工会话级（session）是两套 ID：
+# conversation_id 由客户端生成、贯穿整轮问答；session_id 只在转人工后才存在。
+# 链路回溯按 conversation 组织，故单独一个 router，避免路径歧义。
+conversation_router = APIRouter(prefix="/customer-service/conversations", tags=["customer-service"])
 ACTIVE_STATUSES = {"human_active"}
 RECLAIMABLE_STATUSES = {"waiting_human", "paused"}
 TERMINAL_STATUSES = {"resolved", "closed", "expired"}
@@ -754,4 +758,86 @@ async def close_session(request: Request, session_id: str, user: Annotated[User,
         _audit(session, user_id=user.id, action="customer_service_session_close", row=row)
         await session.commit(); await session.refresh(row)
         await publish_customer_realtime(request.app.state.redis.client, row.customer_id, 'human.session.closed', row.id, {'status': 'closed', 'assigned_agent_id': row.assigned_agent_id})
-        return ApiResponse(data=_response(row), trace_id=get_trace_id())
+
+
+# ---------------------------------------------------------------------------
+# 对话链路回溯
+# ---------------------------------------------------------------------------
+_TRACE_ACTION = "customer_agent.tool_call"
+
+
+def _trace_rounds(rows) -> list[dict]:
+    """把 `customer_agent.tool_call` 审计行还原成链路轮次。
+
+    字段名与实时 `model_tool_trace.rounds` **保持一致**，前端不必区分历史与实时两种渲染。
+    抽成纯函数是为了可测：归属与鉴权要连数据库，而这段解析逻辑不需要。
+    """
+    rounds: list[dict] = []
+    for row in rows:
+        raw = getattr(row, "detail", None)
+        if not raw:
+            # 空 detail 无法还原任何轮次，跳过——否则会混入一条全 None 的噪音记录
+            continue
+        try:
+            detail = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            # 历史脏数据（审计曾以非 JSON 落库）：跳过该条，而不是让整个接口 500
+            continue
+        rounds.append({
+            "round_index": detail.get("round"),
+            "tool": detail.get("tool"),
+            "arguments": detail.get("arguments") or {},
+            "success": bool(detail.get("success")),
+            "error": detail.get("error"),
+            "evidence_status": detail.get("evidence_status"),
+            "citations": detail.get("citations") or 0,
+            "reasoning": detail.get("reasoning") or "",
+            "duration_ms": detail.get("duration_ms"),
+            "llm_duration_ms": detail.get("llm_duration_ms"),
+            "prompt_tokens": detail.get("prompt_tokens"),
+            "completion_tokens": detail.get("completion_tokens"),
+            "output_preview": detail.get("output_preview") or "",
+            "created_at": getattr(row, "created_at", None),
+        })
+    return rounds
+
+
+@conversation_router.get("/{conversation_id}/trace", response_model=ApiResponse[dict])
+async def get_conversation_trace(request: Request, conversation_id: str,
+                                 limit: int = Query(200, ge=1, le=500),
+                                 user: Annotated[User, Depends(current_user)] = None):
+    """按会话回看 Agent 的工具调用链路——刷新页面后仍能排查。
+
+    数据源是 `customer_agent.tool_call` 审计（每轮工具调用落一条），而不是内存里的
+    model_tool_trace：内存态随请求结束就消失了，审计才是可回溯的真相。
+    返回的 rounds 字段与实时链路**同名同构**，前端可原样喂给链路追踪面板，
+    不必为"历史"和"实时"写两套渲染逻辑。
+
+    权限分成两条路径是有意的：客户只能回看自己的对话；坐席/风控凭 audit:read
+    回看任意对话——排查客诉时他们必须能看到客户那侧到底发生了什么。
+    """
+    if user is None:
+        raise HTTPException(status_code=401, detail={"code": "UNAUTHORIZED", "message": "authentication required"})
+    async with request.app.state.database.session_factory() as session:
+        rows = list((await session.execute(
+            select(AuditLog)
+            .where(AuditLog.action == _TRACE_ACTION, AuditLog.resource_id == conversation_id)
+            .order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+            .limit(limit)
+        )).scalars().all())
+
+    # 归属校验。owners 为空表示会话不存在或从未触发工具调用——两种都放行并返回空列表，
+    # 避免用"403 还是 404"这种差异泄露他人会话是否存在。
+    owners = {row.actor_user_id for row in rows if row.actor_user_id}
+    if _is_customer(user):
+        if owners and user.id not in owners:
+            raise HTTPException(status_code=403, detail={"code": "CUSTOMER_SERVICE_CONVERSATION_SCOPE", "message": "conversation is outside customer scope"})
+    elif not user.is_super_admin and "audit:read" not in _permissions(user):
+        raise HTTPException(status_code=403, detail={"code": "AUDIT_READ_REQUIRED", "message": "audit:read permission required"})
+
+    rounds = _trace_rounds(rows)
+    # decisions / stopped_reason 是**轮次循环之外**的产物，审计按轮落库故无从还原。
+    # 回填空值而非编造：面板 footer 本就按"有值才显示"处理。
+    return ApiResponse(data={"conversation_id": conversation_id, "rounds": rounds,
+                             "decisions": [], "stopped_reason": None, "layer": None},
+                       trace_id=get_trace_id())

@@ -5,6 +5,7 @@ from app.api.annotation import router as annotation_router
 from app.api.auth import router as auth_router
 from app.api.customer_rag import router as customer_rag_router
 from app.api.customer_service import router as customer_service_router
+from app.api.customer_service import conversation_router as customer_service_conversation_router
 from app.api.data_catalog import router as data_catalog_router
 from app.api.health import router as health_router
 from app.api.knowledge import router as knowledge_router
@@ -25,6 +26,7 @@ api_router.include_router(profile_router)
 api_router.include_router(knowledge_router)
 api_router.include_router(customer_rag_router)
 api_router.include_router(customer_service_router)
+api_router.include_router(customer_service_conversation_router)
 api_router.include_router(data_catalog_router)
 api_router.include_router(trading_router)
 api_router.include_router(admin_router)

@@ -16,6 +16,7 @@ duration_ms / prompt_tokens / completion_tokens / output_preview。
 5. output_preview 是**结构性摘要**而非原文，且必须截断。
 """
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -208,3 +209,41 @@ def test_summarize_output_truncates_plain_text():
 def test_summarize_output_reports_failure_reason():
     preview = _summarize_output(answer="", data={}, success=False, error="fact_not_found")
     assert "fact_not_found" in preview
+
+
+# ---------- 6. 审计落库携带观测字段（历史回溯的数据前提） ----------
+
+def test_audit_detail_carries_observability_fields():
+    """审计 detail 必须带上耗时 / token / 输出摘要，否则历史回溯只剩"调过什么"。
+
+    回溯接口的数据源就是审计：审计缺字段，回溯必然缺字段，刷新页面后
+    看不到耗时与 token，而排查恰恰最需要这两个。故在此锁定契约。
+    """
+    decision = {"name": "get_my_workorder_status", "arguments": {"query": "工单"},
+                "reasoning": "查工单状态"}
+    db = FakeDatabase()
+    _run(UsageProvider([decision]), db=db, planned_intents=["workorder_status"])
+
+    assert len(db.audits) == 1
+    detail = json.loads(db.audits[0].detail)
+    assert detail["duration_ms"] is not None, "回溯要能看出这一轮花了多久"
+    assert detail["prompt_tokens"] == 120
+    assert detail["completion_tokens"] == 30
+    assert detail["output_preview"] == "命中 2 条知识块"
+
+
+def test_audit_detail_records_blocked_round_reasoning():
+    """被拦截的轮次，审计要留下理由与 token。
+
+    理由决定回溯时能否回答"模型当时想干什么"；token 决定成本统计是否偏低。
+    两者都曾被漏掉（拦截分支的 _audit 未传 reasoning）。
+    """
+    decision = {"name": "search_customer_knowledge", "arguments": {"query": "工单流程"},
+                "reasoning": "想解释工单流程"}
+    db = FakeDatabase()
+    _run(UsageProvider([decision]), db=db, planned_intents=["workorder_status"])
+
+    detail = json.loads(db.audits[0].detail)
+    assert detail["error"] == "tool_out_of_plan_scope"
+    assert detail["reasoning"] == "想解释工单流程"
+    assert detail["prompt_tokens"] == 120, "被拦截轮次的决策 token 同样要进审计"

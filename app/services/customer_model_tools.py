@@ -292,6 +292,22 @@ def _summarize_output(*, answer: str | None, data: dict | None, success: bool,
     return text[:_OUTPUT_PREVIEW_MAX_CHARS] + ("…" if len(text) > _OUTPUT_PREVIEW_MAX_CHARS else "")
 
 
+def _round_metrics(round_obj: "ToolRound") -> dict:
+    """把 ToolRound 的观测字段抽成审计可携带的字典。
+
+    刻意从**已构造好的 round** 抽取，而不是在审计调用处重算一遍：
+    两处各算一次必然漂移（尤其 output_preview 的截断规则），
+    且会为写审计重复执行一次摘要计算。
+    """
+    return {
+        "duration_ms": round_obj.duration_ms,
+        "prompt_tokens": round_obj.prompt_tokens,
+        "completion_tokens": round_obj.completion_tokens,
+        "llm_duration_ms": round_obj.llm_duration_ms,
+        "output_preview": round_obj.output_preview,
+    }
+
+
 @dataclass
 class ModelToolOutcome:
     """模型自主工具调度的最终产物。"""
@@ -351,8 +367,14 @@ class CustomerModelToolLoop:
     async def _audit(self, *, customer_id: str, conversation_id: str, round_index: int,
                      tool: str, arguments: dict, success: bool, error: str | None,
                      evidence_status: str | None, citations: int,
-                     reasoning: str | None = None) -> None:
-        """每轮工具调用落审计。失败不影响主流程。"""
+                     reasoning: str | None = None,
+                     metrics: dict | None = None) -> None:
+        """每轮工具调用落审计。失败不影响主流程。
+
+        metrics 携带链路追踪的观测字段（耗时 / token / 输出摘要），由 `_round_metrics` 提供。
+        写进审计是为了让**历史回溯**能还原与实时面板一致的画面：否则刷新页面后
+        只剩"调过哪些工具"，看不到"花了多久、消耗多少 token"，而排查恰恰最需要后者。
+        """
         try:
             from app.models.audit import AuditLog
             async with self.database.session_factory() as session:
@@ -367,6 +389,7 @@ class CustomerModelToolLoop:
                         "evidence_status": evidence_status, "citations": citations,
                         "read_only": True, "selection": "model",
                         "reasoning": reasoning or "",
+                        **(metrics or {}),
                     }, ensure_ascii=False),
                 ))
                 await session.commit()
@@ -398,7 +421,7 @@ class CustomerModelToolLoop:
             # 规则补齐**不经过 LLM 决策**，故 token 字段留空（前端显示"—"而非 0）。
             # 这一点对成本归因很重要：把确定性路径也记成 0 token 会低估模型开销，
             # 反过来若记成真实值则与事实不符。
-            outcome.rounds.append(ToolRound(
+            backstop_round = ToolRound(
                 round_index=round_index, tool=tool_name,
                 arguments={"query": query, "intent": intent, "filled_by": "rule_backstop"},
                 success=result.success, error=result.error,
@@ -408,7 +431,8 @@ class CustomerModelToolLoop:
                 output_preview=_summarize_output(
                     answer=getattr(result, "answer", None), data=data,
                     success=result.success, error=result.error),
-            ))
+            )
+            outcome.rounds.append(backstop_round)
             outcome.tool_names.append(tool_name)
             await self._audit(
                 customer_id=customer_id, conversation_id=conversation_id,
@@ -417,6 +441,7 @@ class CustomerModelToolLoop:
                 success=result.success, error=result.error,
                 evidence_status=data.get("evidence_status"),
                 citations=len(data.get("citations") or []),
+                metrics=_round_metrics(backstop_round),
             )
             if result.success:
                 outcome.results.append({
@@ -541,15 +566,17 @@ class CustomerModelToolLoop:
             # 但不能越出计划意图所映射的工具集。
             allowed_tools = _tools_for_intents(planned_intents)
             if allowed_tools and tool_name not in allowed_tools:
-                outcome.rounds.append(ToolRound(
+                off_plan_round = ToolRound(
                     round_index=round_index, tool=tool_name, arguments=arguments,
                     success=False, error="tool_out_of_plan_scope",
                     reasoning=reasoning, **_usage_fields(round_usage),
-                    output_preview="未执行：该工具不在本次计划范围内"))
+                    output_preview="未执行：该工具不在本次计划范围内")
+                outcome.rounds.append(off_plan_round)
                 await self._audit(customer_id=customer_id, conversation_id=conversation_id,
                                   round_index=round_index, tool=tool_name, arguments=arguments,
                                   success=False, error="tool_out_of_plan_scope",
-                                  evidence_status=None, citations=0, reasoning=reasoning)
+                                  evidence_status=None, citations=0, reasoning=reasoning,
+                                  metrics=_round_metrics(off_plan_round))
                 context_lines.append(
                     f"[{tool_name}] 该工具不在本次计划范围内（计划仅涉及：{'、'.join(planned_intents or [])}），"
                     "请改用计划内的工具或直接结束。"
@@ -567,15 +594,17 @@ class CustomerModelToolLoop:
             # 参数，4 次都失败、无任何结果（ISSUE-20260914-TOOL-FAILURE-NOT-FEED-BACK）。
             call_key = f"{tool_name}:{json.dumps(arguments, sort_keys=True, ensure_ascii=False)}"
             if call_key in seen_calls:
-                outcome.rounds.append(ToolRound(
+                duplicate_round = ToolRound(
                     round_index=round_index, tool=tool_name, arguments=arguments,
                     success=False, error="duplicate_call_skipped",
                     reasoning=reasoning, **_usage_fields(round_usage),
-                    output_preview="未执行：与已执行过的调用参数完全相同，跳过"))
+                    output_preview="未执行：与已执行过的调用参数完全相同，跳过")
+                outcome.rounds.append(duplicate_round)
                 await self._audit(customer_id=customer_id, conversation_id=conversation_id,
                                   round_index=round_index, tool=tool_name, arguments=arguments,
                                   success=False, error="duplicate_call_skipped",
-                                  evidence_status=None, citations=0)
+                                  evidence_status=None, citations=0, reasoning=reasoning,
+                                  metrics=_round_metrics(duplicate_round))
                 # 明确告知模型"该调用已试过"，并结束——再循环不会有新信息
                 context_lines.append(
                     f"[{tool_name}] 该调用（参数={arguments}）本轮已执行过且结果相同，不再重复。"
@@ -587,15 +616,17 @@ class CustomerModelToolLoop:
 
             # 硬白名单：模型编造工具名（或试图写操作）在此被拒
             if tool_name not in _ALLOWED_TOOL_NAMES:
-                outcome.rounds.append(ToolRound(
+                not_allowed_round = ToolRound(
                     round_index=round_index, tool=tool_name, arguments=arguments,
                     success=False, error="tool_not_allowed",
                     reasoning=reasoning, **_usage_fields(round_usage),
-                    output_preview="未执行：该工具不在只读白名单内"))
+                    output_preview="未执行：该工具不在只读白名单内")
+                outcome.rounds.append(not_allowed_round)
                 await self._audit(customer_id=customer_id, conversation_id=conversation_id,
                                   round_index=round_index, tool=tool_name, arguments=arguments,
                                   success=False, error="tool_not_allowed",
-                                  evidence_status=None, citations=0)
+                                  evidence_status=None, citations=0, reasoning=reasoning,
+                                  metrics=_round_metrics(not_allowed_round))
                 outcome.stopped_reason = "tool_not_allowed"
                 outcome.decisions[-1]["outcome"] = "rejected_not_allowed"
                 break
@@ -639,7 +670,8 @@ class CustomerModelToolLoop:
                               round_index=round_index, tool=tool_name, arguments=arguments,
                               success=result.success, error=result.error,
                               evidence_status=round_record.evidence_status,
-                              citations=round_record.citations, reasoning=reasoning)
+                              citations=round_record.citations, reasoning=reasoning,
+                              metrics=_round_metrics(round_record))
 
             if result.success:
                 # 意图标注：知识类工具的真实类别由模型传入的 intent 参数决定（company_info/policy/...），

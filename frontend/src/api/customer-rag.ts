@@ -23,6 +23,8 @@ export const customerServiceApi = {
   execute: (content: string, conversationId: string, pageContext = '', resourceId?: string) => http.post('/customer-service/sessions/agent/execute', { content, conversation_id: conversationId, page_context: pageContext, resource_id: resourceId }),
   executeTargeted: (content: string, conversationId: string, pageContext = '', options: UnifiedAgentExecuteOptions = {}) => http.post('/customer-service/sessions/agent/execute', { content, conversation_id: conversationId, page_context: pageContext, resource_id: options.resourceId, target_customer_id: options.targetCustomerId }),
   executePlan: (query: string, conversationId: string) => http.post('/customer-service/sessions/execute-plan', { note: query }, { headers: { 'X-Conversation-Id': conversationId } }),
+  // 历史链路回溯：实时 trace 随请求结束就消失了，刷新后只能从审计还原
+  trace: (conversationId: string) => http.get(`/customer-service/conversations/${conversationId}/trace`),
 }
 
 
