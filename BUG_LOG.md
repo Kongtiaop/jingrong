@@ -4014,3 +4014,179 @@ async def _load_active_user(app, subject)     # 按 sub 查 status=active 用户
    排查"某能力缺失"时应先 grep 是否**已有实现没挂上**，而不是直接新写。
 
 ---
+
+### ISSUE-20260918-TRACE-PANEL-NEVER-RENDERS
+- 日期：2026-09-18
+- 标题：链路追踪面板做完了，但页面上永远不显示
+
+**现象**：对话内链路追踪面板（`AgentTracePanel.vue`）代码完成、单测通过、前端构建通过，
+但用户在智能客服页提问后**什么都看不到**，反馈"没看到哪里有思维链和审计页面"。
+
+**根因**：面板读取的 `data.model_tool_trace` **只在 `app/services/graph_agent_runner.py` 注入**，
+而该 runner 仅在 `agent_graph_enabled=True` 时被 API 使用；图内的 `model_tool` 节点
+又受 `agent_model_tool_selection_enabled` 控制（`graph.py:350`）。
+这两个开关**默认都是 `false`**（`app/core/settings.py:68,82`），
+于是默认走确定性管线 → 产出的是另一套 `data.tool_calls`
+（结构仅 tool/iteration/success/error/evidence_status，**无思维链、无耗时、无 token**）
+→ 面板 `v-if="rounds.length"` 恒为假 → 永不渲染。
+
+实测（`POST /customer-service/sessions/agent/execute`，query="我有没有风险限制"）：
+两个 task 均无 `model_tool_trace`；`risk_public` 的 `execution_mode=bounded_react`，
+链路数据在 `tool_calls` 里。
+
+**修复**：`docker-compose.p0.yml` 两个开关默认值改 `true`（保留 `${VAR:-true}` 便于回滚）；
+`docs/OBSERVABILITY_IMPLEMENTATION_PLAN.md` 3.5 补记该前置条件。
+修复后实测 `model_tool_trace` 正常产出，含 `layer` 分层、耗时、token。
+
+**方法论教训（重要）**：
+1. **"代码正确"≠"运行时走得到"**。本次单测锁住了字段契约（558 passed），
+   却没验证"这条代码路径是否真的被执行"——而默认开关可以让整条链路永不运行。
+   验收清单里那条"发起一次会触发工具调用的问答"恰恰最关键，当时未执行。
+2. **接入新能力前先确认目标路径的默认状态**，不要假设"写好了就会跑"。
+3. 同一语义存在**两条互不相通的实现**时（此处 `tool_calls` vs `model_tool_trace`），
+   消费方必须明确对接的是哪一条，否则会出现"数据明明有、界面就是空"的假象。
+
+---
+
+### ISSUE-20260918-REASONING-ALWAYS-EMPTY
+- 日期：2026-09-18
+- 标题：思维链正文恒为空——取值通道选错，且 prompt 从未要求该字段
+
+**现象**：链路面板的「调用理由」（`ToolRound.reasoning`）**永远为空字符串**，
+而这正是用户最想看的"思维链"本体。
+
+**排查过程（先证伪了一个省事的假设）**：
+- 假设一：prompt 没要求模型给理由 → 在 `_TOOL_LOOP_SYSTEM` 加第 9 条
+  「调用前先简述判断依据」后**实测仍为空**，排除。
+- 真因：`app/infrastructure/qwen.py:461` 把 `reasoning` 取自 tool_call **同帧的
+  `message.content`**。而 OpenAI 兼容接口在返回 `tool_calls` 时该字段**恒为空**
+  （DashScope 实测如此）——接口行为，prompt 无法改变。
+
+**修复**：把 `reasoning` 声明为 **tool schema 的必填参数**
+（`_inject_reasoning_param(CUSTOMER_READ_TOOL_SCHEMAS)`），模型发起调用时填进
+`arguments.reasoning`；代码取出后**立即 pop 剥离**，兜底才回退到 `content` 路径。
+
+剥离是必须的，否则引入两个**静默**故障：
+1. 工具收到一个它不认识的 `reasoning` 参数（污染入参）；
+2. 重复调用闸门按 `(工具, 参数)` 判重，而每轮理由措辞略有不同
+   → 真正相同的调用不再被判重，**闸门失效**。
+
+**验证**：query="你们公司的主营业务是什么" 实测：
+```
+#1 search_customer_knowledge ok=True  reasoning=查询公司基本信息，确认主营业务范围以回答用户问题
+#2 search_customer_knowledge ok=True  reasoning=为了获取公司基本信息…需查询知识库中的公司信息类别
+#3 search_customer_knowledge ok=False duplicate_call_skipped
+   reasoning=…需调用知识库中 company_info 类别进行检索
+```
+`#3` 被正确判重，**反证剥离干净**：若未剥离，它与 `#2` 理由措辞不同、参数不同，会躲过闸门。
+
+**方法论教训**：
+1. **依赖第三方接口"顺带提供的字段"前，先验证它在目标调用路径上真的有值**，
+   不能只看字段存在就认为拿得到。声明为必填参数才是可靠通道。
+2. **先排除"最省事的假设"再往下走**——本次正是先证伪了"prompt 没写"，
+   才没在错误方向上继续堆 prompt。
+
+---
+
+### ISSUE-20260918-WHY-RECOMMEND-RETURNS-LIST
+- 日期：2026-09-18
+- 标题：问「为什么推荐」得到同一份清单——疑问词在意图判定中完全失效
+
+**现象**：用户问「为什么推荐这些产品给我」，回答与「给我推荐」**一字不差**，
+都是同一份产品清单；用户想要的是推荐依据。
+
+实测：`route=customer_recommendation`、`intent=product_recommendation`、无 `model_tool_trace`。
+
+**根因**：`app/services/customer_intent.py:141` 触发词表里
+`("product_recommendation", "推荐", "suitability", .88)` ——
+**只要句中出现「推荐」二字就把整句判成产品推荐**，疑问词（为什么/依据/凭什么）不参与判定。
+且 `product_recommendation` 的执行分支本就没有"解释理由"的产出。
+
+**修复**：
+1. 新增 `_EXPLAIN_RECOMMEND_RE` 识别「解释词 ↔ 推荐/产品」组合，
+   在 `plan()` 中**先于** `_BUY_ELIGIBILITY_RE` 与模式表判定，命中即返回新意图
+   `recommendation_explanation`。正则必须**双向**匹配——第一版只写了「解释词在前」，
+   实测「这些产品是怎么选出来的」漏判成 `faq`（"这些产品"在解释词之前）。
+2. 执行侧抽出 `_build_recommendation()`，**推荐与解释共用同一份适当性结果**；
+   新增纯函数 `explain_recommendation()` 输出依据。
+   共用是有意的：否则解释里写的规则会与实际筛选规则**漂移**，用户按解释核对反而对不上。
+3. 连带修复：解释文本曾**重复一遍产品清单**——`suitability_service.py:169,172` 的
+   `preference_note` 本身就是「产品清单+理由」的浓缩，拼在已列产品的解释后面即复读。已移除。
+
+**验证**：输出含风险等级、可投资产、两条硬性筛选条件、逐条匹配理由、被排除数量。
+测试 `tests/test_recommendation_explanation.py` 8 例（含"不误伤正常推荐请求"
+与"字段缺失降级"）；全量 570 passed。
+
+**方法论教训**：
+1. **单关键词触发词表处理不了"疑问词 + 关键词"的组合语义**。
+   凡"问法不同但都含同一个名词"的场景（为什么推荐/怎么推荐/凭什么推荐），
+   都需显式组合规则，否则疑问词被吞掉。
+2. 规则要**双向**覆盖词序——中文问句的语序比想象的灵活。
+
+---
+
+### ISSUE-20260918-REPEATED-SAME-INTENT-LOOP
+- 日期：2026-09-18
+- 标题：同一意图换措辞反复检索，直到预算耗尽
+
+**现象**：query=「公司客户规模」连续 4 次调用 `search_customer_knowledge`，
+措辞各不相同（"公司客户规模、客户数量或客户群体范围" / "贵公司客户规模有多大？" /
+"公司客户规模" / "公司客户规模、客户数量、服务客户总数等公开信息"），
+**命中的是同一批知识块（2~5 条）**，却一路调到 `budget_exhausted`。
+总耗时 28668ms、6651 tokens。答案正确，但多出的 3 次调用纯属浪费。
+
+**根因**：源码本有三条「阻止重复」路径，其中两条已带明确提示：
+- `tool_out_of_plan_scope`（越界）→ 提示 + break
+- `duplicate_call_skipped`（参数完全相同）→ 提示 + break
+
+唯独「**同一意图已成功过**」（`existing is not None` 分支）只把
+`result.answer[:600]` **再回灌一遍**就 `continue`。
+模型据此看到的是"我拿到了一批资料"，而非"我拿到的是**刚才那批**"，于是继续改写问法重试。
+
+**修复**：
+1. 该分支改为明确告知：意图已有结果、本次返回的是**同一批资料**、
+   改写问法不会让检索结果变得不同、已能回答就**直接结束本轮的调用**。
+2. prompt 第 6 条同步补充同一规则（软引导 + 硬提示双保险）。
+
+**验证**：同一 query 实测调用次数 **4 → 2**，第二次 `stopped=duplicate_call_skipped`。
+（单次采样，LLM 有随机性，不可断言稳定为 2；但机制上"改写措辞"与"原样重复"
+两条路现在都有拦截。）全量 572 passed。
+
+**方法论教训**：
+- **回灌内容 ≠ 回灌状态**。把原始结果再喂一遍，模型无法感知"这是重复"；
+  必须显式说明**它的行为状态**（你重复了、原因是什么、下一步该做什么），
+  否则模型会一直在原地优化那个它认为"还没做好"的动作。
+
+---
+
+### ISSUE-20260918-REDACT-DEAD-CODE-AND-AUDIT-PII（勘查完成，未修复）
+- 日期：2026-09-18
+- 标题：脱敏工具是死代码；审计记录留存用户输入原文
+
+**现象（勘查结论）**：
+1. `app/common/security/redaction.py` 仅 11 行（`redact()` 保留头 3 尾 4 + `audit_context()`），
+   **全仓库零调用——是死代码**。有工具，没人用。
+   （注：`data_analysis_agent.py` 曾被关键词误命中，实为注释里的英文单词 masks。）
+2. `audit_logs` 中 `customer_agent.tool_call` 的 detail 实测包含
+   `arguments.query` = **用户输入原文**。若客户输入含手机号/身份证号，会原样落库，
+   而审计可被有 `audit:read` 权限的员工经 `/trace` 接口回溯查看。
+
+**同时确认的三处「干净」**（避免过度设计）：
+- 日志中 `contact_phone`、`risk_level=`、`total_asset=` **零匹配**；
+  无 `logger` 打印 content/query/payload 的调用
+- `password_hash` 不在任何 schema / api 中，不会返回前端
+- 模型输出预览已摘要化（`output_preview` 只出结构描述）
+
+⚠️ 但上述"干净"目前**靠开发者自觉，没有兜底机制**——这是要做通用脱敏能力的核心理由。
+
+**拟定方案（待确认范围）**：统一 `app/common/security/pii.py`，在数据流出边界应用——
+① 日志层 `logging.Filter` 全局兜底（零侵入）；② 审计写库前对自由文本脱敏；
+③ 收编死代码 `redact`，补手机号/身份证/银行卡/邮箱/姓名规则。
+
+**排查教训（误报）**：初查用 `1[3-9][0-9]{9}` 扫日志命中大量 11 位数字，
+差点判定为"手机号泄漏"。实际是 **Redis Stream 的 message_id**
+（`1786612747148-0`，时间戳-序号格式）被截取命中。
+→ **纯长度/前缀正则识别 PII 误报率极高**，必须带边界约束（前后非数字），
+并优先结合**字段名**判断而非只扫内容；设计脱敏规则时须一并防误报（脱敏过度同样有害）。
+
+---
