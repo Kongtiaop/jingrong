@@ -876,3 +876,53 @@ def test_low_confidence_hint_discourages_tool_switch():
     asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="q"))
     feedback = provider.calls[1]["user"]
     assert "不要改调" in feedback or "请勿改调" in feedback
+
+
+# ---------- 同一意图重复检索：必须明确劝阻 ----------
+
+def test_repeated_same_intent_tells_model_to_stop():
+    """同一意图换措辞重试时，必须明确告知模型「已有结果、别再重复」。
+
+    实测（2026-09-18）「公司客户规模」连续 4 次 search_customer_knowledge，
+    措辞各不相同却命中同一批知识块，28.7s / 6651 tokens 后 budget_exhausted。
+    答案是对的，但多出的 3 次调用纯属浪费。
+    此前该分支只把相同内容再回灌一遍——模型据此看不出自己在原地打转，于是继续改写。
+    """
+    decisions = [
+        {"name": "search_customer_knowledge",
+         "arguments": {"query": "公司客户规模", "intent": "company_info"}},
+        {"name": "search_customer_knowledge",
+         "arguments": {"query": "贵公司客户规模有多大", "intent": "company_info"}},
+        None,
+    ]
+    provider = FakeProvider(decisions)
+    loop = CustomerModelToolLoop(provider=provider, tools=FakeReadTools(),
+                                 database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1", query="公司客户规模"))
+
+    assert len(outcome.results) == 1, "同一意图不应产出多个 task"
+    # 第三次请求的 user_block 里带着第二轮回灌 → 应出现明确的重复提示
+    third_user = provider.calls[2]["user"]
+    assert "同一批资料" in third_user, "必须点明返回的是同一批资料"
+    assert "不要用不同措辞反复检索" in third_user, "必须劝阻换措辞重试"
+
+
+def test_different_intents_still_get_separate_results():
+    """多意图 query 仍须各得一个结果——修复不得误伤这条路径。
+
+    （源码注释里记录过相关历史教训：曾因「事实类工具一次成功即 break」
+    导致多意图 query 丢掉第二个 task。）
+    """
+    decisions = [
+        {"name": "search_customer_knowledge",
+         "arguments": {"query": "风险制度", "intent": "risk_public"}},
+        {"name": "get_my_risk_restriction", "arguments": {}},
+        None,
+    ]
+    loop = CustomerModelToolLoop(provider=FakeProvider(decisions), tools=FakeReadTools(),
+                                 database=FakeDatabase(), max_rounds=4)
+    outcome = asyncio.run(loop.run(customer_id="c1", conversation_id="v1",
+                                   query="我有没有风险限制",
+                                   planned_intents=["risk_public", "risk_restriction"]))
+    intents = {r["intent"] for r in outcome.results}
+    assert len(outcome.results) == 2, f"多意图应各自成 task，实际 {intents}"

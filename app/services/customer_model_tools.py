@@ -360,6 +360,8 @@ _TOOL_LOOP_SYSTEM = (
     "5. **多意图问题要逐个覆盖**：例如'我有没有风险限制'既需要查账户的事实限制，也可能需要解释风险制度，"
     "两类依据都应取得后再结束。\n"
     "6. 用户问题已被前面的工具结果完整覆盖时，直接结束（不再调用）。\n"
+    "   注意：**改写问法不会让检索结果变得不同**。同一意图不要用不同措辞反复检索；"
+    "若看到「该意图此前已取到结果」的提示，说明你已经重复了，请立即结束本轮的调用。\n"
     "7. **工具调用失败时留在同一意图内**：换参数或改写 query 重试；"
     "**不要改调与用户问题无关的其他工具**（例如查订单失败后不要改查工单或知识库），"
     "反复失败就停止，交由下游提示用户补充信息或转人工。\n"
@@ -718,7 +720,19 @@ class CustomerModelToolLoop:
                 if existing is not None:
                     existing["answer"] = result.answer or existing["answer"]
                     existing["data"] = {**existing["data"], **data}
-                    context_lines.append(f"[{tool_name}] {result.answer[:600]}")
+                    # 同一意图此前已成功取到结果，本次属于**换措辞重试**。
+                    # 只把同样的内容再回灌一遍是不够的：模型据此看不出自己在原地打转，
+                    # 会继续改写 query 直到预算耗尽。实测「公司客户规模」连续 4 次调用
+                    # search_customer_knowledge（措辞各不相同、命中同一批知识块），
+                    # 总耗时 28.7s、6651 tokens，最终 stopped_reason=budget_exhausted——
+                    # 答案是对的，但多花的 3 次调用纯粹是浪费。
+                    # 故此处明确告知「已有结果、不要重复检索」，并给出停止指引。
+                    context_lines.append(
+                        f"[{tool_name}] 意图「{intent_label}」此前已取到结果，"
+                        "本次检索返回的是**同一批资料**。"
+                        "同一意图不要用不同措辞反复检索——改写问法不会让检索结果变得不同；"
+                        "若这些资料已能回答用户的问题，请**直接结束本轮的调用**。"
+                    )
                     continue
                 outcome.results.append({
                     "task_id": f"model-tool-{round_index}",
