@@ -682,7 +682,15 @@ class SupervisorGraph:
             generated = await self.answer_generator.generate(
                 query=gen_query, result=rag_result)
             r["answer"] = generated.answer
-            r["data"] = {**(r.get("data") or {}), "generation_status": generated.generation_status}
+            r["data"] = {
+                **(r.get("data") or {}),
+                "generation_status": generated.generation_status,
+                # 暴露「资料不足」这一判断的来源：explicit=模型输出的显式标记，
+                # keyword=回退通道扫文本命中标记词。不暴露就无法区分
+                # 「模型认为没答全」和「措辞恰好撞上标记词」——两者的处置完全不同
+                # （前者要调生成尺度，后者要改匹配规则）。
+                "insufficient_source": getattr(generated, "insufficient_source", ""),
+            }
             # 中间态：拿到了引用、生成了答案，但答案**自述资料不足**（引用没覆盖问题本身）。
             # 此前只有 succeeded/failed 两态，这类"半成功"被标成 succeeded → summarize 判
             # `completed`，用户看到"资料不足"却被告知问题已解决

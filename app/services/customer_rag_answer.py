@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from app.infrastructure.qwen import QwenProvider
@@ -23,6 +24,14 @@ class CustomerRagAnswer:
     # 这是 ISSUE-20260914-NO-PARTIAL-STATE 的中间态信号：此前只有 succeeded/failed 两态，
     # 导致"引用了相关制度但答不出具体流程"被标成 succeeded+completed，用户误以为问题已解决。
     insufficient: bool = False
+    # insufficient 这个判断的**来源**，用于区分两种性质完全不同的情况：
+    #   "explicit" = 模型输出的 [[evidence:...]] 标记      → 模型认为没答全
+    #   "keyword"  = 回退通道扫描答案文本命中标记词        → 可能只是措辞撞上了（易误判）
+    #   "empty"    = 模型只回了标记没写正文
+    #   ""         = 未做该判断（未生成/无引用）
+    # 保留它是为了可观测：排查"为什么被标资料不足"时，必须能分清
+    # 是模型真的这么认为，还是关键词匹配误伤——两者的处置完全不同。
+    insufficient_source: str = ""
 
 
 # 制度/规则类意图：检索的是**制度文本**，无从知道客户个人状态。
@@ -42,11 +51,45 @@ _INSUFFICIENT_MARKERS = (
 
 
 def answer_reports_insufficient(text: str) -> bool:
-    """答案是否自述"资料不足/引用未涵盖"——用于判定半成功。"""
+    """答案是否自述"资料不足/引用未涵盖"——用于判定半成功。
+
+    ⚠️ 这是**回退**通道，只在模型未输出显式标记时使用（见 `split_evidence_flag`）。
+    它靠字符串匹配推断状态，本质上不可靠：
+    - 模型不会严格沿用约定措辞，换个说法就漏判；
+    - 更麻烦的是**误判**——模型在礼貌性补充说明里同样会用到这些词。
+      实测（2026-09-18）：答案已完整给出客户规模数据（862万/473万等），
+      却因结尾一句「如需了解更详细的客户结构…当前引用资料未提供，建议联系人工客服」
+      命中 `未提供` 与 `资料未`，整条被判为 `partially_answered`。
+      那句话说的是「你追问的附加信息没覆盖」，与「你问的问题没答上」是两回事。
+    保留宽标记是因为金融场景下**漏判比误判更糟**（用户以为问到了、实际没有）。
+    """
     body = (text or "").strip()
     if not body:
         return False
     return any(marker in body for marker in _INSUFFICIENT_MARKERS)
+
+
+_EVIDENCE_FLAG_RE = re.compile(r"\[\[\s*evidence\s*:\s*(sufficient|insufficient)\s*\]\]", re.IGNORECASE)
+
+
+def split_evidence_flag(text: str) -> tuple[str, bool | None]:
+    """剥离模型输出的机器可读证据标记，返回 (给用户看的正文, 是否资料不足)。
+
+    返回的第二个值为 `None` 表示模型没输出标记（应回退到关键词匹配）。
+
+    为什么要显式标记：状态判定此前完全依赖**扫描生成文本的措辞**，
+    而模型的自述措辞既不稳定、又会与礼貌性免责声明混淆（详见上方 docstring 的实测）。
+    显式标记把「模型自己的判断」与「它恰好用到的词」解耦。
+    这与 reasoning 改用 tool schema 必填参数是同一思路：
+    凡是要机器读的东西，都别指望从自然语言里猜。
+    """
+    body = (text or "").strip()
+    match = _EVIDENCE_FLAG_RE.search(body)
+    if match is None:
+        return body, None
+    # 标记行必须剥离——它是内部约定，不能让客户看到
+    cleaned = _EVIDENCE_FLAG_RE.sub("", body).strip()
+    return cleaned, match.group(1).lower() == "insufficient"
 
 
 def build_answerability_judge(provider: QwenProvider):
@@ -129,7 +172,19 @@ class CustomerRagAnswerService:
             )
         prompt = (
             "你是财富管理平台客服助手。只能根据提供的引用回答，不得编造、承诺收益或执行任何交易。"
-            "如果引用不足以回答，必须明确说资料不足并建议转人工。使用清晰、谨慎、客户可理解的中文。"
+            "如果引用不足以回答，必须明确说资料不足并建议转人工。使用清晰、谨慎、客户可理解的中文。\n"
+            # 机器可读的证据状态标记。为什么必须显式标注：
+            # 此前状态判定靠**扫描答案文本里的关键词**（_INSUFFICIENT_MARKERS），
+            # 而模型在礼貌性补充说明里同样会用到那些词——实测答案已完整给出客户规模数据，
+            # 却因结尾一句「如需了解更详细的客户结构…当前引用资料未提供」命中 `未提供`，
+            # 被误判为资料不足（partially_answered）。显式标记把「模型自己的判断」
+            # 与「它恰好用到的词」解耦。
+            "\n回答的最后必须另起一行，单独输出证据状态标记，严格二选一：\n"
+            "[[evidence:sufficient]]   —— 引用足以回答用户的问题\n"
+            "[[evidence:insufficient]] —— 引用缺少关键依据，无法完整回答\n"
+            "注意：标记只反映「用户所问的问题」是否答得上。"
+            "若问题本身已答清，只是附带说明了别的信息未覆盖，仍应标 sufficient。\n"
+            "该标记行仅供系统判定，不要在正文里提及或解释它。\n"
             f"{role_block}\n\n"
             f"客户问题：{query}\n\n引用资料：\n{evidence}{history_block}"
         )
@@ -148,8 +203,18 @@ class CustomerRagAnswerService:
             text = (response.choices[0].message.content or "").strip()
             if not text:
                 return CustomerRagAnswer(answer=result.message, generation_status="empty_response",
-                                         insufficient=True)
-            return CustomerRagAnswer(answer=text, generation_status="generated",
-                                     insufficient=answer_reports_insufficient(text))
+                                         insufficient=True, insufficient_source="empty")
+            # 优先采信模型显式输出的证据标记；未输出时回退到关键词匹配（旧行为）。
+            answer_text, flagged = split_evidence_flag(text)
+            if flagged is None:
+                insufficient, source = answer_reports_insufficient(answer_text), "keyword"
+            else:
+                insufficient, source = flagged, "explicit"
+            if not answer_text:
+                # 极端情况：模型只回了标记、没写正文。退回原文并把标记视为不可信，
+                # 宁可让用户看到带标记的原样文本，也不要返回空答案。
+                answer_text, insufficient, source = text, True, "empty"
+            return CustomerRagAnswer(answer=answer_text, generation_status="generated",
+                                     insufficient=insufficient, insufficient_source=source)
         except Exception:  # noqa: BLE001
             return CustomerRagAnswer(answer="当前回答服务暂时不可用，已保留检索依据并建议转人工客服。", generation_status="generation_failed")
