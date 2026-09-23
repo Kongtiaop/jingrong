@@ -4274,4 +4274,64 @@ def answer_reports_insufficient(text): return any(m in text for m in _INSUFFICIE
 
 ---
 
+### ISSUE-20260923-CONVERSATION-TURN-ORDER
+- 日期：2026-09-23
+- 标题：会话历史里同一轮的问与答顺序错乱
+
+**现象**：新增会话持久化后，实测读回的历史消息顺序错误：
+```
+[user] 公司客户规模有多大
+[assistant] 根据最新公开资料…        ← 第 1 轮，正确
+[assistant] "双录"是…                ← 第 2 轮的回答排到了提问前面
+[user] 什么是双录
+```
+
+**根因**：`agent_conversation_message.created_at` 用 `server_default=func.now()`，
+而 **PostgreSQL 的 `now()` 在同一事务内返回同一时刻**（事务开始时间）。
+同一轮的问与答在**一次事务**里 `add_all` 插入 → 两条时间戳**完全相同**
+→ 排序 `ORDER BY created_at, id` 退化为按 UUID 随机比大小。
+
+**修复**：落库时显式指定时间戳，assistant 比 user 晚 1ms。
+不选"加自增序号列"是因为那需要额外维护会话内计数；
+1ms 偏移既保证顺序，又不改变"按时间浏览"的语义。
+
+**验证**：修复后实测两轮问答顺序完全正确。
+
+**方法论教训**：
+1. **`now()` 是事务级的，不是语句级的**。凡在一次事务内插入"有先后含义"的多行，
+   都不能指望 `server_default=func.now()` 给出有区分度的时间戳。
+2. 这类缺陷**只在多轮场景下暴露**——单轮（一问一答）测试完全看不出问题。
+   验证与时序相关的功能时，样本必须覆盖**两轮以上**。
+
+---
+
+### ISSUE-20260923-ALEMBIC-VERSION-DRIFT（环境问题，未根治）
+- 日期：2026-09-23
+- 标题：alembic 版本记录落后于实际 schema，导致迁移中断
+
+**现象**：执行 `alembic upgrade head` 失败：
+```
+asyncpg.exceptions.DuplicateColumnError: column "scope" of relation "customer_memory" already exists
+[SQL: ALTER TABLE customer_memory ADD COLUMN scope VARCHAR(32) DEFAULT 'private' NOT NULL]
+```
+
+**诊断**：
+- `alembic current` → `0023_bad_case`（版本记录）
+- `alembic heads` → `0026_agent_conversation_message`
+- 但实际 schema **已含 0024 的全部变更**：`scope` / `agent_type` 两列，
+  `ix_customer_memory_scope` / `ix_customer_memory_agent_type`，
+  以及重建后的 `uq_customer_memory_active_key` 索引**全部存在**
+
+即 DDL 已经生效，只是 alembic 版本表没跟上。
+
+**处置**：逐项核对 0024 的变更确已应用后，`alembic stamp 0024_shared_memory`
+补上版本记录，再 `upgrade head` 升级至 0026。
+
+**未根治**：没有查清"DDL 是怎么在 alembic 之外被应用的"。
+可疑方向：`docker/postgres/init` 下的初始化脚本，或某次手工执行未回写版本。
+本项目此前也有"两套 schema 初始化并存"的记录，疑为同源。
+**遗留风险**：只要脱节存在，后续任何新迁移都可能再次中断。
+
+---
+
 ---
