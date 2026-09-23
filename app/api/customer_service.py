@@ -957,8 +957,11 @@ async def confirm_conversation_handoff(request: Request, conversation_id: str,
     确定性系统 + 用户确认），转人工做成「建议 → 用户确认 → 执行」，
     与交易草稿的「预检 → 确认 → 下单」同构。
 
-    注意：用户**主动**说"转人工"时不会走到这里——那条路径由 agent 直接建单
-    （那是明确意图，再弹确认反而碍事）。
+    注意：用户**主动**说"转人工"时也走这里。统一走确认有两个理由：
+    1. 系统本来就会先问一句"是否现在转接人工客服？"——直接建单会让这句问话变成空话
+       （实测 query=「转人工」：答案里既问'是否现在转接'、又写'已为您转接'，自相矛盾）；
+    2. 建单是**唯一的**副作用型动作，只留一个入口才可能保证「没有确认就没有工单」。
+    代价是多一次点击，但换来的是"用户没点过就不会有工单"这一可验证的性质。
 
     权限：**仅客户本人**可确认。员工即使有 audit:read 也不得代按——
     确认表达的是用户意愿，不能由他人代为作出。
@@ -970,16 +973,22 @@ async def confirm_conversation_handoff(request: Request, conversation_id: str,
                                                      "message": "only the customer can confirm handoff"})
 
     async with request.app.state.database.session_factory() as session:
-        owners = set((await session.execute(
-            select(AgentConversationMessage.customer_id)
+        rows = list((await session.execute(
+            select(AgentConversationMessage)
             .where(AgentConversationMessage.conversation_id == conversation_id)
-            .distinct()
+            .order_by(AgentConversationMessage.created_at.desc(), AgentConversationMessage.id.desc())
+            .limit(20)
         )).scalars().all())
-    _require_conversation_access(owners, user)
+    _require_conversation_access({row.customer_id for row in rows if row.customer_id}, user)
+
+    # 用**用户真实问过的那句**建单，而不是固定字符串。
+    # 工单侧按 sha256(intent:query) 去重，若固定传"用户确认转人工"，
+    # 同一客户此后每次确认都会命中同一条工单——实测复用了 2026-08-14 的旧单号。
+    original_query = next((row.content for row in rows if row.role == "user" and row.content), "") or "用户确认转人工"
 
     handoff = await CustomerRagHandoffService(request.app.state.database).handoff(
         customer_id=user.id,
-        query="用户确认转人工",
+        query=original_query,
         intent="human_handoff",
         # 用 customer_requested：用户确认后的转人工在业务语义上等同于用户主动要求，
         # 复用既有取值可避免下游（工单分类、坐席分配）需要认识新枚举。

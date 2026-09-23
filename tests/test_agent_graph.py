@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.agents.checkpointer import memory_checkpointer, thread_config
-from app.agents.graph import SupervisorGraph
+from app.agents.graph import SupervisorGraph, _handoff_reason
 from app.schemas.agents import AgentState
 from app.services.customer_intent import IntentPlan, IntentTask
 from app.services.customer_task_executor import TaskExecutionResult
@@ -89,6 +89,10 @@ def test_clarification_twice_handoff():
     final = asyncio.run(graph.ainvoke(_base_state(clarification_count=1)))
     assert final["overall_status"] == "handoff"
     assert final["needs_handoff"] is True
+    assert final["handoff_suggested"] is True
+    assert final["handoff_reason"] == "clarification_exhausted"
+    # 澄清耗尽也只是「建议」——建单必须等用户确认
+    assert not final.get("customer_service_session_id")
 
 
 def test_readonly_knowledge_intent_uses_react_loop():
@@ -279,3 +283,86 @@ def test_mixed_tasks_keep_partial_status_but_no_global_prompt():
     assert "partially_answered" in statuses and "succeeded" in statuses, statuses
     assert final["overall_status"] == "partially_answered"
     assert not final.get("clarification"), "无 task 带 clarification → 整体不应有提示"
+
+
+# ---------- 转人工：一律「建议 + 确认」，任何路径都不得静默建单 ----------
+#
+# 背景（2026-09-23 实测）：query=「转人工」时前端永远不弹确认卡片，工单与人工会话
+# 却已经建好；而答案里同时写着「是否现在转接人工客服？」——系统自己问自己答。
+# 根因是建单分支把「没有 low_confidence」当成了「用户主动要求」的**兜底判据**，
+# 于是任何其他来源的 needs_handoff 都会落到那一支被静默建单。
+# 现在：判定用显式判据（见 _handoff_reason），建单唯一入口是用户点确认后的接口。
+
+class FakeLowConfidenceExecutor:
+    async def execute(self, *, customer_id: str, plan: IntentPlan):
+        return [
+            TaskExecutionResult(t.task_id, t.intent, "failed", answer="",
+                                error="low_confidence", data={})
+            for t in plan.tasks
+        ]
+
+
+def _handoff_planner(*intents, requires_handoff: bool = False):
+    class _Planner:
+        def plan(self, query: str):
+            return IntentPlan(
+                normalized_query=query,
+                tasks=[IntentTask(f"t{i + 1}", it, "handoff", query, confidence=0.99)
+                       for i, it in enumerate(intents)],
+                requires_handoff=requires_handoff)
+    return _Planner()
+
+
+def test_handoff_reason_prefers_explicit_user_request():
+    """判据按**具体程度**排序：用户明确表态优先于系统推断。
+
+    末一条是关键回归点——两者皆否时必须落到 clarification_exhausted，
+    而不能像修复前那样被当成 customer_requested 去建单。
+    """
+    requested = IntentPlan(normalized_query="q",
+                           tasks=[IntentTask("t1", "human_handoff", "handoff", "q")])
+    other = IntentPlan(normalized_query="q",
+                       tasks=[IntentTask("t1", "faq", "rag_explanation", "q")])
+    assert _handoff_reason(plan=requested, low_confidence=True) == "customer_requested"
+    assert _handoff_reason(plan=requested, low_confidence=False) == "customer_requested"
+    assert _handoff_reason(plan=other, low_confidence=True) == "low_confidence"
+    assert _handoff_reason(plan=other, low_confidence=False) == "clarification_exhausted"
+
+
+def test_user_requested_handoff_still_needs_confirmation():
+    """用户主动说"转人工"也不能直接建单——同样要过确认卡片。"""
+    graph = SupervisorGraph(planner=_handoff_planner("human_handoff", requires_handoff=True),
+                            executor=FakeExecutor()).build()
+    final = asyncio.run(graph.ainvoke(_base_state(user_message="转人工")))
+
+    assert final["handoff_suggested"] is True
+    assert final["handoff_reason"] == "customer_requested"
+    assert not final.get("work_order_id"), "未确认前不得建工单"
+    assert not final.get("ticket_no")
+    assert not final.get("customer_service_session_id"), "未确认前不得开人工会话"
+
+
+def test_low_confidence_only_suggests_handoff():
+    """检索低置信：只建议，不建单。"""
+    graph = SupervisorGraph(planner=_handoff_planner("faq"),
+                            executor=FakeLowConfidenceExecutor()).build()
+    final = asyncio.run(graph.ainvoke(_base_state()))
+
+    assert final["handoff_suggested"] is True
+    assert final["handoff_reason"] == "low_confidence"
+    assert not final.get("customer_service_session_id")
+
+
+def test_human_handoff_intent_does_not_reach_tool_loop():
+    """转人工是确定性意图，不得被送进只读工具轮（会产出错误答案）。"""
+    calls = []
+
+    class RecordingTool:
+        async def execute(self, *, name, customer_id, query, intent, entities):
+            calls.append(name)
+            return SimpleNamespace(success=True, error=None, data={}, answer="")
+
+    graph = SupervisorGraph(planner=_handoff_planner("human_handoff", requires_handoff=True),
+                            executor=FakeExecutor(), react_tool=RecordingTool()).build()
+    asyncio.run(graph.ainvoke(_base_state(user_message="转人工")))
+    assert calls == [], f"转人工不应调用知识检索工具，实际调用了 {calls}"

@@ -80,6 +80,26 @@ def _plan_to_dict(plan: IntentPlan) -> dict:
     }
 
 
+def _handoff_reason(*, plan: IntentPlan, low_confidence: bool) -> str:
+    """判定「建议转人工」的由来——决定前端确认卡片的措辞。
+
+    三种可能，**每一种都必须是显式判据**：
+      customer_requested      用户明确说了要转人工（plan 里有 human_handoff 任务）
+      low_confidence          检索置信不足，系统判定答不好
+      clarification_exhausted 反复澄清仍缺参数，系统判定答不了
+
+    为什么强调"显式"：此前这段逻辑是「没有 low_confidence 就当作 customer_requested」，
+    即把用户要求当成了**兜底分支**。后果是任何其他来源的 needs_handoff
+    （plan.requires_handoff、handoff_node 已判过的澄清耗尽）都会落到该分支被当成
+    "用户要求"，从而静默建单、绕过确认——实测 query=「转人工」正是如此：
+    响应里 handoff_suggested 恒为 False，前端永远不弹卡片，工单却已经建好了。
+    判据按**具体程度**排序：用户明确表态优先于系统推断。
+    """
+    if any(t.intent == "human_handoff" for t in plan.tasks):
+        return "customer_requested"
+    return "low_confidence" if low_confidence else "clarification_exhausted"
+
+
 def _active_product_from_short_term(short_term: dict) -> str | None:
     """从短时记忆里取"当前对话活跃产品"，供指代消解（与管线同逻辑）。"""
     ap = short_term.get("active_product")
@@ -294,13 +314,24 @@ class SupervisorGraph:
         plan = _rebuild_plan(state.plan)
         overall, clarification, aggregate_answer = CustomerTaskExecutor.summarize(
             results, requires_handoff=plan.requires_handoff)
-        needs_handoff = plan.requires_handoff or any(r.error == "low_confidence" for r in results)
-        return {
+        low_confidence = any(r.error == "low_confidence" for r in results)
+        needs_handoff = plan.requires_handoff or low_confidence
+        patch: dict[str, Any] = {
             "overall_status": overall,
             "clarification": clarification,
             "final_response": aggregate_answer or "当前没有可返回的结果，建议转人工客服。",
             "needs_handoff": needs_handoff,
         }
+        if needs_handoff:
+            # 判定放在这里（而非 persist_node）有两个理由：
+            # 1. 本节点是纯计算，不依赖数据库，行为可被单测直接锁住；
+            # 2. **统一在这里判、在确认接口里建**——建单只有一个入口，不会再有
+            #    "某条兜底分支偷偷建了单"的可能（此前正是如此，见 _handoff_reason 注释）。
+            patch.update({
+                "handoff_suggested": True,
+                "handoff_reason": _handoff_reason(plan=plan, low_confidence=low_confidence),
+            })
+        return patch
 
     async def clarify_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
         clarification = (state.plan or {}).get("clarification") or "请补充信息。"
@@ -312,44 +343,22 @@ class SupervisorGraph:
         }
 
     async def handoff_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict[str, Any]:
-        """转人工：建工单/客服会话，写入 state 供 runner 回给前端。"""
-        patch: dict[str, Any] = {
+        """澄清次数耗尽：**只建议转人工，不建单**。
+
+        本节点此前会在"判定为用户主动要求"时直接建工单 + 客服会话。现已统一为只建议——
+        全图仅剩一个建单入口：`POST /conversations/{id}/handoff-confirm`（用户点确认后）。
+        转人工是有副作用的动作（建工单、占用人工坐席、通知客服），
+        按项目一贯原则（AI 只做理解与建议，执行交给确定性系统 + 用户确认）不应由 AI 触发，
+        与交易草稿的「预检 → 确认 → 下单」同构。
+        """
+        return {
             "overall_status": "handoff",
             "clarification_count": state.clarification_count + 1,
-            "final_response": "为避免反复追问，建议转接人工客服。",
+            "final_response": "为避免反复追问，建议转接人工客服。您可以选择转人工，或继续补充信息。",
             "needs_handoff": True,
+            "handoff_suggested": True,
+            "handoff_reason": _handoff_reason(plan=_rebuild_plan(state.plan), low_confidence=False),
         }
-        if self.database is not None and state.customer_id:
-            try:
-                from app.services.customer_rag_handoff import CustomerRagHandoffService
-                plan = _rebuild_plan(state.plan)
-                intent = next((t.intent for t in plan.tasks if t.intent != "human_handoff"), "human_handoff")
-                evidence = "clarification_exhausted" if (state.plan or {}).get("clarification") else "customer_requested"
-                if evidence == "clarification_exhausted":
-                    # 系统判定（澄清次数耗尽）→ **只建议，不建单**，交用户确认。
-                    # 转人工有副作用（建工单、占用人工坐席、通知客服），
-                    # 不该由 AI 单方面触发；与交易草稿的"预检→确认"保持同一原则。
-                    patch.update({
-                        "handoff_suggested": True,
-                        "handoff_reason": evidence,
-                        "final_response": "为避免反复追问，建议转接人工客服。您可以选择转人工，或继续补充信息。",
-                    })
-                else:
-                    # 用户主动要求 → 明确意图，直接建单（不做二次确认，否则碍事）
-                    handoff = await CustomerRagHandoffService(self.database).handoff(
-                        customer_id=state.customer_id, query=state.combined_query or state.user_message,
-                        intent=intent, evidence_status=evidence, citations=[])
-                    patch.update({
-                        "work_order_id": handoff.get("work_order_id"),
-                        "ticket_no": handoff.get("ticket_no"),
-                        "customer_service_session_id": handoff.get("customer_service_session_id"),
-                        "customer_service_session_status": handoff.get("customer_service_session_status"),
-                    })
-                    if handoff.get("ticket_no"):
-                        patch["final_response"] = f"为避免反复追问，已为您转接人工客服，工单号：{handoff['ticket_no']}。"
-            except Exception:  # noqa: BLE001 - 转人工失败仍返回话术，不阻塞
-                pass
-        return patch
 
     # ---- 模型自主工具调度（只读查询；与确定性 ReAct 二选一） ----
     def _model_tool_selection_enabled(self) -> bool:
@@ -745,31 +754,14 @@ class SupervisorGraph:
         active_product = _active_product_from_results(results) or state.active_product
         plan = _rebuild_plan(state.plan)
 
-        # 只在需要时补建工单：summarize 判定 needs_handoff 但走的是 execute 分支（非 handoff_node）
+        # 这里**不再建工单**。此前有一段"补建"逻辑：summarize 判了 needs_handoff 时，
+        # 按 `low_confidence` 真假二分——真则建议、假则当成"用户主动要求"直接建单。
+        # 问题在于后者不是判据而是**兜底**：任何其他来源的 needs_handoff 都会落到那一支，
+        # 于是出现"卡片不弹、工单已建、答案里却又问'是否现在转接人工客服？'"的矛盾
+        # （实测 query=「转人工」）。判定已上移到 summarize_node / handoff_node（见 _handoff_reason），
+        # 建单唯一入口是用户点确认后的 POST /conversations/{id}/handoff-confirm。
+        # 本节点只负责落的短时记忆里如实带上"已建议转人工"，不再有任何副作用。
         patch: dict[str, Any] = {}
-        if state.needs_handoff and not state.ticket_no and state.customer_id:
-            try:
-                from app.services.customer_rag_handoff import CustomerRagHandoffService
-                low_conf = any(r.error == "low_confidence" for r in results)
-                if low_conf:
-                    # 系统判定（检索低置信）→ **只建议，不建单**，交用户确认。
-                    # 依据：AI 判"该转人工"可能误判，而建单/占坐席是有副作用的动作，
-                    # 不该由 AI 单方面触发；与交易草稿的"预检→确认"同一原则。
-                    patch.update({"handoff_suggested": True, "handoff_reason": "low_confidence"})
-                else:
-                    # 用户主动要求转人工 → 明确意图，直接建单（不做二次确认，否则碍事）
-                    handoff = await CustomerRagHandoffService(self.database).handoff(
-                        customer_id=state.customer_id, query=state.combined_query or state.user_message,
-                        intent=next((t.intent for t in plan.tasks if t.intent != "human_handoff"), "human_handoff"),
-                        evidence_status="customer_requested", citations=[])
-                    patch.update({
-                        "work_order_id": handoff.get("work_order_id"),
-                        "ticket_no": handoff.get("ticket_no"),
-                        "customer_service_session_id": handoff.get("customer_service_session_id"),
-                        "customer_service_session_status": handoff.get("customer_service_session_status"),
-                    })
-            except Exception:  # noqa: BLE001
-                pass
 
         handoff_state = None
         if state.work_order_id or patch.get("work_order_id"):
