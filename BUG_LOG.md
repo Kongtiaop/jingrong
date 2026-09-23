@@ -4244,6 +4244,34 @@ def answer_reports_insufficient(text): return any(m in text for m in _INSUFFICIE
 3. 双通道（显式优先 + 关键词回退）设计时，**回退通道的松紧要按失效后果定**：
    此处保持宽口径（宁误判不漏判），因为漏判在金融场景后果更重。
 
+**后续处置（同日，提交 27d4342）**：
+
+核实前端显示条件时发现决定性事实——`AgentBubble.vue` 的判断是
+`v-if="overall_status==='needs_clarification' || clarification"`，
+即**只要 clarification 非空就弹「需要补充信息」，与状态位无关**。
+故取"方案 C"：`graph.py` 的 `insufficient` 分支**只降级状态、不再自动设 clarification**。
+状态位保留为机器信号（审计/统计可用），提示不再打断用户。
+
+实测 6 个 case：
+| Query | overall_status | 提示 |
+|---|---|---|
+| 公司客户规模有多大 | completed | 无（原误报场景） |
+| 开户流程是怎样的 | completed | 无 |
+| **我的订单状态（缺单号）** | **needs_clarification** | **有** ← 防误伤 |
+| 我有没有风险限制 | completed | 无 |
+| 你们公司的主营业务是什么 | completed | 无 |
+| 什么是双录 | completed | 无 |
+
+第 3 条证明改动**没有波及** `needs_clarification` 分支。
+
+⚠️ **同时纠正一个中途的错误方向**：曾考虑改用检索层 `evidence_status` 作为判据，
+但该字段的语义是「检索门控未拒绝」——`reject` 会直接转人工、**不进生成**，
+故在生成阶段它几乎恒为 `sufficient`，拿它当判据等于让该状态永不触发。
+**教训：使用一个信号前先确认它的确切语义与产生条件，不要只看字段名**。
+
+**附注**：管线路径本就不产生 `partially_answered`（仅图路径有），
+故本次改动只影响图路径；两条路径在"半成功"表达上的差异是切图的既有影响。
+
 ---
 
 ---
