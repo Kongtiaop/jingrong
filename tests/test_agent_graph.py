@@ -168,3 +168,114 @@ def test_checkpoint_compile_without_checkpointer_is_plain():
     graph = SupervisorGraph(executor=FakeExecutor()).build()
     final = asyncio.run(graph.ainvoke(_base_state()))
     assert final["overall_status"] == "completed"
+
+
+# ---------- 方案 C：自评不足只降级状态，不再自动设 clarification ----------
+#
+# 背景：前端 AgentBubble.vue 的条件是
+#   v-if="overall_status==='needs_clarification' || clarification"
+# 只要 clarification 非空就弹「需要补充信息」。而 `insufficient` 是**模型自己的保守判断**
+# （问句有歧义、或对完整性要求高时都会触发），且它通常在答案正文里已自述了不确定之处。
+# 故解耦：状态位保留（机器信号），提示不再自动设（不打断用户）。
+
+
+def _rag_planner(*intents):
+    class _Planner:
+        def plan(self, query):
+            return IntentPlan(
+                normalized_query=query,
+                tasks=[IntentTask(f"t{i + 1}", it, "rag_explanation", query, confidence=0.9)
+                       for i, it in enumerate(intents)])
+    return _Planner()
+
+
+def _run_rag_graph(generator, *intents, user_message="什么是双录"):
+    graph = SupervisorGraph(
+        planner=_rag_planner(*intents),
+        react_tool=FakeReactTool(first_no_citations=False),
+        answer_generator=generator).build()
+    return asyncio.run(graph.ainvoke(_base_state(user_message=user_message)))
+
+
+def test_insufficient_answer_downgrades_status_without_prompt():
+    """核心行为：状态降级保留，但不再自动设 clarification。"""
+    class G:
+        async def generate(self, *, query, result):
+            return SimpleNamespace(answer="已给出完整数据。", generation_status="generated",
+                                   insufficient=True, insufficient_source="explicit")
+
+    final = _run_rag_graph(G(), "policy")
+    task = final["task_results"][0]
+    assert task["status"] == "partially_answered", "状态位应保留——它是有用的机器信号"
+    assert not task.get("clarification"), "方案 C：不得再自动设提示来打断用户"
+    assert task["data"]["insufficient_evidence"] is True
+
+
+def test_insufficient_source_is_exposed_for_troubleshooting():
+    """判定来源必须可见，否则无法区分「模型判的」与「关键词撞的」。"""
+    class G:
+        async def generate(self, *, query, result):
+            return SimpleNamespace(answer="a", generation_status="generated",
+                                   insufficient=True, insufficient_source="keyword")
+
+    final = _run_rag_graph(G(), "policy")
+    assert final["task_results"][0]["data"]["insufficient_source"] == "keyword"
+
+
+def test_output_text_contains_no_clarification_prompt():
+    """最终文本里不应出现中断提示——这是用户直接看到的东西。"""
+    class G:
+        async def generate(self, *, query, result):
+            return SimpleNamespace(answer="公司注册用户数 862 万。", generation_status="generated",
+                                   insufficient=True, insufficient_source="explicit")
+
+    final = _run_rag_graph(G(), "policy")
+    assert "当前资料未完全覆盖" not in final["final_response"]
+    assert "需要补充信息" not in final["final_response"]
+
+
+def test_complete_answer_stays_completed():
+    """正常完整回答不受影响（不能为了修误报把状态整体放宽）。"""
+    class G:
+        async def generate(self, *, query, result):
+            return SimpleNamespace(answer="完整答案", generation_status="generated",
+                                   insufficient=False, insufficient_source="explicit")
+
+    final = _run_rag_graph(G(), "policy")
+    assert final["task_results"][0]["status"] == "succeeded"
+    assert not final["task_results"][0].get("clarification")
+    assert final["overall_status"] == "completed"
+
+
+def test_generator_without_insufficient_attribute_is_not_penalized():
+    """生成器没有该属性时（老 provider / fake）不得被当成资料不足。"""
+    class G:
+        async def generate(self, *, query, result):
+            return SimpleNamespace(answer="答案", generation_status="generated")
+
+    final = _run_rag_graph(G(), "policy")
+    assert final["task_results"][0]["status"] == "succeeded"
+    assert final["overall_status"] == "completed"
+
+
+def test_mixed_tasks_keep_partial_status_but_no_global_prompt():
+    """多 task 混合：一个不足、一个正常。
+
+    整体状态仍应如实反映"有不完整"（partially_answered），
+    但没有 task 带 clarification，故整体也不该冒出提示——
+    这正是前端不再弹「需要补充信息」的关键。
+    """
+    class G:
+        def __init__(self):
+            self.n = 0
+
+        async def generate(self, *, query, result):
+            self.n += 1
+            return SimpleNamespace(answer=f"答案{self.n}", generation_status="generated",
+                                   insufficient=(self.n == 1), insufficient_source="explicit")
+
+    final = _run_rag_graph(G(), "policy", "faq")
+    statuses = [t["status"] for t in final["task_results"]]
+    assert "partially_answered" in statuses and "succeeded" in statuses, statuses
+    assert final["overall_status"] == "partially_answered"
+    assert not final.get("clarification"), "无 task 带 clarification → 整体不应有提示"

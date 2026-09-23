@@ -699,8 +699,24 @@ class SupervisorGraph:
             if getattr(generated, "insufficient", False):
                 r["status"] = "partially_answered"
                 r["data"] = {**r["data"], "insufficient_evidence": True}
-                if not r.get("clarification"):
-                    r["clarification"] = "当前资料未完全覆盖该问题，可补充更具体的信息或转人工客服。"
+                # 方案 C：**只降级状态位，不自动设 clarification**。
+                #
+                # 前端 AgentBubble.vue 的条件是
+                #   v-if="overall_status==='needs_clarification' || clarification"
+                # ——只要 clarification 非空就弹出「需要补充信息」。
+                # 而这里的 `insufficient` 是**模型自己的保守判断**：问句稍有歧义
+                # （如"公司客户"可指企业客户）、或它对"完整性"要求较高时都会触发。
+                # 实测「公司客户规模」：答案已完整给出 862万/473万 等数据，
+                # 仅因结尾说明"企业客户数据未提供"就弹出中断提示。
+                # 且模型通常在答案正文里已自述了不确定之处——信息并未丢失，
+                # 不该再升格成打断用户的提示。
+                #
+                # 保留 status 是有意的：它是有价值的机器信号（审计/统计/后续监控可用），
+                # 当前也无其他消费者（前端不读该字段、后端仅 summarize 聚合），
+                # 故降级状态不影响任何下游行为。
+                #
+                # 真正「需要用户补充参数」的场景走 needs_clarification 分支
+                # （如缺订单号），不受此处影响；task 自身已有的 clarification 也保持不动。
             out.append(r)
             changed = True
         return {"task_results": out} if changed else {}
