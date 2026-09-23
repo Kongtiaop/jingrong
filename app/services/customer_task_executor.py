@@ -287,7 +287,21 @@ class CustomerTaskExecutor:
         if item.intent == "greeting":
             return TaskExecutionResult(item.task_id, item.intent, "succeeded", answer="您好，我可以协助查询业务事实、客服知识和人工服务。")
         if item.intent == "human_handoff":
-            return TaskExecutionResult(item.task_id, item.intent, "needs_clarification", answer="可以为您转接人工客服。", clarification="是否现在转接人工客服？")
+            # 不再通过 clarification 反问「是否现在转接人工客服？」。
+            #
+            # 那句反问是"两步式转人工"的第一步，但**第二步从未实现**：用户回答
+            # "是的"/"是"会被当成一条全新提问重新走意图识别，实测落到
+            # 「您想查询哪一类信息，例如订单、工单…」——既没转成人工，
+            # 还顺带把 clarification_count 推高，两次之后升级成
+            # clarification_exhausted（用户当时的观感就是"我明明说了是，它却在乱问"）。
+            #
+            # 现在确认动作由前端卡片承担（handoff_suggested → 点按钮 → 确认接口），
+            # 那是个**可执行**的动作；而文本反问是一句系统自己处理不了的话，
+            # 属于"问了做不到"，不如不问。
+            #
+            # 状态标 succeeded 是如实的：这一轮确实完成了它的职责（表达可以转人工）。
+            return TaskExecutionResult(item.task_id, item.intent, "succeeded",
+                                       answer="可以为您转接人工客服，请在下方确认。")
         if item.intent in self.REACT_INTENTS:
             # 把前序事实作为上下文传给知识/制度类 task。
             # 这是"用事实套规则"得以成立的前提：制度 task 必须拿到客户真实等级，
