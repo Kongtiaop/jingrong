@@ -4334,4 +4334,77 @@ asyncpg.exceptions.DuplicateColumnError: column "scope" of relation "customer_me
 
 ---
 
+### ISSUE-20260923-HANDOFF-SILENT-BUILD
+
+- 日期：2026-09-23
+- 标题：转人工改了「建议 + 确认」，但兜底分支仍在静默建单
+
+**现象**：用户实测反馈——**「卡片确实出现了，但是还是不行啊，就是逻辑上还是直接转了人工然后就卡片就没了」**。
+确认卡片能渲染，但只要走到某条路径，工单与人工会话仍被直接创建。
+
+**根因**：`app/agents/graph.py` `persist_node` 里的一段判据是**兜底**而非判据：
+
+```python
+low_conf = any(r.error == "low_confidence" for r in results)
+if low_conf:
+    patch.update({"handoff_suggested": True, ...})   # 只建议
+else:
+    # 注释写的是"用户主动要求转人工"
+    handoff = await CustomerRagHandoffService(...).handoff(...)   # 直接建单
+```
+
+`else` 把「**没有** low_confidence」当成了「用户主动要求转人工」。任何其他来源的
+`needs_handoff`（`plan.requires_handoff`、`handoff_node` 已判过的澄清耗尽）都会落到
+这一支被静默建单——`handoff_node` 自己也有一个同构的 else 分支，会被这里二次放大。
+
+实测 query=「转人工」的响应：
+```
+overall_status=handoff   handoff_suggested=False        ← 前端因此永不弹卡片
+work_order_id / ticket_no / customer_service_session_id 全部已生成
+answer=「可以为您转接人工客服。下一步：是否现在转接人工客服？已为您转接人工客服，工单号：WO…」
+```
+最后一句尤其荒谬：**同一段话里刚问完「是否现在转接」，又写「已为您转接」**——
+系统自己问自己答，用户没有任何选择权。
+
+**修复**（提交 7164973）：
+1. 新增模块级纯函数 `_handoff_reason(plan, low_confidence)`，按**具体程度**给显式判据，
+   不再有兜底分支：`customer_requested`（plan 里有 human_handoff 任务）→
+   `low_confidence` → `clarification_exhausted`（两者皆否）
+2. 判定上移到 `summarize_node`（纯计算、不依赖数据库，行为可被单测直接锁住），
+   `handoff_node` 同样只建议；`persist_node` 的建单逻辑整体移除
+3. **全图只剩一个建单入口**：`POST /conversations/{id}/handoff-confirm`
+
+**连带修复**：
+- 确认接口原先用固定串 `"用户确认转人工"` 当 query，而工单按 `sha256(intent:query)`
+  去重 → 同一客户每次确认都命中同一条工单（实测复用了 2026-08-14 的旧单号）。
+  改为取该会话最后一条用户消息，工单描述因此是真实提问原文。
+- 前端卡片原先只依赖内存里的 `result`，刷新即消失——**用户看到过建议却再也找不到
+  确认入口**。改为写 `sessionStorage` 并在挂载时恢复。
+
+**验证（实机，两端对账）**：
+| 场景 | handoff_suggested | reason | 工单/会话 |
+|---|---|---|---|
+| 转人工 | True | customer_requested | **全为 None** |
+| 请介绍一下贵公司的太空采矿业务 | True | low_confidence | **全为 None** |
+
+数据库对账：人工会话 144→**144**、工单 99→**99**（修复前每问一次都会 +1）。
+随后点确认 → 工单 `WO20260923075021ADF851`（描述=用户真实提问原文）+ 会话
+`waiting_human`，总数 145/100（只 +1）。
+
+**方法论教训**：
+1. **`if A else B` 里的 `else` 若没有独立判据，就是兜底**——它会把所有未预料到的
+   输入都归到 B。写这种分支前必须能回答"B 的判据是什么"，答不上来就说明 B 是错的。
+2. **同一副作用有多个可达入口时，改动几乎必然漏掉一条**。本次上一轮只改了两处，
+   实际有四处（`handoff_node` 两条分支 + `persist_node` + 管线路径）。正确的收口方式是
+   把判定集中、把执行收敛到**唯一入口**，而不是逐个改调用点。
+3. 前端只依赖内存态渲染的交互（卡片、确认框），**刷新即失**，用户会看到"提示过但找不到入口"。
+   凡是要用户**动作**的提示，都要持久化。
+
+**遗留（未修）**：管线路径 `app/services/customer_agent_execution.py:528,539`
+**仍是直接建单**（澄清耗尽 / needs_handoff 两处）。当前图开关为 true，该路径不执行，
+故本次未一并改。但**一旦把 `AGENT_GRAPH_ENABLED` 回退为 false，静默建单就会复现**——
+回退前必须先改这两处。
+
+---
+
 ---
