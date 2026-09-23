@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from typing import Annotated
 from uuid import uuid4
@@ -11,12 +11,13 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
+from app.common.logging.config import get_logger
 from app.common.middleware.trace import get_trace_id
 from app.common.response import ApiResponse
 from app.common.security.auth import current_user, websocket_current_user
 from app.models.audit import AuditLog
 from app.models.auth import Role, User
-from app.models.customer_service import CustomerServiceMessage, CustomerServiceSession
+from app.models.customer_service import AgentConversationMessage, CustomerServiceMessage, CustomerServiceSession
 from app.models.workorder import WorkOrder
 from app.schemas.customer_service import CustomerIntentPlanResponse, IntentTaskResponse, TaskExecutionResultResponse, CustomerTaskExecutionResponse, CustomerServiceActionRequest, UnifiedAgentRequest, CustomerServiceAssignRequest, CustomerServiceMessageCreateRequest, CustomerServiceMessageResponse, CustomerServiceSessionResponse
 from app.services.customer_intent import CustomerIntentPlanner, extract_preference_statement
@@ -33,6 +34,9 @@ from app.services.agent_capabilities import AgentCapabilityRegistry
 from app.services.data_analysis_agent import DataAnalysisAgent
 from app.services.data_catalog_service import CatalogSearchScope, DataCatalogService
 from app.services.permission_scoped_cache import PermissionScopedCache
+
+
+logger = get_logger(__name__)
 from app.services.subject_scope import SubjectScopeService
 from app.repositories.data_catalog import DataCatalogRepository
 from app.models.data_catalog import DataCatalogColumn, DataCatalogExampleQuery, DataCatalogTable
@@ -204,6 +208,45 @@ async def intent_plan(request: Request, payload: CustomerServiceActionRequest, u
     ), trace_id=get_trace_id())
 
 
+async def _persist_conversation_turn(database, *, conversation_id: str, customer_id: str,
+                                     query: str, result) -> None:
+    """把一轮问答写入会话历史（用户问题 + 助手回答）。
+
+    为什么需要：此前 AI 阶段的问答内容**无处留存**——`audit_logs` 里只有工具调用轨迹，
+    且 `output_preview` 仅存结构性摘要（如"命中 5 条知识块"），没有答案全文，
+    刷新页面后对话即消失。本表让"历史对话"成为可回看的事实，而不是靠前端内存。
+
+    **失败绝不阻塞主流程**：留痕是增值能力，写不进去只影响体验，
+    不该让用户因此拿不到答案（与审计、观测同属"不得拖垮业务"的一类）。
+    """
+    try:
+        trace_id = get_trace_id()
+        # 显式给两条记录**错开 1 毫秒**的时间戳。
+        # 为什么必须显式指定：模型的 created_at 是 server_default=func.now()，
+        # 而 PostgreSQL 的 now() 在**同一事务内返回同一个时刻**，
+        # 于是同一轮的问与答时间戳完全相同，排序退化为按 UUID 比大小——
+        # 实测第 2 轮的回答被排到了提问前面（历史对话顺序错乱）。
+        # 错开 1ms 既保证顺序，又不影响"按时间浏览"的语义。
+        now = datetime.now(timezone.utc)
+        async with database.session_factory() as session:
+            session.add_all([
+                AgentConversationMessage(
+                    id=str(uuid4()), conversation_id=conversation_id, customer_id=customer_id,
+                    role="user", content=query, trace_id=trace_id, created_at=now,
+                ),
+                AgentConversationMessage(
+                    id=str(uuid4()), conversation_id=conversation_id, customer_id=customer_id,
+                    role="assistant", content=result.answer or "", trace_id=trace_id,
+                    overall_status=result.overall_status, route=result.route,
+                    created_at=now + timedelta(milliseconds=1),
+                ),
+            ])
+            await session.commit()
+    except Exception:  # noqa: BLE001 - 留痕失败不得影响问答返回
+        logger.warning("conversation_turn_persist_failed conversation_id=%s",
+                       conversation_id, exc_info=True)
+
+
 async def _run_customer_agent(request: Request, *, user: User, conversation_id: str, query: str,
                               is_customer: bool) -> CustomerTaskExecutionResponse:
     """客户 Agent 统一入口：按开关决定走 LangGraph 真图还是确定性管线。
@@ -226,16 +269,20 @@ async def _run_customer_agent(request: Request, *, user: User, conversation_id: 
         runner = GraphAgentRunner(
             database, redis_client, settings=settings,
             checkpointer=getattr(request.app.state, "agent_checkpointer", None))
-        return await runner.execute(
+        result = await runner.execute(
             customer_id=user.id, conversation_id=conversation_id, query=query,
             is_customer=is_customer, user_id=user.id,
             role=next((r.code for r in user.roles), None))
+        # 刻意不在此处 return：下方的问答留痕必须同时覆盖「图」与「管线」两条路径
+        # （HTTP 与 WebSocket 也都经由本函数，故留痕放在收口处最省事也最不易漏）。
+    else:
+        result = await CustomerAgentExecutionService(
+            database, redis_client, settings=settings
+        ).execute(customer_id=user.id, conversation_id=conversation_id, query=query)
 
-    result = await CustomerAgentExecutionService(
-        database, redis_client, settings=settings
-    ).execute(customer_id=user.id, conversation_id=conversation_id, query=query)
-
-    if shadow_enabled:
+    # 影子只在管线路径上触发（图已是权威路径时无需自我对照）。
+    # 用条件表达而非缩进嵌套，避免动到原有块结构。
+    if shadow_enabled and not graph_enabled:
         from app.services.graph_agent_runner import GraphAgentRunner
         runner = GraphAgentRunner(
             database, redis_client, settings=settings,
@@ -247,6 +294,11 @@ async def _run_customer_agent(request: Request, *, user: User, conversation_id: 
             pipeline_result=result, is_customer=is_customer))
         _SHADOW_TASKS.add(task)
         task.add_done_callback(_SHADOW_TASKS.discard)
+
+    # 问答留痕：覆盖「图/管线」×「HTTP/WebSocket」四种组合，故放在这个收口处。
+    await _persist_conversation_turn(
+        database, conversation_id=conversation_id, customer_id=user.id,
+        query=query, result=result)
     return result
 
 
@@ -766,6 +818,26 @@ async def close_session(request: Request, session_id: str, user: Annotated[User,
 _TRACE_ACTION = "customer_agent.tool_call"
 
 
+def _require_conversation_access(owner_ids: set[str], user: User) -> None:
+    """会话访问校验——`/trace` 与 `/messages` **共用**，保证两个接口口径一致。
+
+    客户只能访问自己的会话；坐席/风控凭 `audit:read`（或超管）可访问任意会话——
+    排查客诉时他们必须能看到客户那侧发生了什么。
+    `owner_ids` 为空表示查不到归属记录（会话不存在、或尚无任何内容），
+    此时**放行并返回空列表**，避免用「403 还是 404」的差异泄露他人会话是否存在。
+    """
+    if _is_customer(user):
+        if owner_ids and user.id not in owner_ids:
+            raise HTTPException(status_code=403,
+                                detail={"code": "CUSTOMER_SERVICE_CONVERSATION_SCOPE",
+                                        "message": "conversation is outside customer scope"})
+        return
+    if not user.is_super_admin and "audit:read" not in _permissions(user):
+        raise HTTPException(status_code=403,
+                            detail={"code": "AUDIT_READ_REQUIRED",
+                                    "message": "audit:read permission required"})
+
+
 def _trace_rounds(rows) -> list[dict]:
     """把 `customer_agent.tool_call` 审计行还原成链路轮次。
 
@@ -826,14 +898,9 @@ async def get_conversation_trace(request: Request, conversation_id: str,
             .limit(limit)
         )).scalars().all())
 
-    # 归属校验。owners 为空表示会话不存在或从未触发工具调用——两种都放行并返回空列表，
-    # 避免用"403 还是 404"这种差异泄露他人会话是否存在。
+    # 归属校验（与 /messages 共用同一实现，避免两个接口口径漂移）
     owners = {row.actor_user_id for row in rows if row.actor_user_id}
-    if _is_customer(user):
-        if owners and user.id not in owners:
-            raise HTTPException(status_code=403, detail={"code": "CUSTOMER_SERVICE_CONVERSATION_SCOPE", "message": "conversation is outside customer scope"})
-    elif not user.is_super_admin and "audit:read" not in _permissions(user):
-        raise HTTPException(status_code=403, detail={"code": "AUDIT_READ_REQUIRED", "message": "audit:read permission required"})
+    _require_conversation_access(owners, user)
 
     rounds = _trace_rounds(rows)
     # decisions / stopped_reason 是**轮次循环之外**的产物，审计按轮落库故无从还原。
@@ -841,3 +908,89 @@ async def get_conversation_trace(request: Request, conversation_id: str,
     return ApiResponse(data={"conversation_id": conversation_id, "rounds": rounds,
                              "decisions": [], "stopped_reason": None, "layer": None},
                        trace_id=get_trace_id())
+
+
+@conversation_router.get("/{conversation_id}/messages", response_model=ApiResponse[list[dict]])
+async def get_conversation_messages(request: Request, conversation_id: str,
+                                    limit: int = Query(200, ge=1, le=500),
+                                    user: Annotated[User, Depends(current_user)] = None):
+    """读取 AI 会话的问答历史——刷新页面后仍能回看。
+
+    与 `/trace` 的分工：本接口给**对话内容**（问了什么、答了什么），
+    `/trace` 给**工具调用链路**（查了什么、花了多久）。两者共用同一个 conversation_id，
+    前端可并列展示，从而还原"这一条回答是怎么来的"。
+
+    在此接口之前，AI 阶段的问答内容**无处留存**——`audit_logs` 里只有工具轨迹
+    （且 output_preview 仅结构性摘要），刷新页面后对话即消失。
+    """
+    if user is None:
+        raise HTTPException(status_code=401, detail={"code": "UNAUTHORIZED", "message": "authentication required"})
+    async with request.app.state.database.session_factory() as session:
+        rows = list((await session.execute(
+            select(AgentConversationMessage)
+            .where(AgentConversationMessage.conversation_id == conversation_id)
+            .order_by(AgentConversationMessage.created_at.asc(), AgentConversationMessage.id.asc())
+            .limit(limit)
+        )).scalars().all())
+
+    # 归属校验（与 /trace 共用同一实现）
+    _require_conversation_access({row.customer_id for row in rows if row.customer_id}, user)
+
+    return ApiResponse(data=[{
+        "id": row.id,
+        "role": row.role,
+        "content": row.content,
+        "trace_id": row.trace_id,
+        "overall_status": row.overall_status,
+        "route": row.route,
+        "created_at": row.created_at,
+    } for row in rows], trace_id=get_trace_id())
+
+
+@conversation_router.post("/{conversation_id}/handoff-confirm", response_model=ApiResponse[dict])
+async def confirm_conversation_handoff(request: Request, conversation_id: str,
+                                       user: Annotated[User, Depends(current_user)] = None):
+    """用户确认转人工——**此时才真正创建工单与人工会话**。
+
+    为什么需要这一步：AI 判定"该转人工"存在误判可能，而建工单、占用人工坐席、
+    通知客服都是有副作用的动作。按项目一贯原则（AI 只做理解与建议，执行交给
+    确定性系统 + 用户确认），转人工做成「建议 → 用户确认 → 执行」，
+    与交易草稿的「预检 → 确认 → 下单」同构。
+
+    注意：用户**主动**说"转人工"时不会走到这里——那条路径由 agent 直接建单
+    （那是明确意图，再弹确认反而碍事）。
+
+    权限：**仅客户本人**可确认。员工即使有 audit:read 也不得代按——
+    确认表达的是用户意愿，不能由他人代为作出。
+    """
+    if user is None:
+        raise HTTPException(status_code=401, detail={"code": "UNAUTHORIZED", "message": "authentication required"})
+    if not _is_customer(user):
+        raise HTTPException(status_code=403, detail={"code": "CUSTOMER_ONLY_ACTION",
+                                                     "message": "only the customer can confirm handoff"})
+
+    async with request.app.state.database.session_factory() as session:
+        owners = set((await session.execute(
+            select(AgentConversationMessage.customer_id)
+            .where(AgentConversationMessage.conversation_id == conversation_id)
+            .distinct()
+        )).scalars().all())
+    _require_conversation_access(owners, user)
+
+    handoff = await CustomerRagHandoffService(request.app.state.database).handoff(
+        customer_id=user.id,
+        query="用户确认转人工",
+        intent="human_handoff",
+        # 用 customer_requested：用户确认后的转人工在业务语义上等同于用户主动要求，
+        # 复用既有取值可避免下游（工单分类、坐席分配）需要认识新枚举。
+        evidence_status="customer_requested",
+        citations=[])
+    logger.info("handoff_confirmed conversation_id=%s ticket_no=%s",
+                conversation_id, handoff.get("ticket_no"))
+    return ApiResponse(data={
+        "conversation_id": conversation_id,
+        "work_order_id": handoff.get("work_order_id"),
+        "ticket_no": handoff.get("ticket_no"),
+        "customer_service_session_id": handoff.get("customer_service_session_id"),
+        "customer_service_session_status": handoff.get("customer_service_session_status"),
+    }, trace_id=get_trace_id())

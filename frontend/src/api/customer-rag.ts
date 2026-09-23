@@ -25,6 +25,10 @@ export const customerServiceApi = {
   executePlan: (query: string, conversationId: string) => http.post('/customer-service/sessions/execute-plan', { note: query }, { headers: { 'X-Conversation-Id': conversationId } }),
   // 历史链路回溯：实时 trace 随请求结束就消失了，刷新后只能从审计还原
   trace: (conversationId: string) => http.get(`/customer-service/conversations/${conversationId}/trace`),
+  // 会话历史（AI 阶段的问答内容）：此前问答无处留存，刷新页面即丢
+  messages: (conversationId: string) => http.get(`/customer-service/conversations/${conversationId}/messages`),
+  // 确认转人工：转人工改为「建议 → 用户确认 → 执行」，这是确认那一步
+  confirmHandoff: (conversationId: string) => http.post(`/customer-service/conversations/${conversationId}/handoff-confirm`),
 }
 
 

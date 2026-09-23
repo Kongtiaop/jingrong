@@ -316,7 +316,7 @@ class SupervisorGraph:
         patch: dict[str, Any] = {
             "overall_status": "handoff",
             "clarification_count": state.clarification_count + 1,
-            "final_response": "为避免反复追问，已为您转接人工客服。",
+            "final_response": "为避免反复追问，建议转接人工客服。",
             "needs_handoff": True,
         }
         if self.database is not None and state.customer_id:
@@ -325,17 +325,28 @@ class SupervisorGraph:
                 plan = _rebuild_plan(state.plan)
                 intent = next((t.intent for t in plan.tasks if t.intent != "human_handoff"), "human_handoff")
                 evidence = "clarification_exhausted" if (state.plan or {}).get("clarification") else "customer_requested"
-                handoff = await CustomerRagHandoffService(self.database).handoff(
-                    customer_id=state.customer_id, query=state.combined_query or state.user_message,
-                    intent=intent, evidence_status=evidence, citations=[])
-                patch.update({
-                    "work_order_id": handoff.get("work_order_id"),
-                    "ticket_no": handoff.get("ticket_no"),
-                    "customer_service_session_id": handoff.get("customer_service_session_id"),
-                    "customer_service_session_status": handoff.get("customer_service_session_status"),
-                })
-                if handoff.get("ticket_no"):
-                    patch["final_response"] = f"为避免反复追问，已为您转接人工客服，工单号：{handoff['ticket_no']}。"
+                if evidence == "clarification_exhausted":
+                    # 系统判定（澄清次数耗尽）→ **只建议，不建单**，交用户确认。
+                    # 转人工有副作用（建工单、占用人工坐席、通知客服），
+                    # 不该由 AI 单方面触发；与交易草稿的"预检→确认"保持同一原则。
+                    patch.update({
+                        "handoff_suggested": True,
+                        "handoff_reason": evidence,
+                        "final_response": "为避免反复追问，建议转接人工客服。您可以选择转人工，或继续补充信息。",
+                    })
+                else:
+                    # 用户主动要求 → 明确意图，直接建单（不做二次确认，否则碍事）
+                    handoff = await CustomerRagHandoffService(self.database).handoff(
+                        customer_id=state.customer_id, query=state.combined_query or state.user_message,
+                        intent=intent, evidence_status=evidence, citations=[])
+                    patch.update({
+                        "work_order_id": handoff.get("work_order_id"),
+                        "ticket_no": handoff.get("ticket_no"),
+                        "customer_service_session_id": handoff.get("customer_service_session_id"),
+                        "customer_service_session_status": handoff.get("customer_service_session_status"),
+                    })
+                    if handoff.get("ticket_no"):
+                        patch["final_response"] = f"为避免反复追问，已为您转接人工客服，工单号：{handoff['ticket_no']}。"
             except Exception:  # noqa: BLE001 - 转人工失败仍返回话术，不阻塞
                 pass
         return patch
@@ -740,16 +751,23 @@ class SupervisorGraph:
             try:
                 from app.services.customer_rag_handoff import CustomerRagHandoffService
                 low_conf = any(r.error == "low_confidence" for r in results)
-                handoff = await CustomerRagHandoffService(self.database).handoff(
-                    customer_id=state.customer_id, query=state.combined_query or state.user_message,
-                    intent=next((t.intent for t in plan.tasks if t.intent != "human_handoff"), "human_handoff"),
-                    evidence_status="low_confidence" if low_conf else "customer_requested", citations=[])
-                patch.update({
-                    "work_order_id": handoff.get("work_order_id"),
-                    "ticket_no": handoff.get("ticket_no"),
-                    "customer_service_session_id": handoff.get("customer_service_session_id"),
-                    "customer_service_session_status": handoff.get("customer_service_session_status"),
-                })
+                if low_conf:
+                    # 系统判定（检索低置信）→ **只建议，不建单**，交用户确认。
+                    # 依据：AI 判"该转人工"可能误判，而建单/占坐席是有副作用的动作，
+                    # 不该由 AI 单方面触发；与交易草稿的"预检→确认"同一原则。
+                    patch.update({"handoff_suggested": True, "handoff_reason": "low_confidence"})
+                else:
+                    # 用户主动要求转人工 → 明确意图，直接建单（不做二次确认，否则碍事）
+                    handoff = await CustomerRagHandoffService(self.database).handoff(
+                        customer_id=state.customer_id, query=state.combined_query or state.user_message,
+                        intent=next((t.intent for t in plan.tasks if t.intent != "human_handoff"), "human_handoff"),
+                        evidence_status="customer_requested", citations=[])
+                    patch.update({
+                        "work_order_id": handoff.get("work_order_id"),
+                        "ticket_no": handoff.get("ticket_no"),
+                        "customer_service_session_id": handoff.get("customer_service_session_id"),
+                        "customer_service_session_status": handoff.get("customer_service_session_status"),
+                    })
             except Exception:  # noqa: BLE001
                 pass
 

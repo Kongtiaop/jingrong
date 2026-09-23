@@ -27,6 +27,11 @@ class AgentState(BaseModel):
     clarification: str | None = None                   # 本轮澄清/追问话术（澄清分支与 summary 都写）
     overall_status: str = ""                           # needs_clarification / handoff / succeeded / ...
     needs_handoff: bool = False
+    # 转人工改为「建议 + 确认」：系统判定需要转人工时**只置此标记、不建单**，
+    # 等用户在前端确认后才由确认接口创建工单与人工会话。
+    # 用户主动要求转人工（evidence_status=customer_requested）仍直接建单，不经此路径。
+    handoff_suggested: bool = False
+    handoff_reason: str | None = None
     # 只读 ReAct 循环状态（read-only 知识意图走 LangGraph 条件循环）
     react_query: str = ""                              # 当前待处理查询（含改写）
     react_attempts: list[dict] = Field(default_factory=list)  # 每轮工具调用记录

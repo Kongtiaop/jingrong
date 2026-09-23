@@ -100,6 +100,11 @@ def response_from_state(*, state: dict, conversation_id: str) -> CustomerTaskExe
         results=_results_from_state(state),
         clarification=state.get("clarification"),
         requires_handoff=bool(state.get("needs_handoff")),
+        # 「建议转人工」：系统判定需要转，但**尚未建单**，等用户确认。
+        # 与 requires_handoff 的区别：后者表示确实需要人工介入，
+        # 前者表示 AI 建议转但没转——前端据此渲染确认卡片。
+        handoff_suggested=bool(state.get("handoff_suggested")),
+        handoff_reason=state.get("handoff_reason"),
         work_order_id=state.get("work_order_id"),
         ticket_no=ticket_no,
         customer_service_session_id=state.get("customer_service_session_id"),

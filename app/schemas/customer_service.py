@@ -84,6 +84,14 @@ class CustomerTaskExecutionResponse(BaseModel):
     results: list[TaskExecutionResultResponse]
     clarification: str | None = None
     requires_handoff: bool = False
+    # 转人工改为「建议 + 确认」后新增：
+    #   handoff_suggested = 系统判定该转人工，但**尚未建单**，等用户确认
+    #   handoff_reason    = 建议理由（low_confidence / clarification_exhausted）
+    # 为什么不让 AI 直接转：转人工是有副作用的动作（建工单、占用人工坐席、通知客服），
+    # 按项目一贯原则应交由确定性流程 + 用户确认，与交易草稿的「预检→确认」一致。
+    # 注意：用户**主动**要求转人工时仍直接建单（那是明确意图），不走确认。
+    handoff_suggested: bool = False
+    handoff_reason: str | None = None
     work_order_id: str | None = None
     ticket_no: str | None = None
     customer_service_session_id: str | None = None
