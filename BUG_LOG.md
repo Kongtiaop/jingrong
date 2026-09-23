@@ -4469,4 +4469,56 @@ if item.intent == "human_handoff":
 
 ---
 
+### ISSUE-20260923-STALE-INDEX-HTML-CACHE
+
+- 日期：2026-09-23
+- 标题：后端与产物都已更新，页面却纹丝不动——index.html 没有缓存指令
+
+**现象**：转人工的确认卡片在页面上不出现。但：
+- 后端接口实测返回 `handoff_suggested=True`；
+- **WS 载荷也验证正确**（用容器内 `websockets` 直连页面所用通道，
+  `agent.final.result` 含 `handoff_suggested=True`、`clarification=None`）；
+- 前端构建产物里确实含有卡片代码（bundle 中 `handoff_suggested` / `handoff-suggest` /
+  `确认转接` 均命中）。
+
+三项全对，功能却不出现。
+
+**根因**：`frontend/nginx.conf` 里 **index.html 没有任何 `Cache-Control`**。
+
+```
+$ curl -sI http://localhost/
+HTTP/1.1 200 OK
+Last-Modified: Wed, 23 Sep 2026 07:49:16 GMT
+ETag: "6ab3847c-16c"          ← 只有 ETag，无 Cache-Control
+
+$ curl -sI http://localhost/assets/index-r8fR-1tW.js
+Cache-Control: max-age=604800 ← 资源有，入口没有
+```
+
+无缓存指令时浏览器按**启发式规则**自行决定时长（依据 Last-Modified）。
+于是新构建虽换了产物文件名（`index-<hash>.js`），浏览器仍用**旧 index.html**，
+指向旧 bundle → 页面表现成"代码改了却毫无变化"。
+
+带哈希的资源长缓存是对的（内容变即换名），**唯独 index.html 是"指向当前产物的那张表"，
+必须每次校验**。原配置恰恰漏了这一点。
+
+**修复**（提交 a75f051）：
+- 新增 `location = /index.html` → `Cache-Control: no-cache, must-revalidate`
+- `location /` 兜底同样 no-cache
+- assets 保持 `max-age=604800` 不变
+
+**验证**：`/` 与 `/customer-center/service`（SPA 回退路径）均返回
+`no-cache, must-revalidate`；assets 仍长缓存。
+
+**方法论教训**：
+1. **"改了没生效"要先分清是三层中的哪一层**：后端行为 / 构建产物 / 浏览器所载资源。
+   逐层证伪比反复改代码有效——本次正是先证明"后端对、产物对"，
+   才把范围压缩到"浏览器加载了什么"。
+2. **SPA 的 index.html 必须显式声明不可缓存**，这是部署级常识，但漏了极难自查：
+   现象像代码问题，实则与代码无关。凡"新功能在容器里验证通过、在浏览器里不出现"，
+   先查响应头。
+
+
+---
+
 ---
