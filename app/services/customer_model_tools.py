@@ -208,6 +208,15 @@ def _tools_for_intents(planned_intents: list[str] | None) -> set[str]:
 
     用途：约束模型不得调用计划外的工具（见 ISSUE-20260914-MODEL-CALLS-OFFPLAN-TOOL）。
     返回空集表示"无约束"（未传计划时不限制），保持向后兼容。
+
+    ⚠️ 注意 `explain_order_status` / `explain_workorder_status` **故意不在本函数的
+    结果里**——它们不映射任何意图，因此模型永远调不到。这不是遗漏，是刻意设计：
+    解释类工具只允许由**规划器**通过「多意图 + depends_on」触发
+    （`customer_intent.py` 的依赖任务 + `customer_task_executor.py` 的
+    `item.depends_on and item.intent in {workflow, faq, policy}` 分支）。
+    原因见 tests/test_model_tool_scope_constraint.py 顶部：放开给模型临时决定，
+    曾在知识库缺料时把整体状态污染成 partially_completed + requires_handoff，
+    用户已拿到事实却被回复"没有依据、已转人工"，自相矛盾。
     """
     if not planned_intents:
         return set()

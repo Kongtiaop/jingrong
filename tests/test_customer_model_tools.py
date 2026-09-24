@@ -17,6 +17,7 @@ from app.services.customer_model_tools import (
     CUSTOMER_READ_TOOL_SCHEMAS,
     CustomerModelToolLoop,
     _ALLOWED_TOOL_NAMES,
+    _tools_for_intents,
 )
 
 
@@ -926,3 +927,44 @@ def test_different_intents_still_get_separate_results():
                                    planned_intents=["risk_public", "risk_restriction"]))
     intents = {r["intent"] for r in outcome.results}
     assert len(outcome.results) == 2, f"多意图应各自成 task，实际 {intents}"
+
+
+# ---------- 解释类工具的"可达性"是刻意的，不是遗漏 ----------
+#
+# 2026-09-24 实测：用户问「我最近的交易记录」，第 1 轮取到订单状态 `pending_review`，
+# 第 2 轮模型想调用 `explain_order_status` 解释其含义，被 `tool_out_of_plan_scope` 拦下，
+# 最终用户只拿到一个状态码。
+#
+# 一开始我判定这是缺陷（"声明了却永远调不到"），**但那是错的**。查证后发现：
+#   1. 拦截是有意设计，背后有真实事故（见 test_model_tool_scope_constraint.py 顶部）：
+#      放开给模型临时决定时，知识库缺料 → explain 返回 low_confidence →
+#      整体状态被污染成 partially_completed + requires_handoff，
+#      用户**已拿到事实**却被回复"没有依据、已转人工"，自相矛盾。
+#   2. 设计上的正解路径是**通的**：规划器产出带 depends_on 的知识任务
+#      （customer_intent.py），执行器据此确定性地调 explain_*
+#      （customer_task_executor.py 的 `item.depends_on and item.intent in {workflow,faq,policy}`）。
+# 故这两个工具"模型侧不可达"是特性而非缺陷。以下测试把这个意图固定下来，
+# 避免以后有人（包括我）再把它当 bug "修"一遍。
+
+def test_explain_tools_are_deliberately_out_of_model_scope():
+    """解释类工具不得进入模型的可调用范围——由规划器按依赖触发，不由模型临时决定。"""
+    scope = _tools_for_intents(["order_status", "workorder_status"])
+    assert "explain_order_status" not in scope
+    assert "explain_workorder_status" not in scope
+
+
+def test_explain_tools_are_reachable_through_planner_dependency():
+    """但能力本身是可达的：问句同时含事实标记与知识标记时，规划器会加依赖任务。
+
+    这条是"可达性"的正向证据——若哪天规划器的依赖逻辑被删掉，
+    解释能力就真的断了（而上面那条测试仍会通过，因为它只断言"模型侧不可达"）。
+    """
+    from app.services.customer_intent import CustomerIntentPlanner
+
+    plan = CustomerIntentPlanner().plan("我的工单进展以及处理流程")
+    fact_tasks = [t for t in plan.tasks if t.intent in {"order_status", "workorder_status"}]
+    dependent = [t for t in plan.tasks if t.depends_on and t.intent in {"workflow", "faq", "policy"}]
+
+    assert fact_tasks, "应识别出事实类任务"
+    assert dependent, "含知识标记时应产出依赖事实任务的知识任务（执行器据此调 explain_*）"
+    assert dependent[0].depends_on == [fact_tasks[0].task_id]
