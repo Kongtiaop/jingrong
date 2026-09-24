@@ -7,7 +7,7 @@ from typing import Annotated
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -908,6 +908,60 @@ async def get_conversation_trace(request: Request, conversation_id: str,
     return ApiResponse(data={"conversation_id": conversation_id, "rounds": rounds,
                              "decisions": [], "stopped_reason": None, "layer": None},
                        trace_id=get_trace_id())
+
+
+@conversation_router.get("", response_model=ApiResponse[list[dict]])
+async def list_conversations(request: Request,
+                             limit: int = Query(20, ge=1, le=100),
+                             user: Annotated[User, Depends(current_user)] = None):
+    """列出**本人**的历史会话——供前端在会话之间切换。
+
+    为什么需要：`conversation_id` 此前只在首次访问时生成一次，用户既没有"新建会话"
+    也没有"回到旧会话"的手段；补了新建之后（提交 68a8f0f），旧会话在界面上就再也
+    找不回来了。本接口补上另一半。
+
+    数据源同样取 `agent_conversation_message`（AI 阶段的问答留痕），**不另建会话表**：
+    会话的边界本来就由 conversation_id 划分，单独维护一张会话表只会引入两处不一致。
+
+    标题取该会话**第一条用户消息**——用户认得出自己问过什么，比编号或时间好用。
+    只按 `customer_id == user.id` 过滤，即天然"只能看自己的"：
+    员工调它只会拿到自己的（通常为空），故不需要额外的能力校验。
+    """
+    if user is None:
+        raise HTTPException(status_code=401, detail={"code": "UNAUTHORIZED", "message": "authentication required"})
+    async with request.app.state.database.session_factory() as session:
+        stats = (await session.execute(
+            select(AgentConversationMessage.conversation_id,
+                   func.max(AgentConversationMessage.created_at).label("last_at"),
+                   func.count(AgentConversationMessage.id).label("message_count"))
+            .where(AgentConversationMessage.customer_id == user.id)
+            .group_by(AgentConversationMessage.conversation_id)
+            .order_by(func.max(AgentConversationMessage.created_at).desc())
+            .limit(limit)
+        )).all()
+        if not stats:
+            return ApiResponse(data=[], trace_id=get_trace_id())
+        ids = [row.conversation_id for row in stats]
+        title_rows = (await session.execute(
+            select(AgentConversationMessage.conversation_id, AgentConversationMessage.content)
+            .where(AgentConversationMessage.customer_id == user.id,
+                   AgentConversationMessage.conversation_id.in_(ids),
+                   AgentConversationMessage.role == "user")
+            .order_by(AgentConversationMessage.conversation_id.asc(),
+                      AgentConversationMessage.created_at.asc(), AgentConversationMessage.id.asc())
+        )).all()
+    # 按 (conversation_id, created_at) 升序遍历，setdefault 留下的即**每组第一条**。
+    # 不能用 dict(...)：重复 key 时它保留最后一条，标题会变成该会话最后一次提问。
+    titles: dict[str, str] = {}
+    for conversation_id, content in title_rows:
+        titles.setdefault(conversation_id, content or "")
+
+    return ApiResponse(data=[{
+        "conversation_id": row.conversation_id,
+        "title": (titles.get(row.conversation_id) or "").strip()[:40] or "（无提问记录）",
+        "message_count": int(row.message_count or 0),
+        "last_at": row.last_at,
+    } for row in stats], trace_id=get_trace_id())
 
 
 @conversation_router.get("/{conversation_id}/messages", response_model=ApiResponse[list[dict]])

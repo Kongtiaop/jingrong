@@ -147,6 +147,13 @@ class CustomerIntentPlanner:
     _patterns: list[tuple[str, str, str, float]] = [
         ("human_handoff", "人工", "handoff", .99), ("human_handoff", "客服接入", "handoff", .99),
         ("workorder_status", "工单", "business_fact", .95), ("order_status", "订单", "business_fact", .90),
+        # 客户实际很少说"订单"，更常说"交易记录/明细/成交记录"。
+        # 实测（2026-09-24）「我最近的交易记录」因只认"订单"而落到未知意图，
+        # 回一句"您想查询哪一类信息…"。CustomerQueryRouter 的 _ORDER 词表本就包含
+        # "交易"，故补齐触发词即与其一致，无需改路由。
+        # 用具体词组而非单字"交易"，避免与 business_operation（申购/购买/赎回）抢命中。
+        ("order_status", "交易记录", "business_fact", .90), ("order_status", "交易明细", "business_fact", .90),
+        ("order_status", "成交记录", "business_fact", .90), ("order_status", "订单记录", "business_fact", .90),
         ("risk_restriction", "风险限制", "business_fact", .96), ("risk_restriction", "账户限制", "business_fact", .96),
         ("risk_restriction", "冻结", "business_fact", .92), ("asset_summary", "资产", "business_fact", .92),
         ("asset_summary", "持仓", "business_fact", .92), ("asset_summary", "余额", "business_fact", .90),

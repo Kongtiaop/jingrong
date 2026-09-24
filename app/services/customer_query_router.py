@@ -217,6 +217,17 @@ class CustomerQueryRouter:
             for holding, name in holdings
         ]
         data: dict[str, Any] = {"latest_asset": None, "holdings": holding_items}
+        # 答案里必须**带上持仓明细本身**，不能只说"展示了 N 条"。
+        # 原因：模型工具轮喂给模型的只是 `answer` 文本（见 customer_model_tools 的
+        # context_lines：`[{tool_name}] {result.answer[:600]}`），`data` 不参与生成。
+        # 只给"共 2 条持仓"这种摘要，模型就无法回答"我的持仓有哪些"——
+        # 实测（2026-09-24）此处修复前，客户拿到的是一句权限拒绝；
+        # 修复路由后仍只能答出总资产，问的是持仓却看不到持仓。
+        holding_lines = [
+            f"- {item['product_name']}：市值 {item['market_value']:,.2f} 元，盈亏 {item['profit_loss']:+,.2f} 元"
+            for item in holding_items[:5]
+        ]
+        more = f"（另有 {len(holding_items) - 5} 条未列出）" if len(holding_items) > 5 else ""
         if asset:
             data["latest_asset"] = {
                 "total_asset": float(asset.total_asset), "cash_balance": float(asset.cash_balance),
@@ -224,10 +235,12 @@ class CustomerQueryRouter:
                 "net_asset": float(asset.net_asset),
                 "snapshot_time": asset.snapshot_time.isoformat() if asset.snapshot_time else None,
             }
-            answer = f"您最近一次资产快照的总资产为 {float(asset.total_asset):,.2f} 元，当前展示 {len(holding_items)} 条有效持仓。"
+            answer = f"您最近一次资产快照的总资产为 {float(asset.total_asset):,.2f} 元，"
+            answer += f"其中现金余额 {float(asset.cash_balance):,.2f} 元。"
+            answer += (f"当前有效持仓 {len(holding_items)} 条：\n" + "\n".join(holding_lines) + more) if holding_lines else "当前没有有效持仓记录。"
             status = "sufficient"
         elif holding_items:
-            answer = f"当前未找到资产快照，但查询到 {len(holding_items)} 条有效持仓记录。"
+            answer = f"当前未找到资产快照，但查询到 {len(holding_items)} 条有效持仓：\n" + "\n".join(holding_lines) + more
             status = "partial"
         else:
             answer = "当前未找到资产快照或有效持仓记录。"

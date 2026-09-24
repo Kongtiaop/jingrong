@@ -27,6 +27,8 @@ export const customerServiceApi = {
   trace: (conversationId: string) => http.get(`/customer-service/conversations/${conversationId}/trace`),
   // 会话历史（AI 阶段的问答内容）：此前问答无处留存，刷新页面即丢
   messages: (conversationId: string) => http.get(`/customer-service/conversations/${conversationId}/messages`),
+  // 本人历史会话列表：供在会话之间切换（此前只能新建，回不到旧会话）
+  conversations: () => http.get('/customer-service/conversations'),
   // 确认转人工：转人工改为「建议 → 用户确认 → 执行」，这是确认那一步
   confirmHandoff: (conversationId: string) => http.post(`/customer-service/conversations/${conversationId}/handoff-confirm`),
 }

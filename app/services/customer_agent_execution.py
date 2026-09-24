@@ -26,7 +26,17 @@ import re
 AGENT_ROUTE_BY_INTENT = {
     "product_recommendation": "customer_recommendation",
     "risk_restriction": "customer_risk",
-    "asset_summary": "analysis",
+    # asset_summary 曾映射到 "analysis"（员工侧数据分析 Agent，需 DataAnalysisAgent 权限）。
+    # 但该意图承载的是**客户本人的资产与持仓**，而面向客户的只读工具
+    # `get_my_asset_summary` 早已实现（返回资产快照 + 前 10 条持仓，含市值/盈亏/份额）。
+    # 后果是客户问"我的资产/持仓/余额"时：图里工具轮已经把数据取到了，
+    # 却在 customer_service.py 的 Agent 权限守卫处，因 analysis 对客户不可用
+    # 而**清空 results 并替换成一句"当前身份不具备该领域助手权限"**。
+    # 实测（2026-09-24）「我的持仓有哪些」「我的资产有多少」「我的账户余额」三条全部如此。
+    # 改为 customer_service：客户走只读工具，与既有实现语义一致。
+    # 员工侧不受影响——员工的持仓查询走 NL2SQL 模板分支并在其之前早退，
+    # 且 /agent/execute 对员工根本不会进入 _run_customer_agent。
+    "asset_summary": "customer_service",
     "business_operation": "customer_trade_draft",
     "human_handoff": "customer_service",
     "workorder_status": "customer_service",
